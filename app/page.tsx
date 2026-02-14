@@ -2072,6 +2072,8 @@ function drawContourRegionsOnTargetView(
   targetRect: { x: number; y: number; width: number; height: number },
   blinkOn: boolean,
   regionColors?: string[],
+  pixelsPerInch = 0,
+  formatLinearFromInches?: (valueInches: number, fractionDigits?: number) => string,
 ): void {
   const patchWidth = Math.max(1, snapshot.patchWidthPx);
   const patchHeight = Math.max(1, snapshot.patchHeightPx);
@@ -2084,6 +2086,16 @@ function drawContourRegionsOnTargetView(
     const region = visibleRegions[i];
     const rectWidth = Math.max(1, region.maxX - region.minX + 1);
     const rectHeight = Math.max(1, region.maxY - region.minY + 1);
+    const { diameterPx, diameterInches } = estimatePatchBlobDiameter(
+      region.pixelCount,
+      rectWidth,
+      rectHeight,
+      patchWidth,
+      patchHeight,
+      targetRect.width,
+      targetRect.height,
+      pixelsPerInch,
+    );
     const radiusPatch = Math.max(2, Math.round(Math.max(rectWidth, rectHeight) / 2));
     const centerX = targetRect.x + ((region.centerX + 0.5) / patchWidth) * targetRect.width;
     const centerY = targetRect.y + ((region.centerY + 0.5) / patchHeight) * targetRect.height;
@@ -2106,6 +2118,29 @@ function drawContourRegionsOnTargetView(
       blinkOn ? "rgba(255, 255, 255, 0.95)" : "rgba(0, 0, 0, 0.95)",
       1.25,
     );
+
+    const sizeLabel =
+      diameterInches !== null && formatLinearFromInches
+        ? `#${i + 1} D${formatLinearFromInches(diameterInches, 2)}`
+        : `#${i + 1} D${diameterPx.toFixed(1)} px`;
+    context.font = "10px sans-serif";
+    const textWidth = context.measureText(sizeLabel).width;
+    const labelPaddingX = 4;
+    const labelHeight = 12;
+    const rawLabelX = centerX + radius + 4;
+    const rawLabelY = centerY - radius - labelHeight - 2;
+    const labelX = Math.max(
+      targetRect.x + 1,
+      Math.min(rawLabelX, targetRect.x + targetRect.width - (textWidth + labelPaddingX * 2) - 1),
+    );
+    const labelY = Math.max(
+      targetRect.y + 1,
+      Math.min(rawLabelY, targetRect.y + targetRect.height - labelHeight - 1),
+    );
+    context.fillStyle = "rgba(0, 0, 0, 0.72)";
+    context.fillRect(labelX, labelY, textWidth + labelPaddingX * 2, labelHeight);
+    context.fillStyle = hexToRgba(color, 0.98);
+    context.fillText(sizeLabel, labelX + labelPaddingX, labelY + 9);
   }
 }
 
@@ -6108,7 +6143,15 @@ export default function Home() {
               }
               return clusterColorForId(index + 1);
             });
-            drawContourRegionsOnTargetView(context, contourWindowSnapshotForFrame, drawRect, isBlinkOn, contourRegionColors);
+            drawContourRegionsOnTargetView(
+              context,
+              contourWindowSnapshotForFrame,
+              drawRect,
+              isBlinkOn,
+              contourRegionColors,
+              pixelsPerInch,
+              formatLinearFromInches,
+            );
           }
           const oneInchRadiusPx = pixelsPerInch > 0 ? pixelsPerInch / 2 : 0;
           const oneInchRadiusOverlay = oneInchRadiusPx * Math.max(scaleX, scaleY);
@@ -6603,6 +6646,8 @@ export default function Home() {
             },
             isBlinkOn,
             contourRegionColors,
+            pixelsPerInch,
+            formatLinearFromInches,
           );
         }
 
