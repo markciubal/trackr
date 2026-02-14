@@ -201,6 +201,13 @@ type RoiRect = {
   height: number;
 };
 
+type NormalizedMeasurementLine = {
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+};
+
 type TrackingMode = "template" | "meanshift" | "camshift";
 type WorkflowStep = "upload_video" | "capture_frame" | "draw_geometry" | "calibrate" | "scan" | "export";
 
@@ -329,6 +336,11 @@ type ContourWindowRegionSnapshot = {
   maxX: number;
   maxY: number;
 };
+
+type ContourRegionOverlay = Pick<
+  ContourWindowRegionSnapshot,
+  "centerX" | "centerY" | "minX" | "minY" | "maxX" | "maxY"
+>;
 
 type ContourWindowFrameSnapshot = {
   frame: number;
@@ -789,18 +801,18 @@ const TWEAK_CATEGORIES: TweakCategoryConfig[] = [
     ],
   },
   {
-    title: "K-Means Clustering",
+    title: "DBSCAN Clustering",
     fields: [
-      { key: "kmeansTimeWeight", label: "K-Means Time Weight", min: 0.1, max: 10, step: 0.01 },
-      { key: "kmeansMaxClustersCap", label: "K-Means Max Clusters Cap", min: 1, max: 50, step: 1 },
-      { key: "kmeansComplexityPenalty", label: "K-Means Complexity Penalty", min: 0, max: 1, step: 0.001 },
-      { key: "kmeansClosePenaltyWeight", label: "K-Means Close Penalty Weight", min: 0, max: 5, step: 0.001 },
-      { key: "kmeansSsePenaltyWeight", label: "K-Means SSE Penalty Weight", min: 0, max: 5, step: 0.001 },
-      { key: "kmeansCentroidCloseDistance", label: "Centroid Close Distance", min: 0, max: 10, step: 0.01 },
-      { key: "kmeansMergeCombinedDistanceMax", label: "Merge Combined Distance Max", min: 0, max: 10, step: 0.01 },
-      { key: "kmeansMergeSpatialDistanceMax", label: "Merge Spatial Distance Max", min: 0, max: 10, step: 0.01 },
-      { key: "kmeansMergeTimeDistanceMax", label: "Merge Time Distance Max", min: 0, max: 10, step: 0.01 },
-      { key: "kmeansMaxIterations", label: "K-Means Max Iterations", min: 1, max: 500, step: 1 },
+      { key: "kmeansTimeWeight", label: "DBSCAN Time Weight", min: 0.1, max: 10, step: 0.01 },
+      { key: "kmeansMaxClustersCap", label: "DBSCAN Max Clusters Cap", min: 1, max: 50, step: 1 },
+      { key: "kmeansComplexityPenalty", label: "DBSCAN Cluster Penalty", min: 0, max: 1, step: 0.001 },
+      { key: "kmeansClosePenaltyWeight", label: "DBSCAN Epsilon Scale", min: 0, max: 5, step: 0.001 },
+      { key: "kmeansSsePenaltyWeight", label: "DBSCAN Dispersion Penalty", min: 0, max: 5, step: 0.001 },
+      { key: "kmeansCentroidCloseDistance", label: "DBSCAN Epsilon Radius", min: 0, max: 10, step: 0.01 },
+      { key: "kmeansMergeCombinedDistanceMax", label: "DBSCAN Merge Combined Distance Max", min: 0, max: 10, step: 0.01 },
+      { key: "kmeansMergeSpatialDistanceMax", label: "DBSCAN Merge Spatial Distance Max", min: 0, max: 10, step: 0.01 },
+      { key: "kmeansMergeTimeDistanceMax", label: "DBSCAN Merge Time Distance Max", min: 0, max: 10, step: 0.01 },
+      { key: "kmeansMaxIterations", label: "DBSCAN Min Samples (scaled)", min: 1, max: 500, step: 1 },
     ],
   },
 ];
@@ -969,6 +981,8 @@ const USE_YELLOW_GREEN_DETERMINANT = true;
 const USE_CONTOUR_RENDER_HITS_AS_SHOTS = true;
 const CONTOUR_SHOT_DEDUP_WINDOW_SEC = 0.35;
 const CONTOUR_SHOT_DEDUP_DISTANCE_FACTOR = 1.8;
+const LIVE_GROUP_UPDATE_INTERVAL_MS = 500;
+const CLUSTER_MIN_VISIBLE_AGE_SEC = 1;
 const AUDIO_SUBPEAK_RELATIVE_THRESHOLD = 0.45;
 const AUDIO_SUBPEAK_STDDEV_FACTOR = 0.55;
 
@@ -1188,11 +1202,19 @@ type NormalizedShotPoint = {
   nt: number;
 };
 
-type KMeansModel = {
-  k: number;
+type KdTreeNode = {
+  pointIndex: number;
+  axis: 0 | 1 | 2;
+  left: KdTreeNode | null;
+  right: KdTreeNode | null;
+};
+
+type DbscanClusterModel = {
   assignments: number[];
   centroids: Array<{ x: number; y: number; t: number }>;
-  sse: number;
+  initialClusterCount: number;
+  noiseCount: number;
+  objectiveScore: number;
 };
 
 function euclideanDistance3(aX: number, aY: number, aT: number, bX: number, bY: number, bT: number): number {
@@ -1207,207 +1229,240 @@ function meanAndStd(values: number[]): { mean: number; std: number } {
   return { mean, std: std > 1e-6 ? std : 1 };
 }
 
-function initializeKMeansCentroids(points: NormalizedShotPoint[], k: number): Array<{ x: number; y: number; t: number }> {
-  const centroids: Array<{ x: number; y: number; t: number }> = [];
-  if (points.length === 0 || k <= 0) return centroids;
-
-  const meanX = points.reduce((sum, point) => sum + point.nx, 0) / points.length;
-  const meanY = points.reduce((sum, point) => sum + point.ny, 0) / points.length;
-  const meanT = points.reduce((sum, point) => sum + point.nt, 0) / points.length;
-
-  let firstIdx = 0;
-  let firstDist = -1;
-  for (let i = 0; i < points.length; i += 1) {
-    const point = points[i];
-    const distance = euclideanDistance3(point.nx, point.ny, point.nt, meanX, meanY, meanT);
-    if (distance > firstDist) {
-      firstDist = distance;
-      firstIdx = i;
-    }
-  }
-  centroids.push({ x: points[firstIdx].nx, y: points[firstIdx].ny, t: points[firstIdx].nt });
-
-  const selected = new Set<number>([firstIdx]);
-  while (centroids.length < k) {
-    let nextIdx = -1;
-    let maxNearest = -1;
-    for (let i = 0; i < points.length; i += 1) {
-      if (selected.has(i)) continue;
-      const point = points[i];
-      let nearest = Number.POSITIVE_INFINITY;
-      for (const centroid of centroids) {
-        const distance = euclideanDistance3(point.nx, point.ny, point.nt, centroid.x, centroid.y, centroid.t);
-        if (distance < nearest) nearest = distance;
-      }
-      if (nearest > maxNearest) {
-        maxNearest = nearest;
-        nextIdx = i;
-      }
-    }
-    if (nextIdx < 0) break;
-    selected.add(nextIdx);
-    centroids.push({ x: points[nextIdx].nx, y: points[nextIdx].ny, t: points[nextIdx].nt });
-  }
-
-  while (centroids.length < k) {
-    const fallbackIdx = centroids.length % points.length;
-    centroids.push({ x: points[fallbackIdx].nx, y: points[fallbackIdx].ny, t: points[fallbackIdx].nt });
-  }
-
-  return centroids;
+function kdPointCoordinate(point: NormalizedShotPoint, axis: 0 | 1 | 2): number {
+  if (axis === 0) return point.nx;
+  if (axis === 1) return point.ny;
+  return point.nt;
 }
 
-function runKMeans(points: NormalizedShotPoint[], k: number, maxIterations = 30): KMeansModel {
-  const safeK = Math.max(1, Math.min(k, Math.max(1, points.length)));
-  const assignments = new Array<number>(points.length).fill(0);
-  const centroids = initializeKMeansCentroids(points, safeK);
+function buildKdTree(pointIndices: number[], points: NormalizedShotPoint[], depth = 0): KdTreeNode | null {
+  if (pointIndices.length === 0) return null;
+  const axis = (depth % 3) as 0 | 1 | 2;
+  const sorted = [...pointIndices].sort(
+    (a, b) => kdPointCoordinate(points[a], axis) - kdPointCoordinate(points[b], axis),
+  );
+  const median = Math.floor(sorted.length / 2);
+  return {
+    pointIndex: sorted[median],
+    axis,
+    left: buildKdTree(sorted.slice(0, median), points, depth + 1),
+    right: buildKdTree(sorted.slice(median + 1), points, depth + 1),
+  };
+}
 
-  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-    let changed = false;
-    for (let i = 0; i < points.length; i += 1) {
-      const point = points[i];
-      let bestCluster = 0;
-      let bestDistance = Number.POSITIVE_INFINITY;
-      for (let cluster = 0; cluster < centroids.length; cluster += 1) {
-        const centroid = centroids[cluster];
-        const distance = euclideanDistance3(point.nx, point.ny, point.nt, centroid.x, centroid.y, centroid.t);
-        if (distance < bestDistance) {
-          bestDistance = distance;
-          bestCluster = cluster;
-        }
-      }
-      if (assignments[i] !== bestCluster) {
-        assignments[i] = bestCluster;
-        changed = true;
-      }
+function kdRadiusSearch(
+  node: KdTreeNode | null,
+  points: NormalizedShotPoint[],
+  targetX: number,
+  targetY: number,
+  targetT: number,
+  radiusSq: number,
+  hits: number[],
+): void {
+  if (!node) return;
+  const point = points[node.pointIndex];
+  const dx = point.nx - targetX;
+  const dy = point.ny - targetY;
+  const dt = point.nt - targetT;
+  const distanceSq = dx * dx + dy * dy + dt * dt;
+  if (distanceSq <= radiusSq) {
+    hits.push(node.pointIndex);
+  }
+
+  const targetCoord = node.axis === 0 ? targetX : node.axis === 1 ? targetY : targetT;
+  const nodeCoord = kdPointCoordinate(point, node.axis);
+  const diff = targetCoord - nodeCoord;
+  const nearChild = diff <= 0 ? node.left : node.right;
+  const farChild = diff <= 0 ? node.right : node.left;
+  kdRadiusSearch(nearChild, points, targetX, targetY, targetT, radiusSq, hits);
+  if (diff * diff <= radiusSq) {
+    kdRadiusSearch(farChild, points, targetX, targetY, targetT, radiusSq, hits);
+  }
+}
+
+function centroidFromPointIndices(
+  points: NormalizedShotPoint[],
+  pointIndices: number[],
+): { x: number; y: number; t: number } {
+  let sumX = 0;
+  let sumY = 0;
+  let sumT = 0;
+  for (const pointIndex of pointIndices) {
+    sumX += points[pointIndex].nx;
+    sumY += points[pointIndex].ny;
+    sumT += points[pointIndex].nt;
+  }
+  const count = Math.max(1, pointIndices.length);
+  return { x: sumX / count, y: sumY / count, t: sumT / count };
+}
+
+function runDbscanClustering(points: NormalizedShotPoint[], tweaks: TweakSettings): DbscanClusterModel {
+  if (points.length === 0) {
+    return {
+      assignments: [],
+      centroids: [],
+      initialClusterCount: 0,
+      noiseCount: 0,
+      objectiveScore: 0,
+    };
+  }
+
+  const radiusScale = Math.max(0.25, tweaks.kmeansClosePenaltyWeight);
+  const radius = Math.max(0.05, tweaks.kmeansCentroidCloseDistance * radiusScale);
+  const radiusSq = radius * radius;
+  const minSamples = Math.max(2, Math.min(40, Math.round(Math.max(2, tweaks.kmeansMaxIterations * 0.12))));
+  const maxClustersCap = Math.max(1, Math.round(tweaks.kmeansMaxClustersCap));
+  const pointIndices = Array.from({ length: points.length }, (_, index) => index);
+  const kdTree = buildKdTree(pointIndices, points);
+  if (!kdTree) {
+    return {
+      assignments: [],
+      centroids: [],
+      initialClusterCount: 0,
+      noiseCount: points.length,
+      objectiveScore: 0,
+    };
+  }
+
+  const UNVISITED = -2;
+  const NOISE = -1;
+  const neighborCache = new Map<number, number[]>();
+  const regionQuery = (pointIndex: number): number[] => {
+    const cached = neighborCache.get(pointIndex);
+    if (cached) return cached;
+    const hits: number[] = [];
+    const point = points[pointIndex];
+    kdRadiusSearch(kdTree, points, point.nx, point.ny, point.nt, radiusSq, hits);
+    neighborCache.set(pointIndex, hits);
+    return hits;
+  };
+
+  const assignments = new Array<number>(points.length).fill(UNVISITED);
+  let clusterIndex = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    if (assignments[i] !== UNVISITED) continue;
+    const neighbors = regionQuery(i);
+    if (neighbors.length < minSamples) {
+      assignments[i] = NOISE;
+      continue;
     }
 
-    const sums = centroids.map(() => ({ x: 0, y: 0, t: 0, count: 0 }));
-    for (let i = 0; i < points.length; i += 1) {
-      const cluster = assignments[i];
-      sums[cluster].x += points[i].nx;
-      sums[cluster].y += points[i].ny;
-      sums[cluster].t += points[i].nt;
-      sums[cluster].count += 1;
-    }
-
-    for (let cluster = 0; cluster < centroids.length; cluster += 1) {
-      if (sums[cluster].count === 0) {
-        let farthestIdx = 0;
-        let farthestDistance = -1;
-        for (let i = 0; i < points.length; i += 1) {
-          const assignedCentroid = centroids[assignments[i]];
-          const distance = euclideanDistance3(
-            points[i].nx,
-            points[i].ny,
-            points[i].nt,
-            assignedCentroid.x,
-            assignedCentroid.y,
-            assignedCentroid.t,
-          );
-          if (distance > farthestDistance) {
-            farthestDistance = distance;
-            farthestIdx = i;
-          }
-        }
-        centroids[cluster] = { x: points[farthestIdx].nx, y: points[farthestIdx].ny, t: points[farthestIdx].nt };
-        changed = true;
+    assignments[i] = clusterIndex;
+    const queue = neighbors.filter((neighborIndex) => neighborIndex !== i);
+    const queued = new Set<number>(queue);
+    for (let head = 0; head < queue.length; head += 1) {
+      const neighborIndex = queue[head];
+      queued.delete(neighborIndex);
+      if (assignments[neighborIndex] === NOISE) {
+        assignments[neighborIndex] = clusterIndex;
+      }
+      if (assignments[neighborIndex] !== UNVISITED && assignments[neighborIndex] !== clusterIndex) {
         continue;
       }
+      if (assignments[neighborIndex] === UNVISITED) {
+        assignments[neighborIndex] = clusterIndex;
+      }
 
-      centroids[cluster] = {
-        x: sums[cluster].x / sums[cluster].count,
-        y: sums[cluster].y / sums[cluster].count,
-        t: sums[cluster].t / sums[cluster].count,
-      };
+      const neighborNeighbors = regionQuery(neighborIndex);
+      if (neighborNeighbors.length < minSamples) continue;
+      for (const candidate of neighborNeighbors) {
+        if (assignments[candidate] !== UNVISITED && assignments[candidate] !== NOISE) continue;
+        if (queued.has(candidate)) continue;
+        queue.push(candidate);
+        queued.add(candidate);
+      }
     }
-
-    if (!changed) break;
+    clusterIndex += 1;
   }
 
-  let sse = 0;
-  for (let i = 0; i < points.length; i += 1) {
-    const centroid = centroids[assignments[i]];
-    const distance = euclideanDistance3(points[i].nx, points[i].ny, points[i].nt, centroid.x, centroid.y, centroid.t);
-    sse += distance * distance;
+  const initialClusterCount = clusterIndex;
+  if (initialClusterCount > maxClustersCap) {
+    const clusterMembers = Array.from({ length: initialClusterCount }, () => [] as number[]);
+    for (let i = 0; i < assignments.length; i += 1) {
+      const clusterId = assignments[i];
+      if (clusterId >= 0) clusterMembers[clusterId].push(i);
+    }
+    const keepClusterIds = clusterMembers
+      .map((members, clusterId) => ({ clusterId, size: members.length }))
+      .sort((a, b) => {
+        const sizeDelta = b.size - a.size;
+        if (sizeDelta !== 0) return sizeDelta;
+        return a.clusterId - b.clusterId;
+      })
+      .slice(0, maxClustersCap)
+      .map((entry) => entry.clusterId);
+    const oldToNew = new Map<number, number>();
+    for (let i = 0; i < keepClusterIds.length; i += 1) {
+      oldToNew.set(keepClusterIds[i], i);
+    }
+    for (let i = 0; i < assignments.length; i += 1) {
+      const clusterId = assignments[i];
+      if (clusterId < 0) continue;
+      assignments[i] = oldToNew.get(clusterId) ?? NOISE;
+    }
   }
 
-  return { k: safeK, assignments, centroids, sse };
-}
-
-function silhouetteScore(points: NormalizedShotPoint[], assignments: number[], k: number): number {
-  if (points.length <= 1 || k <= 1) return 0;
-
-  const clusters: number[][] = Array.from({ length: k }, () => []);
+  const oldToNewCluster = new Map<number, number>();
+  const compactAssignments = new Array<number>(assignments.length).fill(NOISE);
   for (let i = 0; i < assignments.length; i += 1) {
-    clusters[assignments[i]].push(i);
+    const clusterId = assignments[i];
+    if (clusterId < 0) continue;
+    let remappedClusterId = oldToNewCluster.get(clusterId);
+    if (remappedClusterId === undefined) {
+      remappedClusterId = oldToNewCluster.size;
+      oldToNewCluster.set(clusterId, remappedClusterId);
+    }
+    compactAssignments[i] = remappedClusterId;
   }
 
-  let silhouetteSum = 0;
+  const compactBuckets: number[][] = Array.from({ length: oldToNewCluster.size }, () => []);
+  for (let i = 0; i < compactAssignments.length; i += 1) {
+    const clusterId = compactAssignments[i];
+    if (clusterId < 0) continue;
+    compactBuckets[clusterId].push(i);
+  }
+
+  const centroids = compactBuckets.map((bucket) => centroidFromPointIndices(points, bucket));
+  let dispersion = 0;
+  let assignedCount = 0;
+  let noiseCount = 0;
   for (let i = 0; i < points.length; i += 1) {
-    const ownCluster = assignments[i];
-    const ownMembers = clusters[ownCluster];
-    let a = 0;
-    if (ownMembers.length > 1) {
-      for (const memberIdx of ownMembers) {
-        if (memberIdx === i) continue;
-        a += euclideanDistance3(
-          points[i].nx,
-          points[i].ny,
-          points[i].nt,
-          points[memberIdx].nx,
-          points[memberIdx].ny,
-          points[memberIdx].nt,
-        );
-      }
-      a /= ownMembers.length - 1;
+    const clusterId = compactAssignments[i];
+    if (clusterId < 0) {
+      noiseCount += 1;
+      continue;
     }
-
-    let b = Number.POSITIVE_INFINITY;
-    for (let cluster = 0; cluster < k; cluster += 1) {
-      if (cluster === ownCluster || clusters[cluster].length === 0) continue;
-      let averageDistance = 0;
-      for (const memberIdx of clusters[cluster]) {
-        averageDistance += euclideanDistance3(
-          points[i].nx,
-          points[i].ny,
-          points[i].nt,
-          points[memberIdx].nx,
-          points[memberIdx].ny,
-          points[memberIdx].nt,
-        );
-      }
-      averageDistance /= clusters[cluster].length;
-      if (averageDistance < b) b = averageDistance;
-    }
-
-    const denominator = Math.max(a, b, 1e-6);
-    const s = Number.isFinite(b) ? (b - a) / denominator : 0;
-    silhouetteSum += s;
+    const centroid = centroids[clusterId];
+    const distance = euclideanDistance3(points[i].nx, points[i].ny, points[i].nt, centroid.x, centroid.y, centroid.t);
+    dispersion += distance * distance;
+    assignedCount += 1;
   }
+  const coverage = assignedCount / Math.max(1, points.length);
+  const noiseRatio = noiseCount / Math.max(1, points.length);
+  const normalizedDispersion = dispersion / Math.max(1, assignedCount);
+  const objectiveScore =
+    coverage -
+    tweaks.kmeansComplexityPenalty * Math.max(0, centroids.length - 1) -
+    tweaks.kmeansSsePenaltyWeight * normalizedDispersion -
+    tweaks.kmeansClosePenaltyWeight * noiseRatio;
 
-  return silhouetteSum / points.length;
+  return {
+    assignments: compactAssignments,
+    centroids,
+    initialClusterCount,
+    noiseCount,
+    objectiveScore,
+  };
 }
 
-function centroidClosenessPenalty(centroids: Array<{ x: number; y: number; t: number }>, tweaks: TweakSettings): number {
-  let penalty = 0;
-  const closeDistance = tweaks.kmeansCentroidCloseDistance;
-  for (let i = 0; i < centroids.length; i += 1) {
-    for (let j = i + 1; j < centroids.length; j += 1) {
-      const distance = euclideanDistance3(
-        centroids[i].x,
-        centroids[i].y,
-        centroids[i].t,
-        centroids[j].x,
-        centroids[j].y,
-        centroids[j].t,
-      );
-      if (distance < closeDistance) {
-        penalty += (closeDistance - distance) ** 2;
-      }
-    }
-  }
-  return penalty;
+function filterShotsByAnalysisAge(
+  shots: ShotLogEntry[],
+  analysisTimeSec: number,
+  minVisibleAgeSec = CLUSTER_MIN_VISIBLE_AGE_SEC,
+): ShotLogEntry[] {
+  const safeMinAge = Math.max(0, minVisibleAgeSec);
+  if (safeMinAge <= 0 || !Number.isFinite(analysisTimeSec)) return shots;
+  return shots.filter((shot) => analysisTimeSec - shot.videoTimeSec >= safeMinAge);
 }
 
 function clusterShotsBySpaceTime(shots: ShotLogEntry[], tweaks: TweakSettings): ShotClusteringResult {
@@ -1426,36 +1481,38 @@ function clusterShotsBySpaceTime(shots: ShotLogEntry[], tweaks: TweakSettings): 
   const xStats = meanAndStd(sortedShots.map((shot) => shot.centerX));
   const yStats = meanAndStd(sortedShots.map((shot) => shot.centerY));
   const tStats = meanAndStd(sortedShots.map((shot) => shot.videoTimeSec));
+  // Increase temporal influence so timing separation drives grouping more strongly.
+  const effectiveTimeWeight = Math.max(0, tweaks.kmeansTimeWeight) * 4;
   const points: NormalizedShotPoint[] = sortedShots.map((shot) => ({
     shot,
     nx: (shot.centerX - xStats.mean) / xStats.std,
     ny: (shot.centerY - yStats.mean) / yStats.std,
-    nt: ((shot.videoTimeSec - tStats.mean) / tStats.std) * tweaks.kmeansTimeWeight,
+    nt: ((shot.videoTimeSec - tStats.mean) / tStats.std) * effectiveTimeWeight,
   }));
 
-  const maxK = Math.max(
-    1,
-    Math.min(points.length, Math.min(Math.max(1, Math.round(tweaks.kmeansMaxClustersCap)), Math.floor(Math.sqrt(points.length)) + 1)),
-  );
-  let bestModel = runKMeans(points, 1, Math.max(1, Math.round(tweaks.kmeansMaxIterations)));
-  let bestScore = -Infinity;
-  for (let k = 1; k <= maxK; k += 1) {
-    const model = runKMeans(points, k, Math.max(1, Math.round(tweaks.kmeansMaxIterations)));
-    const silhouette = silhouetteScore(points, model.assignments, model.k);
-    const closePenalty = centroidClosenessPenalty(model.centroids, tweaks);
-    const normalizedSse = model.sse / Math.max(1, points.length);
-    const objective =
-      silhouette -
-      tweaks.kmeansComplexityPenalty * (k - 1) -
-      tweaks.kmeansClosePenaltyWeight * closePenalty -
-      tweaks.kmeansSsePenaltyWeight * normalizedSse;
-    if (objective > bestScore) {
-      bestScore = objective;
-      bestModel = model;
-    }
+  const dbscanModel = runDbscanClustering(points, tweaks);
+  if (dbscanModel.assignments.length !== points.length) {
+    return {
+      selectedK: 0,
+      finalK: 0,
+      closeMergeCount: 0,
+      objectiveScore: 0,
+      shotClusterById: {},
+      clusters: [],
+    };
+  }
+  if (dbscanModel.centroids.length === 0) {
+    return {
+      selectedK: dbscanModel.initialClusterCount,
+      finalK: 0,
+      closeMergeCount: 0,
+      objectiveScore: dbscanModel.objectiveScore,
+      shotClusterById: {},
+      clusters: [],
+    };
   }
 
-  const parents = Array.from({ length: bestModel.k }, (_, index) => index);
+  const parents = Array.from({ length: dbscanModel.centroids.length }, (_, index) => index);
   const findRoot = (index: number): number => {
     let root = index;
     while (parents[root] !== root) {
@@ -1475,20 +1532,20 @@ function clusterShotsBySpaceTime(shots: ShotLogEntry[], tweaks: TweakSettings): 
     if (rootA !== rootB) parents[rootB] = rootA;
   };
 
-  for (let i = 0; i < bestModel.centroids.length; i += 1) {
-    for (let j = i + 1; j < bestModel.centroids.length; j += 1) {
+  for (let i = 0; i < dbscanModel.centroids.length; i += 1) {
+    for (let j = i + 1; j < dbscanModel.centroids.length; j += 1) {
       const spatialDistance = Math.hypot(
-        bestModel.centroids[i].x - bestModel.centroids[j].x,
-        bestModel.centroids[i].y - bestModel.centroids[j].y,
+        dbscanModel.centroids[i].x - dbscanModel.centroids[j].x,
+        dbscanModel.centroids[i].y - dbscanModel.centroids[j].y,
       );
-      const timeDistance = Math.abs(bestModel.centroids[i].t - bestModel.centroids[j].t);
+      const timeDistance = Math.abs(dbscanModel.centroids[i].t - dbscanModel.centroids[j].t);
       const combinedDistance = euclideanDistance3(
-        bestModel.centroids[i].x,
-        bestModel.centroids[i].y,
-        bestModel.centroids[i].t,
-        bestModel.centroids[j].x,
-        bestModel.centroids[j].y,
-        bestModel.centroids[j].t,
+        dbscanModel.centroids[i].x,
+        dbscanModel.centroids[i].y,
+        dbscanModel.centroids[i].t,
+        dbscanModel.centroids[j].x,
+        dbscanModel.centroids[j].y,
+        dbscanModel.centroids[j].t,
       );
       if (
         combinedDistance < tweaks.kmeansMergeCombinedDistanceMax ||
@@ -1502,8 +1559,13 @@ function clusterShotsBySpaceTime(shots: ShotLogEntry[], tweaks: TweakSettings): 
   const rootToClusterId = new Map<number, number>();
   const mergedAssignments: number[] = [];
   let nextClusterId = 1;
-  for (let i = 0; i < bestModel.assignments.length; i += 1) {
-    const root = findRoot(bestModel.assignments[i]);
+  for (let i = 0; i < dbscanModel.assignments.length; i += 1) {
+    const sourceCluster = dbscanModel.assignments[i];
+    if (sourceCluster < 0) {
+      mergedAssignments[i] = -1;
+      continue;
+    }
+    const root = findRoot(sourceCluster);
     if (!rootToClusterId.has(root)) {
       rootToClusterId.set(root, nextClusterId);
       nextClusterId += 1;
@@ -1515,6 +1577,7 @@ function clusterShotsBySpaceTime(shots: ShotLogEntry[], tweaks: TweakSettings): 
   const shotsByCluster = new Map<number, ShotLogEntry[]>();
   for (let i = 0; i < points.length; i += 1) {
     const clusterId = mergedAssignments[i];
+    if (clusterId <= 0) continue;
     const bucket = shotsByCluster.get(clusterId) ?? [];
     bucket.push(points[i].shot);
     shotsByCluster.set(clusterId, bucket);
@@ -1578,10 +1641,10 @@ function clusterShotsBySpaceTime(shots: ShotLogEntry[], tweaks: TweakSettings): 
   }
 
   return {
-    selectedK: bestModel.k,
+    selectedK: dbscanModel.initialClusterCount,
     finalK: rootToClusterId.size,
-    closeMergeCount: Math.max(0, bestModel.k - rootToClusterId.size),
-    objectiveScore: bestScore,
+    closeMergeCount: Math.max(0, dbscanModel.initialClusterCount - rootToClusterId.size),
+    objectiveScore: dbscanModel.objectiveScore,
     shotClusterById,
     clusters,
   };
@@ -1715,7 +1778,7 @@ function drawClusterGeometry(
     context.fillRect(labelX - 14, labelY - 20, 28, 14);
     context.fillStyle = clusterColor;
     context.font = "10px sans-serif";
-    context.fillText(`C${cluster.clusterId}`, labelX - 10, labelY - 10);
+    context.fillText(`DB${cluster.clusterId}`, labelX - 13, labelY - 10);
   }
 }
 
@@ -1726,6 +1789,89 @@ function windowIndexAtTime(timeSec: number, windows: TimeWindow[]): number {
   return -1;
 }
 
+function buildContourRegionClusterVisuals(
+  snapshot: ContourWindowFrameSnapshot,
+  sourceRect: { x: number; y: number; width: number; height: number },
+  shots: ShotLogEntry[],
+  shotClusterById: Record<string, number>,
+  clusterColorById: Record<number, string>,
+): { regionColors: string[]; regionGroupLabels: string[] } {
+  const safeSourceWidth = Math.max(1, sourceRect.width);
+  const safeSourceHeight = Math.max(1, sourceRect.height);
+  const regionColors: string[] = [];
+  const regionGroupLabels: string[] = [];
+  const visibleRegions = snapshot.regions.slice(0, 10);
+
+  for (let i = 0; i < visibleRegions.length; i += 1) {
+    const region = visibleRegions[i];
+    let nearestShot: ShotLogEntry | null = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (const shot of shots) {
+      const patchShotX = ((shot.centerX - sourceRect.x) / safeSourceWidth) * snapshot.patchWidthPx;
+      const patchShotY = ((shot.centerY - sourceRect.y) / safeSourceHeight) * snapshot.patchHeightPx;
+      const distance = Math.hypot(region.centerX - patchShotX, region.centerY - patchShotY);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestShot = shot;
+      }
+    }
+
+    const clusterId = nearestShot ? shotClusterById[nearestShot.id] : undefined;
+    if (clusterId !== undefined && Number.isFinite(clusterId) && clusterId > 0) {
+      const normalizedClusterId = Math.round(clusterId);
+      regionColors.push(clusterColorById[normalizedClusterId] ?? clusterColorForId(normalizedClusterId));
+      regionGroupLabels.push(`DB${normalizedClusterId}`);
+      continue;
+    }
+
+    regionColors.push(clusterColorForId(i + 1));
+    regionGroupLabels.push(`R${i + 1}`);
+  }
+
+  return { regionColors, regionGroupLabels };
+}
+
+function drawContourRegionWindowOverlays(
+  context: CanvasRenderingContext2D,
+  regions: ContourRegionOverlay[],
+  regionColors?: string[],
+  regionGroupLabels?: string[],
+): void {
+  const maxRegionsToDraw = 10;
+  const visibleRegions = regions.slice(0, maxRegionsToDraw);
+  for (let i = 0; i < visibleRegions.length; i += 1) {
+    const region = visibleRegions[i];
+    const rectWidth = Math.max(1, region.maxX - region.minX + 1);
+    const rectHeight = Math.max(1, region.maxY - region.minY + 1);
+    const radius = Math.max(2, Math.round(Math.max(rectWidth, rectHeight) / 2));
+    const color = regionColors?.[i] ?? clusterColorForId(i + 1);
+    const groupLabel = regionGroupLabels?.[i] ?? `${i + 1}`;
+    context.strokeStyle = hexToRgba(color, 0.95);
+    context.lineWidth = 2;
+    context.beginPath();
+    context.arc(region.centerX, region.centerY, radius, 0, Math.PI * 2);
+    context.stroke();
+    drawCenterCross(
+      context,
+      region.centerX,
+      region.centerY,
+      3,
+      "rgba(255, 255, 255, 0.95)",
+      1.25,
+    );
+
+    context.font = "10px sans-serif";
+    const textWidth = context.measureText(groupLabel).width;
+    const labelX = Math.max(0, Math.min(region.centerX - 10, context.canvas.width - textWidth - 4));
+    const labelY = Math.max(10, Math.min(region.centerY + 10, context.canvas.height - 2));
+    context.fillStyle = "rgba(0, 0, 0, 0.72)";
+    context.fillRect(labelX - 2, labelY - 9, textWidth + 4, 12);
+    context.fillStyle = hexToRgba(color, 0.98);
+    context.fillText(groupLabel, labelX, labelY);
+  }
+}
+
 function drawProcessedContourView(
   context: CanvasRenderingContext2D,
   patchRgba: Uint8ClampedArray,
@@ -1734,6 +1880,8 @@ function drawProcessedContourView(
   patchHeight: number,
   mask: Uint8Array | null,
   regions: ChangedContourRegion[],
+  regionColors?: string[],
+  regionGroupLabels?: string[],
 ): void {
   let changedCount = 0;
   const hasBaseline = !!baselineRgba && baselineRgba.length === patchRgba.length;
@@ -1765,34 +1913,7 @@ function drawProcessedContourView(
   }
   context.putImageData(imageData, 0, 0);
 
-  const maxRegionsToDraw = 10;
-  const visibleRegions = regions.slice(0, maxRegionsToDraw);
-  for (let i = 0; i < visibleRegions.length; i += 1) {
-    const region = visibleRegions[i];
-    const rectWidth = Math.max(1, region.maxX - region.minX + 1);
-    const rectHeight = Math.max(1, region.maxY - region.minY + 1);
-    const radius = Math.max(2, Math.round(Math.max(rectWidth, rectHeight) / 2));
-    context.strokeStyle = "rgba(34, 197, 94, 0.95)";
-    context.lineWidth = 2;
-    context.beginPath();
-    context.arc(region.centerX, region.centerY, radius, 0, Math.PI * 2);
-    context.stroke();
-    drawCenterCross(
-      context,
-      region.centerX,
-      region.centerY,
-      3,
-      "rgba(255, 255, 255, 0.95)",
-      1.25,
-    );
-    context.fillStyle = "rgba(239, 68, 68, 0.95)";
-    context.font = "10px sans-serif";
-    context.fillText(
-      `${i + 1}`,
-      Math.max(0, region.centerX - 10),
-      Math.max(10, region.centerY + 10),
-    );
-  }
+  drawContourRegionWindowOverlays(context, regions, regionColors, regionGroupLabels);
 
   context.fillStyle = "rgba(0, 0, 0, 0.72)";
   context.fillRect(0, 0, Math.min(280, patchWidth), 16);
@@ -1804,25 +1925,67 @@ function drawProcessedContourView(
 
 function drawPatchWindowView(
   context: CanvasRenderingContext2D,
-  patchRgba: Uint8ClampedArray,
-  width: number,
-  height: number,
-  title: string,
+  source: CanvasImageSource,
+  sourceRect: { x: number; y: number; width: number; height: number },
 ): void {
-  const safeWidth = Math.max(1, Math.round(width));
-  const safeHeight = Math.max(1, Math.round(height));
+  const safeX = Math.max(0, Math.floor(sourceRect.x));
+  const safeY = Math.max(0, Math.floor(sourceRect.y));
+  const safeWidth = Math.max(1, Math.round(sourceRect.width));
+  const safeHeight = Math.max(1, Math.round(sourceRect.height));
   if (context.canvas.width !== safeWidth || context.canvas.height !== safeHeight) {
     context.canvas.width = safeWidth;
     context.canvas.height = safeHeight;
   }
-  const imageData = context.createImageData(safeWidth, safeHeight);
-  imageData.data.set(patchRgba);
-  context.putImageData(imageData, 0, 0);
+  context.drawImage(
+    source,
+    safeX,
+    safeY,
+    safeWidth,
+    safeHeight,
+    0,
+    0,
+    safeWidth,
+    safeHeight,
+  );
+}
+
+function drawProbePatchOverlayView(
+  context: CanvasRenderingContext2D,
+  patchWidth: number,
+  patchHeight: number,
+  overlayLabel: string,
+  blinkOn: boolean,
+  snapshot: ContourWindowFrameSnapshot | null,
+  regionColors: string[] | undefined,
+  pixelsPerInch: number,
+  formatLinearFromInches: (valueInches: number, fractionDigits?: number) => string,
+  regionGroupLabels?: string[],
+): void {
+  const safeWidth = Math.max(1, Math.round(patchWidth));
+  const safeHeight = Math.max(1, Math.round(patchHeight));
+  const boundaryColor = blinkOn ? "#ffffff" : "#000000";
+  const labelWidth = Math.min(safeWidth, Math.max(120, Math.min(420, 14 + overlayLabel.length * 6)));
+
+  context.strokeStyle = boundaryColor;
+  context.lineWidth = 3;
+  context.strokeRect(0, 0, safeWidth, safeHeight);
   context.fillStyle = "rgba(0, 0, 0, 0.72)";
-  context.fillRect(0, 0, Math.min(260, safeWidth), 16);
-  context.fillStyle = "#e5e7eb";
-  context.font = "10px sans-serif";
-  context.fillText(title, 4, 11);
+  context.fillRect(0, 0, labelWidth, 18);
+  context.fillStyle = blinkOn ? "#ffffff" : "#d4d4d4";
+  context.font = "12px sans-serif";
+  context.fillText(overlayLabel, 6, 12);
+
+  if (!snapshot || snapshot.regions.length === 0) return;
+  drawContourRegionsOnTargetView(
+    context,
+    snapshot,
+    { x: 0, y: 0, width: safeWidth, height: safeHeight },
+    blinkOn,
+    regionColors,
+    pixelsPerInch,
+    formatLinearFromInches,
+    regionGroupLabels,
+  );
 }
 
 function drawBinaryMaskWindowView(
@@ -1996,6 +2159,8 @@ function encodeBinaryMaskRuns(mask: Uint8Array): Array<{ start: number; length: 
 function drawPersistedContourWindowView(
   context: CanvasRenderingContext2D,
   snapshot: ContourWindowFrameSnapshot,
+  regionColors?: string[],
+  regionGroupLabels?: string[],
 ): void {
   const width = Math.max(1, Math.round(snapshot.patchWidthPx));
   const height = Math.max(1, Math.round(snapshot.patchHeightPx));
@@ -2026,34 +2191,7 @@ function drawPersistedContourWindowView(
   }
   context.putImageData(imageData, 0, 0);
 
-  const maxRegionsToDraw = 10;
-  const visibleRegions = snapshot.regions.slice(0, maxRegionsToDraw);
-  for (let i = 0; i < visibleRegions.length; i += 1) {
-    const region = visibleRegions[i];
-    const rectWidth = Math.max(1, region.maxX - region.minX + 1);
-    const rectHeight = Math.max(1, region.maxY - region.minY + 1);
-    const radius = Math.max(2, Math.round(Math.max(rectWidth, rectHeight) / 2));
-    context.strokeStyle = "rgba(34, 197, 94, 0.95)";
-    context.lineWidth = 2;
-    context.beginPath();
-    context.arc(region.centerX, region.centerY, radius, 0, Math.PI * 2);
-    context.stroke();
-    drawCenterCross(
-      context,
-      region.centerX,
-      region.centerY,
-      3,
-      "rgba(255, 255, 255, 0.95)",
-      1.25,
-    );
-    context.fillStyle = "rgba(239, 68, 68, 0.95)";
-    context.font = "10px sans-serif";
-    context.fillText(
-      `${i + 1}`,
-      Math.max(0, region.centerX - 10),
-      Math.max(10, region.centerY + 10),
-    );
-  }
+  drawContourRegionWindowOverlays(context, snapshot.regions, regionColors, regionGroupLabels);
 
   context.fillStyle = "rgba(0, 0, 0, 0.72)";
   context.fillRect(0, 0, Math.min(280, width), 16);
@@ -2074,6 +2212,7 @@ function drawContourRegionsOnTargetView(
   regionColors?: string[],
   pixelsPerInch = 0,
   formatLinearFromInches?: (valueInches: number, fractionDigits?: number) => string,
+  regionGroupLabels?: string[],
 ): void {
   const patchWidth = Math.max(1, snapshot.patchWidthPx);
   const patchHeight = Math.max(1, snapshot.patchHeightPx);
@@ -2119,10 +2258,11 @@ function drawContourRegionsOnTargetView(
       1.25,
     );
 
+    const groupLabelPrefix = regionGroupLabels?.[i] ?? `R${i + 1}`;
     const sizeLabel =
       diameterInches !== null && formatLinearFromInches
-        ? `#${i + 1} D${formatLinearFromInches(diameterInches, 2)}`
-        : `#${i + 1} D${diameterPx.toFixed(1)} px`;
+        ? `${groupLabelPrefix} D${formatLinearFromInches(diameterInches, 2)}`
+        : `${groupLabelPrefix} D${diameterPx.toFixed(1)} px`;
     context.font = "10px sans-serif";
     const textWidth = context.measureText(sizeLabel).width;
     const labelPaddingX = 4;
@@ -3586,7 +3726,9 @@ export default function Home() {
   const [selectedVideoName, setSelectedVideoName] = useState<string | null>(null);
   const [selectedVideoPreviewUrl, setSelectedVideoPreviewUrl] = useState<string | null>(null);
   const [captureMode, setCaptureMode] = useState<"upload" | "stream">("upload");
-  const [streamUrl, setStreamUrl] = useState("");
+  const [streamCameraActive, setStreamCameraActive] = useState(false);
+  const [streamCameraFacingMode, setStreamCameraFacingMode] = useState<"environment" | "user">("environment");
+  const [streamCameraError, setStreamCameraError] = useState<string | null>(null);
   const [opencvReady, setOpenCvReady] = useState(false);
   const [opencvError, setOpenCvError] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
@@ -3599,14 +3741,19 @@ export default function Home() {
   const [calibrationDistanceInches, setCalibrationDistanceInches] = useState(252);
   const [manualDistanceOverrideInches] = useState(0);
   const [focalScalePxIn, setFocalScalePxIn] = useState(0);
-  const [matchThreshold, setMatchThreshold] = useState(20);
-  const [trackingMode, setTrackingMode] = useState<TrackingMode>("template");
+  const matchThreshold = 20;
+  const trackingMode: TrackingMode = "template";
   const [logEntries, setLogEntries] = useState<DetectionLogEntry[]>([]);
   const [shotLogEntries, setShotLogEntries] = useState<ShotLogEntry[]>([]);
   const [lastDetection, setLastDetection] = useState<DetectionLogEntry | null>(null);
   const [lastShot, setLastShot] = useState<ShotLogEntry | null>(null);
   const [roiRect, setRoiRect] = useState<RoiRect | null>(null);
   const [isSelectingRoi, setIsSelectingRoi] = useState(false);
+  const [roiMeasurementLengthInches, setRoiMeasurementLengthInches] = useState(1);
+  const [roiMagnifiedDataUrl, setRoiMagnifiedDataUrl] = useState<string | null>(null);
+  const [roiSelectionPixelSize, setRoiSelectionPixelSize] = useState<{ widthPx: number; heightPx: number } | null>(null);
+  const [roiMeasurementLine, setRoiMeasurementLine] = useState<NormalizedMeasurementLine | null>(null);
+  const [isDrawingRoiMeasurementLine, setIsDrawingRoiMeasurementLine] = useState(false);
   const [howlerReady, setHowlerReady] = useState(false);
   const [howlerError, setHowlerError] = useState<string | null>(null);
   const [spikeMetadata, setSpikeMetadata] = useState<SpikeMetadata[]>([]);
@@ -3638,10 +3785,17 @@ export default function Home() {
   const formatLinearFromInches = (valueInches: number, fractionDigits = 1) =>
     `${toDisplayLinearValue(valueInches, fractionDigits).toFixed(fractionDigits)} ${activeLinearUnitLabel}`;
 
-  const shotClustering = useMemo<ShotClusteringResult>(
-    () => clusterShotsBySpaceTime(shotLogEntries, tweakSettings),
-    [shotLogEntries, tweakSettings],
-  );
+  const shotClustering = useMemo<ShotClusteringResult>(() => {
+    let analysisTimeSec = Number.NEGATIVE_INFINITY;
+    for (const entry of logEntries) {
+      if (entry.videoTimeSec > analysisTimeSec) analysisTimeSec = entry.videoTimeSec;
+    }
+    for (const shot of shotLogEntries) {
+      if (shot.videoTimeSec > analysisTimeSec) analysisTimeSec = shot.videoTimeSec;
+    }
+    const eligibleShots = filterShotsByAnalysisAge(shotLogEntries, analysisTimeSec, CLUSTER_MIN_VISIBLE_AGE_SEC);
+    return clusterShotsBySpaceTime(eligibleShots, tweakSettings);
+  }, [logEntries, shotLogEntries, tweakSettings]);
   const clusterColorById = useMemo<Record<number, string>>(() => {
     const map: Record<number, string> = {};
     for (const cluster of shotClustering.clusters) {
@@ -3656,15 +3810,13 @@ export default function Home() {
       ).length,
     [tweakSettings],
   );
-  const hasUploadedVideo = captureMode === "upload" && !!selectedVideoPreviewUrl;
+  const hasUploadedVideo = captureMode === "upload" ? !!selectedVideoPreviewUrl : streamCameraActive;
   const hasReferenceFrame = !!selectedImagePreviewUrl;
   const hasDrawnGeometry = !!roiRect && roiRect.width >= 0.01 && roiRect.height >= 0.01;
   const hasScaleCalibration = pixelsPerInch > 0 || focalScalePxIn > 0;
   const hasResultData = logEntries.length > 0 || shotLogEntries.length > 0;
   const workflowStep: WorkflowStep =
-    captureMode !== "upload"
-      ? "upload_video"
-      : !hasUploadedVideo
+    !hasUploadedVideo
         ? "upload_video"
         : !hasReferenceFrame
           ? "capture_frame"
@@ -3677,6 +3829,20 @@ export default function Home() {
                 : "export";
   const highlightActionClass =
     "ring-2 ring-amber-300 border-amber-300 bg-amber-500/10 text-amber-100 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]";
+  const roiMeasurementMetrics = useMemo(() => {
+    if (!roiMeasurementLine || !roiSelectionPixelSize) return null;
+    const dxPx = (roiMeasurementLine.endX - roiMeasurementLine.startX) * roiSelectionPixelSize.widthPx;
+    const dyPx = (roiMeasurementLine.endY - roiMeasurementLine.startY) * roiSelectionPixelSize.heightPx;
+    const pixelLength = Math.hypot(dxPx, dyPx);
+    if (!Number.isFinite(pixelLength) || pixelLength <= 0) return null;
+    const knownLengthInches = Math.max(0, roiMeasurementLengthInches);
+    const nextPixelsPerInch = knownLengthInches > 0 ? pixelLength / knownLengthInches : null;
+    return {
+      pixelLength,
+      knownLengthInches,
+      pixelsPerInch: nextPixelsPerInch,
+    };
+  }, [roiMeasurementLine, roiMeasurementLengthInches, roiSelectionPixelSize]);
 
   const updateTweakSetting = (key: keyof TweakSettings, value: number) => {
     if (!Number.isFinite(value)) return;
@@ -3805,6 +3971,7 @@ export default function Home() {
   const processedYellowGreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const imagePreviewRef = useRef<HTMLImageElement | null>(null);
+  const roiMeasurementCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoSourceSectionRef = useRef<HTMLElement | null>(null);
   const captureFrameButtonRef = useRef<HTMLButtonElement | null>(null);
   const roiContainerRef = useRef<HTMLDivElement | null>(null);
@@ -3824,6 +3991,9 @@ export default function Home() {
   const lastShotAtMsRef = useRef(0);
   const roiRectRef = useRef<RoiRect | null>(null);
   const roiStartRef = useRef<{ x: number; y: number } | null>(null);
+  const roiMeasurementLineStartRef = useRef<{ x: number; y: number } | null>(null);
+  const roiMagnifiedImageRef = useRef<HTMLImageElement | null>(null);
+  const streamMediaRef = useRef<MediaStream | null>(null);
   const spikeEventsRef = useRef<SpikeMetadata[]>([]);
   const scanVideoRef = useRef<HTMLVideoElement | null>(null);
   const analyzedPlaybackVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -3843,6 +4013,16 @@ export default function Home() {
   });
   const liveClusterColorByIdRef = useRef<Record<number, string>>({});
   const liveClusterShotCountRef = useRef(0);
+  const liveClusterLastUpdatedAtMsRef = useRef(0);
+  const liveContourGroupVisualsRef = useRef<{
+    updatedAtMs: number;
+    regionColors: string[];
+    regionGroupLabels: string[];
+  }>({
+    updatedAtMs: 0,
+    regionColors: [],
+    regionGroupLabels: [],
+  });
   const audioRmsTimelineRef = useRef<AudioRmsSample[]>([]);
   const audioMeanDbfsRef = useRef(-120);
   const audioThresholdDbfsRef = useRef(-120);
@@ -3857,6 +4037,100 @@ export default function Home() {
   const analysisVideoCacheRequestIdRef = useRef(0);
   const relaxedShotGateNoticeRef = useRef(false);
   const lastHistogramDeltaPctRef = useRef(0);
+
+  const stopStreamCamera = useCallback(() => {
+    const stream = streamMediaRef.current;
+    if (stream) {
+      for (const track of stream.getTracks()) {
+        track.stop();
+      }
+      streamMediaRef.current = null;
+    }
+
+    const videoEl = videoRef.current;
+    if (videoEl?.srcObject) {
+      videoEl.pause();
+      videoEl.srcObject = null;
+    }
+    const overlayEl = overlayCanvasRef.current;
+    if (overlayEl) {
+      const overlayContext = overlayEl.getContext("2d");
+      overlayContext?.clearRect(0, 0, overlayEl.width, overlayEl.height);
+    }
+    setStreamCameraActive(false);
+  }, []);
+
+  const startStreamCamera = useCallback(
+    async (preferredFacingMode?: "environment" | "user") => {
+      if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+        const message = "Camera streaming is not supported in this browser.";
+        setStreamCameraError(message);
+        setScanStatus(message);
+        return false;
+      }
+
+      const facingMode = preferredFacingMode ?? streamCameraFacingMode;
+      const constraintsWithFacing: MediaStreamConstraints = {
+        audio: false,
+        video: {
+          facingMode: { ideal: facingMode },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
+      };
+      const fallbackConstraints: MediaStreamConstraints = {
+        audio: false,
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+      };
+
+      stopStreamCamera();
+      try {
+        let stream: MediaStream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraintsWithFacing);
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia(fallbackConstraints);
+        }
+
+        streamMediaRef.current = stream;
+        const videoEl = videoRef.current;
+        if (!videoEl) {
+          setScanStatus("Camera preview element unavailable.");
+          stopStreamCamera();
+          return false;
+        }
+
+        videoEl.srcObject = stream;
+        videoEl.playsInline = true;
+        videoEl.muted = true;
+        await videoEl.play().catch(() => undefined);
+
+        setStreamCameraFacingMode(facingMode);
+        setStreamCameraActive(true);
+        setStreamCameraError(null);
+        setScanStatus(`Device camera stream ready (${facingMode === "environment" ? "rear" : "front"} camera).`);
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unable to access device camera.";
+        setStreamCameraError(message);
+        setScanStatus(`Camera access failed: ${message}`);
+        setStreamCameraActive(false);
+        return false;
+      }
+    },
+    [stopStreamCamera, streamCameraFacingMode],
+  );
+
+  const toggleStreamCameraFacingMode = useCallback(async () => {
+    const nextFacingMode = streamCameraFacingMode === "environment" ? "user" : "environment";
+    setStreamCameraFacingMode(nextFacingMode);
+    if (captureMode === "stream" && streamCameraActive) {
+      await startStreamCamera(nextFacingMode);
+    }
+  }, [captureMode, startStreamCamera, streamCameraActive, streamCameraFacingMode]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -3912,6 +4186,13 @@ export default function Home() {
       revokeBlobUrl(selectedVideoPreviewUrl);
     };
   }, [selectedVideoPreviewUrl]);
+
+  useEffect(() => {
+    if (captureMode !== "stream") {
+      setStreamCameraError(null);
+      stopStreamCamera();
+    }
+  }, [captureMode, stopStreamCamera]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -3970,6 +4251,10 @@ export default function Home() {
     if (previousStep === "draw_geometry" && (workflowStep === "calibrate" || workflowStep === "scan")) {
       return;
     }
+    // Keep viewport stable after analysis; avoid auto-jumping into Resulting Data/logs.
+    if (previousStep === "scan" && workflowStep === "export") {
+      return;
+    }
 
     const targetElement =
       workflowStep === "upload_video"
@@ -3997,6 +4282,7 @@ export default function Home() {
 
   useEffect(() => {
     return () => {
+      stopStreamCamera();
       if (howlRef.current) {
         howlRef.current.unload();
         howlRef.current = null;
@@ -4014,7 +4300,7 @@ export default function Home() {
         playPauseTimeoutRef.current = null;
       }
     };
-  }, []);
+  }, [stopStreamCamera]);
 
   const stopAnalyzedPlayback = () => {
     if (analyzedPlaybackRafRef.current) {
@@ -4110,6 +4396,202 @@ export default function Home() {
     }
   };
 
+  const clearRoiLineCalibrationState = useCallback(() => {
+    setRoiMagnifiedDataUrl(null);
+    setRoiSelectionPixelSize(null);
+    setRoiMeasurementLine(null);
+    setIsDrawingRoiMeasurementLine(false);
+    roiMeasurementLineStartRef.current = null;
+    roiMagnifiedImageRef.current = null;
+    const canvas = roiMeasurementCanvasRef.current;
+    if (canvas) {
+      const context = canvas.getContext("2d");
+      context?.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }, []);
+
+  const renderRoiMeasurementCanvas = useCallback(() => {
+    const canvas = roiMeasurementCanvasRef.current;
+    const image = roiMagnifiedImageRef.current;
+    if (!canvas || !image || !roiSelectionPixelSize) return;
+
+    const width = Math.max(1, Math.round(roiSelectionPixelSize.widthPx));
+    const height = Math.max(1, Math.round(roiSelectionPixelSize.heightPx));
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.clearRect(0, 0, width, height);
+    context.imageSmoothingEnabled = false;
+    context.drawImage(image, 0, 0, width, height);
+
+    if (!roiMeasurementLine) return;
+    const x1 = clamp01(roiMeasurementLine.startX) * width;
+    const y1 = clamp01(roiMeasurementLine.startY) * height;
+    const x2 = clamp01(roiMeasurementLine.endX) * width;
+    const y2 = clamp01(roiMeasurementLine.endY) * height;
+    const pixelLength = Math.hypot(x2 - x1, y2 - y1);
+
+    context.strokeStyle = "rgba(248, 113, 113, 0.98)";
+    context.lineWidth = Math.max(1.5, Math.min(4, Math.max(width, height) * 0.01));
+    context.beginPath();
+    context.moveTo(x1, y1);
+    context.lineTo(x2, y2);
+    context.stroke();
+
+    const endpointRadius = Math.max(2, Math.min(6, Math.max(width, height) * 0.015));
+    context.fillStyle = "rgba(248, 113, 113, 0.98)";
+    context.beginPath();
+    context.arc(x1, y1, endpointRadius, 0, Math.PI * 2);
+    context.fill();
+    context.beginPath();
+    context.arc(x2, y2, endpointRadius, 0, Math.PI * 2);
+    context.fill();
+
+    const label = `${pixelLength.toFixed(1)} px`;
+    const labelX = Math.max(3, Math.min(width - 90, (x1 + x2) / 2 - 32));
+    const labelY = Math.max(14, Math.min(height - 4, (y1 + y2) / 2 - 6));
+    context.fillStyle = "rgba(0, 0, 0, 0.72)";
+    context.fillRect(labelX - 3, labelY - 10, 72, 14);
+    context.fillStyle = "#fca5a5";
+    context.font = "10px sans-serif";
+    context.fillText(label, labelX, labelY);
+  }, [roiMeasurementLine, roiSelectionPixelSize]);
+
+  useEffect(() => {
+    if (isSelectingRoi) return;
+    const activeRoi = roiRectRef.current ?? roiRect;
+    if (!selectedImagePreviewUrl || !activeRoi || activeRoi.width < 0.01 || activeRoi.height < 0.01) {
+      clearRoiLineCalibrationState();
+      return;
+    }
+
+    let isCancelled = false;
+    void (async () => {
+      try {
+        const [dataUrl, pixelSize] = await Promise.all([
+          createTemplateRegionDataUrl(selectedImagePreviewUrl, activeRoi),
+          getSelectionPixelSize(selectedImagePreviewUrl, activeRoi),
+        ]);
+        if (isCancelled) return;
+        setRoiMagnifiedDataUrl(dataUrl);
+        setRoiSelectionPixelSize(pixelSize);
+        setRoiMeasurementLine(null);
+      } catch {
+        if (!isCancelled) {
+          clearRoiLineCalibrationState();
+        }
+      }
+    })();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [clearRoiLineCalibrationState, isSelectingRoi, roiRect, selectedImagePreviewUrl]);
+
+  useEffect(() => {
+    if (!roiMagnifiedDataUrl) {
+      roiMagnifiedImageRef.current = null;
+      renderRoiMeasurementCanvas();
+      return;
+    }
+
+    let isCancelled = false;
+    const image = new Image();
+    image.onload = () => {
+      if (isCancelled) return;
+      roiMagnifiedImageRef.current = image;
+      renderRoiMeasurementCanvas();
+    };
+    image.onerror = () => {
+      if (isCancelled) return;
+      roiMagnifiedImageRef.current = null;
+      renderRoiMeasurementCanvas();
+    };
+    image.src = roiMagnifiedDataUrl;
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [renderRoiMeasurementCanvas, roiMagnifiedDataUrl]);
+
+  useEffect(() => {
+    renderRoiMeasurementCanvas();
+  }, [renderRoiMeasurementCanvas]);
+
+  const linePointFromClient = (clientX: number, clientY: number): { x: number; y: number } | null => {
+    const canvas = roiMeasurementCanvasRef.current;
+    if (!canvas) return null;
+    const bounds = canvas.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return null;
+    return {
+      x: clamp01((clientX - bounds.left) / bounds.width),
+      y: clamp01((clientY - bounds.top) / bounds.height),
+    };
+  };
+
+  const startRoiMeasurementLineSelection = (clientX: number, clientY: number) => {
+    const point = linePointFromClient(clientX, clientY);
+    if (!point) return;
+    roiMeasurementLineStartRef.current = point;
+    setIsDrawingRoiMeasurementLine(true);
+    setRoiMeasurementLine({
+      startX: point.x,
+      startY: point.y,
+      endX: point.x,
+      endY: point.y,
+    });
+  };
+
+  const updateRoiMeasurementLineSelection = (clientX: number, clientY: number) => {
+    if (!isDrawingRoiMeasurementLine) return;
+    const start = roiMeasurementLineStartRef.current;
+    if (!start) return;
+    const point = linePointFromClient(clientX, clientY);
+    if (!point) return;
+    setRoiMeasurementLine({
+      startX: start.x,
+      startY: start.y,
+      endX: point.x,
+      endY: point.y,
+    });
+  };
+
+  const endRoiMeasurementLineSelection = () => {
+    setIsDrawingRoiMeasurementLine(false);
+    roiMeasurementLineStartRef.current = null;
+    setRoiMeasurementLine((current) => {
+      if (!current || !roiSelectionPixelSize) return null;
+      const dxPx = (current.endX - current.startX) * roiSelectionPixelSize.widthPx;
+      const dyPx = (current.endY - current.startY) * roiSelectionPixelSize.heightPx;
+      return Math.hypot(dxPx, dyPx) >= 2 ? current : null;
+    });
+  };
+
+  const applyCalibrationFromRoiMeasurementLine = () => {
+    if (!roiMeasurementMetrics || !roiMeasurementMetrics.pixelsPerInch || roiMeasurementMetrics.pixelsPerInch <= 0) {
+      setScanStatus(`Draw a line and enter a positive length in ${activeLinearUnitLabel}.`);
+      return;
+    }
+
+    const nextPixelsPerInch = roiMeasurementMetrics.pixelsPerInch;
+    setPixelsPerInch(nextPixelsPerInch);
+    if (calibrationDistanceInches > 0) {
+      setFocalScalePxIn(nextPixelsPerInch * calibrationDistanceInches);
+    } else {
+      setFocalScalePxIn(0);
+    }
+    setScanStatus(
+      `Line calibration applied: ${roiMeasurementMetrics.pixelLength.toFixed(1)} px = ${formatLinearFromInches(
+        roiMeasurementMetrics.knownLengthInches,
+        3,
+      )}.`,
+    );
+  };
+
   const hasAnalysisCoverageForWindow = useCallback(
     (windowStartSec: number, windowEndSec: number): boolean => {
       const safeStart = Math.min(windowStartSec, windowEndSec);
@@ -4178,6 +4660,7 @@ export default function Home() {
         setSelectedImagePreviewUrl(previewUrl);
         setRoiRect(null);
         roiRectRef.current = null;
+        clearRoiLineCalibrationState();
         setFocalScalePxIn(0);
         clearTemplateRegionCache();
         return;
@@ -4193,6 +4676,7 @@ export default function Home() {
       setSelectedImagePreviewUrl(null);
       setRoiRect(null);
       roiRectRef.current = null;
+      clearRoiLineCalibrationState();
       setFocalScalePxIn(0);
       clearTemplateRegionCache();
       setSpikeMetadata([]);
@@ -4206,8 +4690,12 @@ export default function Home() {
 
   const captureReferenceFrameFromVideo = () => {
     const videoEl = videoRef.current;
-    if (!videoEl || !selectedVideoPreviewUrl) {
-      setScanStatus("Upload a video first, then capture a reference frame.");
+    if (!videoEl || (captureMode === "upload" ? !selectedVideoPreviewUrl : !streamCameraActive)) {
+      setScanStatus(
+        captureMode === "upload"
+          ? "Upload a video first, then capture a reference frame."
+          : "Start the device camera stream first, then capture a reference frame.",
+      );
       return;
     }
 
@@ -4230,12 +4718,17 @@ export default function Home() {
     frameCtx.drawImage(videoEl, 0, 0, width, height);
     const frameDataUrl = frameCanvas.toDataURL("image/png");
     revokeBlobUrl(selectedImagePreviewUrl);
+    const frameSourceName =
+      captureMode === "upload"
+        ? (selectedVideoName ?? "video").replace(/\.[^/.]+$/, "")
+        : `stream-${streamCameraFacingMode === "environment" ? "rear" : "front"}-camera`;
     setSelectedImageName(
-      `${(selectedVideoName ?? "video").replace(/\.[^/.]+$/, "")}-frame-${videoEl.currentTime.toFixed(2)}s.png`,
+      `${frameSourceName}-frame-${videoEl.currentTime.toFixed(2)}s.png`,
     );
     setSelectedImagePreviewUrl(frameDataUrl);
     setRoiRect(null);
     roiRectRef.current = null;
+    clearRoiLineCalibrationState();
     setFocalScalePxIn(0);
     clearTemplateRegionCache();
     setScanStatus("Reference frame captured. Drag to select target geometry.");
@@ -4364,6 +4857,7 @@ export default function Home() {
   const clearRoiSelection = () => {
     roiRectRef.current = null;
     setRoiRect(null);
+    clearRoiLineCalibrationState();
     setFocalScalePxIn(0);
     clearTemplateRegionCache();
   };
@@ -4427,9 +4921,12 @@ export default function Home() {
       cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
     }
-    if (videoRef.current) videoRef.current.pause();
+    if (videoRef.current && captureMode === "upload") videoRef.current.pause();
     if (scanVideoRef.current) {
-      scanVideoRef.current.pause();
+      const shouldPauseScanVideo = !(captureMode === "stream" && streamCameraActive && scanVideoRef.current === videoRef.current);
+      if (shouldPauseScanVideo) {
+        scanVideoRef.current.pause();
+      }
       scanVideoRef.current = null;
     }
     if (howlRef.current) {
@@ -4460,6 +4957,8 @@ export default function Home() {
     };
     liveClusterColorByIdRef.current = {};
     liveClusterShotCountRef.current = 0;
+    liveClusterLastUpdatedAtMsRef.current = 0;
+    liveContourGroupVisualsRef.current = { updatedAtMs: 0, regionColors: [], regionGroupLabels: [] };
     setIsScanning(false);
     setDetectionEnabled(false);
     setDetectionConfidence(null);
@@ -4469,17 +4968,17 @@ export default function Home() {
   };
 
   const startScan = async (options?: StartScanOptions) => {
-    const requestedWindow = options?.forcedWindow ?? null;
-    const requiresAudioPipeline = !requestedWindow;
+    const isStreamScan = captureMode === "stream";
+    const requestedWindow = isStreamScan ? null : options?.forcedWindow ?? null;
+    const requiresAudioPipeline = !requestedWindow && !isStreamScan;
     const runtimeCv = window.cv as unknown as CvApi | undefined;
 
-    if (!opencvReady || !runtimeCv || (requiresAudioPipeline && (!howlerReady || !window.Howl))) {
-      setScanStatus("OpenCV.js or Howler.js is not ready yet.");
+    if (!opencvReady || !runtimeCv) {
+      setScanStatus("OpenCV.js is not ready yet.");
       return;
     }
-
-    if (captureMode !== "upload") {
-      setScanStatus("Video scanning is implemented for uploaded video in this step.");
+    if (requiresAudioPipeline && (!howlerReady || !window.Howl)) {
+      setScanStatus("Howler.js is not ready yet.");
       return;
     }
 
@@ -4487,8 +4986,16 @@ export default function Home() {
     const canvasEl = processingCanvasRef.current;
     const overlayEl = overlayCanvasRef.current;
 
-    if (!previewVideoEl || !canvasEl || !overlayEl || !selectedVideoFile || !selectedVideoPreviewUrl) {
+    if (!previewVideoEl || !canvasEl || !overlayEl) {
+      setScanStatus("Video preview or analysis canvases are unavailable.");
+      return;
+    }
+    if (!isStreamScan && (!selectedVideoFile || !selectedVideoPreviewUrl)) {
       setScanStatus("Upload a reference video first.");
+      return;
+    }
+    if (isStreamScan && (!streamCameraActive || !previewVideoEl.srcObject)) {
+      setScanStatus("Start the device camera stream first.");
       return;
     }
 
@@ -4569,33 +5076,40 @@ export default function Home() {
         }
       }
 
-      previewVideoEl.pause();
+      let videoEl: HTMLVideoElement;
+      if (isStreamScan) {
+        videoEl = previewVideoEl;
+        videoEl.muted = true;
+        videoEl.playsInline = true;
+        scanVideoRef.current = videoEl;
+      } else {
+        previewVideoEl.pause();
+        videoEl = document.createElement("video");
+        videoEl.src = selectedVideoPreviewUrl!;
+        videoEl.preload = "auto";
+        videoEl.muted = true;
+        videoEl.playsInline = true;
+        scanVideoRef.current = videoEl;
 
-      const videoEl = document.createElement("video");
-      videoEl.src = selectedVideoPreviewUrl;
-      videoEl.preload = "auto";
-      videoEl.muted = true;
-      videoEl.playsInline = true;
-      scanVideoRef.current = videoEl;
+        if (videoEl.readyState < HTMLMediaElement.HAVE_METADATA) {
+          await new Promise<void>((resolve, reject) => {
+            const onLoadedMetadata = () => {
+              cleanup();
+              resolve();
+            };
+            const onError = () => {
+              cleanup();
+              reject(new Error("Unable to load video metadata for scanning."));
+            };
+            const cleanup = () => {
+              videoEl.removeEventListener("loadedmetadata", onLoadedMetadata);
+              videoEl.removeEventListener("error", onError);
+            };
 
-      if (videoEl.readyState < HTMLMediaElement.HAVE_METADATA) {
-        await new Promise<void>((resolve, reject) => {
-          const onLoadedMetadata = () => {
-            cleanup();
-            resolve();
-          };
-          const onError = () => {
-            cleanup();
-            reject(new Error("Unable to load video metadata for scanning."));
-          };
-          const cleanup = () => {
-            videoEl.removeEventListener("loadedmetadata", onLoadedMetadata);
-            videoEl.removeEventListener("error", onError);
-          };
-
-          videoEl.addEventListener("loadedmetadata", onLoadedMetadata, { once: true });
-          videoEl.addEventListener("error", onError, { once: true });
-        });
+            videoEl.addEventListener("loadedmetadata", onLoadedMetadata, { once: true });
+            videoEl.addEventListener("error", onError, { once: true });
+          });
+        }
       }
 
       const templateMat = cv.imread(activeTemplateCanvas);
@@ -4638,6 +5152,8 @@ export default function Home() {
       };
       liveClusterColorByIdRef.current = {};
       liveClusterShotCountRef.current = 0;
+      liveClusterLastUpdatedAtMsRef.current = 0;
+      liveContourGroupVisualsRef.current = { updatedAtMs: 0, regionColors: [], regionGroupLabels: [] };
       audioRmsTimelineRef.current = [];
       audioMeanDbfsRef.current = -120;
       audioThresholdDbfsRef.current = -120;
@@ -4658,15 +5174,21 @@ export default function Home() {
       setSpritesReady(false);
       setIsScanning(true);
       setScanStatus(
-        requestedWindow
+        isStreamScan
+          ? "Starting live device-camera OpenCV analysis..."
+          : requestedWindow
           ? `Preparing focused analysis (${requestedWindow.start.toFixed(2)}s-${requestedWindow.end.toFixed(2)}s)...`
           : FORCE_OPEN_SHOT_GATES
             ? "Starting concurrent audio + OpenCV analysis (all shot gates open)..."
             : "Starting concurrent audio + OpenCV analysis...",
       );
 
-      const durationSec = Number.isFinite(videoEl.duration) && videoEl.duration > 0 ? videoEl.duration : 0;
-      if (durationSec <= 0) {
+      const durationSec = isStreamScan
+        ? Number.POSITIVE_INFINITY
+        : Number.isFinite(videoEl.duration) && videoEl.duration > 0
+          ? videoEl.duration
+          : 0;
+      if (!isStreamScan && durationSec <= 0) {
         templateGray.delete();
         if (trackingHist) trackingHist.delete();
         setIsScanning(false);
@@ -4674,7 +5196,23 @@ export default function Home() {
         return;
       }
 
-      if (requestedWindow) {
+      if (isStreamScan) {
+        spikeEventsRef.current = [];
+        spikeWindowsRef.current = [{ start: 0, end: Number.POSITIVE_INFINITY }];
+        setSpikeMetadata([]);
+        setAudioSignatureCatalog([]);
+        setAudioSprites({});
+        setSpritesReady(false);
+        audioReadyRef.current = true;
+        audioRmsTimelineRef.current = [];
+        audioMeanDbfsRef.current = -120;
+        audioThresholdDbfsRef.current = -120;
+        if (howlRef.current) {
+          howlRef.current.unload();
+          howlRef.current = null;
+        }
+        setScanStatus("Live camera stream ready. Running OpenCV analysis.");
+      } else if (requestedWindow) {
         const boundedStart = Math.max(0, Math.min(durationSec, requestedWindow.start));
         const boundedEnd = Math.max(boundedStart, Math.min(durationSec, requestedWindow.end));
         const fallbackTimeSec = boundedStart + (boundedEnd - boundedStart) / 2;
@@ -4715,7 +5253,7 @@ export default function Home() {
         }
         const audioTask = (async () => {
           const audioContext = new AudioContext();
-          const fileBuffer = await selectedVideoFile.arrayBuffer();
+          const fileBuffer = await selectedVideoFile!.arrayBuffer();
           const decodedAudio = await audioContext.decodeAudioData(fileBuffer.slice(0));
           await audioContext.close();
 
@@ -4746,7 +5284,7 @@ export default function Home() {
 
           const howl = await new Promise<HowlInstance>((resolve, reject) => {
             const instance = new HowlCtor({
-              src: [selectedVideoPreviewUrl],
+              src: [selectedVideoPreviewUrl!],
               html5: true,
               preload: true,
               sprite: spriteMap,
@@ -5150,9 +5688,6 @@ export default function Home() {
               const patchHeight = changeProbeCanvas.height;
               const probeImageData = changeProbeContext.getImageData(0, 0, patchWidth, patchHeight);
               const currentPatchRgba = probeImageData.data;
-              if (processedPatchContext) {
-                drawPatchWindowView(processedPatchContext, currentPatchRgba, patchWidth, patchHeight, "Probe patch (live)");
-              }
               if (processedContourCanvas) {
                 processedContourCanvas.width = patchWidth;
                 processedContourCanvas.height = patchHeight;
@@ -6028,6 +6563,9 @@ export default function Home() {
             }
             } catch {
               resetShotFlowState();
+              if (processedPatchContext && processedPatchCanvas) {
+                processedPatchContext.clearRect(0, 0, processedPatchCanvas.width, processedPatchCanvas.height);
+              }
               if (processedContourContext && processedContourCanvas) {
                 processedContourContext.clearRect(0, 0, processedContourCanvas.width, processedContourCanvas.height);
               }
@@ -6108,49 +6646,111 @@ export default function Home() {
           }
 
           const visibleShotMarkers = shotMarkersRef.current;
-          if (shotMarkersRef.current.length !== liveClusterShotCountRef.current) {
-            const liveClustering = clusterShotsBySpaceTime(shotMarkersRef.current, tweakSettings);
-            liveShotClusteringRef.current = liveClustering;
-            const liveColorMap: Record<number, string> = {};
-            for (const cluster of liveClustering.clusters) {
-              liveColorMap[cluster.clusterId] = clusterColorForId(cluster.clusterId);
+          const eligibleLiveShotsForClustering = filterShotsByAnalysisAge(
+            visibleShotMarkers,
+            currentSec,
+            CLUSTER_MIN_VISIBLE_AGE_SEC,
+          );
+          const clusterNowMs = performance.now();
+          if (eligibleLiveShotsForClustering.length === 0) {
+            if (liveClusterShotCountRef.current !== 0) {
+              liveShotClusteringRef.current = {
+                selectedK: 0,
+                finalK: 0,
+                closeMergeCount: 0,
+                objectiveScore: 0,
+                shotClusterById: {},
+                clusters: [],
+              };
+              liveClusterColorByIdRef.current = {};
+              liveClusterShotCountRef.current = 0;
+              liveClusterLastUpdatedAtMsRef.current = 0;
+              liveContourGroupVisualsRef.current = { updatedAtMs: 0, regionColors: [], regionGroupLabels: [] };
             }
-            liveClusterColorByIdRef.current = liveColorMap;
-            liveClusterShotCountRef.current = shotMarkersRef.current.length;
+          } else {
+            const shotCountChanged = eligibleLiveShotsForClustering.length !== liveClusterShotCountRef.current;
+            const clusterUpdateDue =
+              clusterNowMs - liveClusterLastUpdatedAtMsRef.current >= LIVE_GROUP_UPDATE_INTERVAL_MS;
+            if (shotCountChanged && clusterUpdateDue) {
+              const liveClustering = clusterShotsBySpaceTime(eligibleLiveShotsForClustering, tweakSettings);
+              liveShotClusteringRef.current = liveClustering;
+              const liveColorMap: Record<number, string> = {};
+              for (const cluster of liveClustering.clusters) {
+                liveColorMap[cluster.clusterId] = clusterColorForId(cluster.clusterId);
+              }
+              liveClusterColorByIdRef.current = liveColorMap;
+              liveClusterShotCountRef.current = eligibleLiveShotsForClustering.length;
+              liveClusterLastUpdatedAtMsRef.current = clusterNowMs;
+            }
           }
           const liveClusterByShotId = liveShotClusteringRef.current.shotClusterById;
           const liveClusterColorById = liveClusterColorByIdRef.current;
           const visibleClusterGeometry = clusterGeometryFromShots(visibleShotMarkers, liveClusterByShotId);
           drawClusterGeometry(overlayContext, visibleClusterGeometry, liveClusterColorById, scaleX, scaleY);
+          let contourRegionColorsForFrame: string[] | undefined;
+          let contourRegionGroupLabelsForFrame: string[] | undefined;
           if (contourWindowSnapshotForFrame && contourWindowSnapshotForFrame.regions.length > 0) {
-            const contourRegionColors = contourWindowSnapshotForFrame.regions.slice(0, 10).map((region, index) => {
-              let nearestShot: ShotLogEntry | null = null;
-              let nearestDistance = Number.POSITIVE_INFINITY;
-              for (const shot of visibleShotMarkers) {
-                const patchShotX = ((shot.centerX - drawRect.x) / Math.max(1, drawRect.width)) * contourWindowSnapshotForFrame.patchWidthPx;
-                const patchShotY = ((shot.centerY - drawRect.y) / Math.max(1, drawRect.height)) * contourWindowSnapshotForFrame.patchHeightPx;
-                const distance = Math.hypot(region.centerX - patchShotX, region.centerY - patchShotY);
-                if (distance < nearestDistance) {
-                  nearestDistance = distance;
-                  nearestShot = shot;
-                }
+            const cachedContourVisuals = liveContourGroupVisualsRef.current;
+            const contourVisualsDue =
+              cachedContourVisuals.regionColors.length === 0 ||
+              clusterNowMs - cachedContourVisuals.updatedAtMs >= LIVE_GROUP_UPDATE_INTERVAL_MS;
+            if (contourVisualsDue) {
+              const contourVisuals = buildContourRegionClusterVisuals(
+                contourWindowSnapshotForFrame,
+                drawRect,
+                eligibleLiveShotsForClustering,
+                liveClusterByShotId,
+                liveClusterColorById,
+              );
+              liveContourGroupVisualsRef.current = {
+                updatedAtMs: clusterNowMs,
+                regionColors: contourVisuals.regionColors,
+                regionGroupLabels: contourVisuals.regionGroupLabels,
+              };
+            }
+            contourRegionColorsForFrame = liveContourGroupVisualsRef.current.regionColors;
+            contourRegionGroupLabelsForFrame = liveContourGroupVisualsRef.current.regionGroupLabels;
+            const contourCanvas = processedContourCanvasRef.current;
+            const contourContext = contourCanvas?.getContext("2d") ?? null;
+            if (contourCanvas && contourContext) {
+              if (
+                contourCanvas.width !== contourWindowSnapshotForFrame.patchWidthPx ||
+                contourCanvas.height !== contourWindowSnapshotForFrame.patchHeightPx
+              ) {
+                contourCanvas.width = contourWindowSnapshotForFrame.patchWidthPx;
+                contourCanvas.height = contourWindowSnapshotForFrame.patchHeightPx;
               }
-              if (nearestShot) {
-                const clusterId = liveClusterByShotId[nearestShot.id];
-                if (clusterId !== undefined) {
-                  return liveClusterColorById[clusterId] ?? clusterColorForId(clusterId);
-                }
-              }
-              return clusterColorForId(index + 1);
-            });
+              drawContourRegionWindowOverlays(
+                contourContext,
+                contourWindowSnapshotForFrame.regions,
+                contourRegionColorsForFrame,
+                contourRegionGroupLabelsForFrame,
+              );
+            }
             drawContourRegionsOnTargetView(
               context,
               contourWindowSnapshotForFrame,
               drawRect,
               isBlinkOn,
-              contourRegionColors,
+              contourRegionColorsForFrame,
               pixelsPerInch,
               formatLinearFromInches,
+              contourRegionGroupLabelsForFrame,
+            );
+          }
+          if (processedPatchContext) {
+            drawPatchWindowView(processedPatchContext, videoEl, drawRect);
+            drawProbePatchOverlayView(
+              processedPatchContext,
+              drawRect.width,
+              drawRect.height,
+              overlayLabel,
+              isBlinkOn,
+              contourWindowSnapshotForFrame,
+              contourRegionColorsForFrame,
+              pixelsPerInch,
+              formatLinearFromInches,
+              contourRegionGroupLabelsForFrame,
             );
           }
           const oneInchRadiusPx = pixelsPerInch > 0 ? pixelsPerInch / 2 : 0;
@@ -6192,7 +6792,7 @@ export default function Home() {
               overlayContext.fillStyle = hexToRgba(clusterColor, 0.95);
               overlayContext.font = "10px sans-serif";
               overlayContext.fillText(
-                `C${clusterId} S${shotMarker.shotNumber}`,
+                `DB${clusterId} S${shotMarker.shotNumber}`,
                 overlayCenterX + shotRadiusOverlay + 2,
                 overlayCenterY - shotRadiusOverlay - 2,
               );
@@ -6264,7 +6864,9 @@ export default function Home() {
         animationFrameRef.current = null;
       }
 
-      videoEl.pause();
+      if (!isStreamScan) {
+        videoEl.pause();
+      }
       scanVideoRef.current = null;
       const overlayCtx = overlayEl.getContext("2d");
       overlayCtx?.clearRect(0, 0, overlayEl.width, overlayEl.height);
@@ -6282,6 +6884,8 @@ export default function Home() {
       };
       liveClusterColorByIdRef.current = {};
       liveClusterShotCountRef.current = 0;
+      liveClusterLastUpdatedAtMsRef.current = 0;
+      liveContourGroupVisualsRef.current = { updatedAtMs: 0, regionColors: [], regionGroupLabels: [] };
       setIsScanning(false);
       setDetectionEnabled(false);
       setDetectionConfidence(null);
@@ -6290,6 +6894,8 @@ export default function Home() {
       setScanStatus(
         stopRequestedRef.current
           ? "Scan stopped"
+          : isStreamScan
+            ? "Camera stream analysis complete."
           : requestedWindow
             ? "Focused spike-window analysis complete."
             : "Scan complete (concurrent audio + OpenCV)",
@@ -6321,6 +6927,8 @@ export default function Home() {
       };
       liveClusterColorByIdRef.current = {};
       liveClusterShotCountRef.current = 0;
+      liveClusterLastUpdatedAtMsRef.current = 0;
+      liveContourGroupVisualsRef.current = { updatedAtMs: 0, regionColors: [], regionGroupLabels: [] };
       setIsScanning(false);
       setDetectionEnabled(false);
       setDetectionConfidence(null);
@@ -6481,13 +7089,14 @@ export default function Home() {
           return diff < Math.abs(closest.videoTimeSec - nowSec) ? entry : closest;
         }, null);
 
+        const isBlinkOn = Math.floor(performance.now() / 500) % 2 === 0;
+        let playbackLabel: string | null = null;
         if (nearestDetection) {
-          const isBlinkOn = Math.floor(performance.now() / 500) % 2 === 0;
           const playbackDistanceSuffix =
             nearestDetection.estimatedDistanceInches === null
               ? ""
               : ` | ~${formatLinearFromInches(nearestDetection.estimatedDistanceInches, 1)}`;
-          const playbackLabel = `SPIKE ${nearestDetection.score.toFixed(1)}%${playbackDistanceSuffix}`;
+          playbackLabel = `SPIKE ${nearestDetection.score.toFixed(1)}%${playbackDistanceSuffix}`;
           const playbackLabelWidth = nearestDetection.estimatedDistanceInches === null ? 165 : 250;
           context.strokeStyle = isBlinkOn ? "#ffffff" : "#000000";
           context.lineWidth = 3;
@@ -6564,8 +7173,12 @@ export default function Home() {
 
         const playbackShotEntries = shotLogEntries.length > 0 ? shotLogEntries : shotMarkersRef.current;
         const spikeShotMarkers = playbackShotEntries.filter((entry) => inWindow(entry.videoTimeSec));
-        const playbackClustering =
-          shotLogEntries.length > 0 ? shotClustering : clusterShotsBySpaceTime(playbackShotEntries, tweakSettings);
+        const eligiblePlaybackShotMarkers = filterShotsByAnalysisAge(
+          spikeShotMarkers,
+          nowSec,
+          CLUSTER_MIN_VISIBLE_AGE_SEC,
+        );
+        const playbackClustering = clusterShotsBySpaceTime(eligiblePlaybackShotMarkers, tweakSettings);
         const playbackClusterByShotId = playbackClustering.shotClusterById;
         const playbackClusterColorById: Record<number, string> = {};
         for (const cluster of playbackClustering.clusters) {
@@ -6578,63 +7191,57 @@ export default function Home() {
         }, null);
         const patchCanvas = processedPatchCanvasRef.current;
         const patchContext = patchCanvas?.getContext("2d") ?? null;
-        if (patchCanvas && patchContext) {
-          if (nearestSpikeShot) {
-            const cropRect = clampRectToFrame(
-              nearestSpikeShot.drawRectX,
-              nearestSpikeShot.drawRectY,
-              nearestSpikeShot.drawRectWidth,
-              nearestSpikeShot.drawRectHeight,
+        const patchSourceRect = nearestDetection
+          ? clampRectToFrame(
+              nearestDetection.x,
+              nearestDetection.y,
+              nearestDetection.width,
+              nearestDetection.height,
               width,
               height,
-            );
-            patchCanvas.width = cropRect.width;
-            patchCanvas.height = cropRect.height;
-            patchContext.drawImage(
-              activeVideo,
-              cropRect.x,
-              cropRect.y,
-              cropRect.width,
-              cropRect.height,
-              0,
-              0,
-              cropRect.width,
-              cropRect.height,
-            );
-            patchContext.fillStyle = "rgba(0, 0, 0, 0.72)";
-            patchContext.fillRect(0, 0, Math.min(260, cropRect.width), 16);
-            patchContext.fillStyle = "#e5e7eb";
-            patchContext.font = "10px sans-serif";
-            patchContext.fillText(`Probe patch (playback) | t=${nearestSpikeShot.videoTimeSec.toFixed(3)}s`, 4, 11);
+            )
+          : nearestSpikeShot
+            ? clampRectToFrame(
+                nearestSpikeShot.drawRectX,
+                nearestSpikeShot.drawRectY,
+                nearestSpikeShot.drawRectWidth,
+                nearestSpikeShot.drawRectHeight,
+                width,
+                height,
+              )
+            : null;
+        if (patchCanvas && patchContext) {
+          if (patchSourceRect) {
+            drawPatchWindowView(patchContext, activeVideo, patchSourceRect);
           } else {
             patchContext.clearRect(0, 0, patchCanvas.width, patchCanvas.height);
           }
         }
-
-        const isBlinkOn = Math.floor(performance.now() / 500) % 2 === 0;
+        let contourRegionColorsForFrame: string[] | undefined;
+        let contourRegionGroupLabelsForFrame: string[] | undefined;
         if (nearestContourSnapshot && nearestDetection) {
-          const contourRegionColors = nearestContourSnapshot.regions.slice(0, 10).map((region, index) => {
-            let nearestShot: ShotLogEntry | null = null;
-            let nearestDistance = Number.POSITIVE_INFINITY;
-            for (const shot of spikeShotMarkers) {
-              const patchShotX =
-                ((shot.centerX - nearestDetection.x) / Math.max(1, nearestDetection.width)) * nearestContourSnapshot.patchWidthPx;
-              const patchShotY =
-                ((shot.centerY - nearestDetection.y) / Math.max(1, nearestDetection.height)) * nearestContourSnapshot.patchHeightPx;
-              const distance = Math.hypot(region.centerX - patchShotX, region.centerY - patchShotY);
-              if (distance < nearestDistance) {
-                nearestDistance = distance;
-                nearestShot = shot;
-              }
-            }
-            if (nearestShot) {
-              const clusterId = playbackClusterByShotId[nearestShot.id];
-              if (clusterId !== undefined) {
-                return playbackClusterColorById[clusterId] ?? clusterColorForId(clusterId);
-              }
-            }
-            return clusterColorForId(index + 1);
-          });
+          const contourVisuals = buildContourRegionClusterVisuals(
+            nearestContourSnapshot,
+            {
+              x: nearestDetection.x,
+              y: nearestDetection.y,
+              width: Math.max(1, nearestDetection.width),
+              height: Math.max(1, nearestDetection.height),
+            },
+            eligiblePlaybackShotMarkers,
+            playbackClusterByShotId,
+            playbackClusterColorById,
+          );
+          contourRegionColorsForFrame = contourVisuals.regionColors;
+          contourRegionGroupLabelsForFrame = contourVisuals.regionGroupLabels;
+          if (contourCanvas && contourContext) {
+            drawPersistedContourWindowView(
+              contourContext,
+              nearestContourSnapshot,
+              contourVisuals.regionColors,
+              contourVisuals.regionGroupLabels,
+            );
+          }
           drawContourRegionsOnTargetView(
             context,
             nearestContourSnapshot,
@@ -6645,9 +7252,24 @@ export default function Home() {
               height: Math.max(1, nearestDetection.height),
             },
             isBlinkOn,
-            contourRegionColors,
+            contourVisuals.regionColors,
             pixelsPerInch,
             formatLinearFromInches,
+            contourVisuals.regionGroupLabels,
+          );
+        }
+        if (patchContext && patchSourceRect && playbackLabel) {
+          drawProbePatchOverlayView(
+            patchContext,
+            patchSourceRect.width,
+            patchSourceRect.height,
+            playbackLabel,
+            isBlinkOn,
+            nearestContourSnapshot,
+            contourRegionColorsForFrame,
+            pixelsPerInch,
+            formatLinearFromInches,
+            contourRegionGroupLabelsForFrame,
           );
         }
 
@@ -6687,7 +7309,9 @@ export default function Home() {
           <p className="mt-1 text-xs text-amber-200">
             Current step:{" "}
             {workflowStep === "upload_video"
-              ? "Upload a reference video"
+              ? captureMode === "upload"
+                ? "Upload a reference video"
+                : "Start your device camera stream"
               : workflowStep === "capture_frame"
                 ? "Press Use Current Video Frame"
                 : workflowStep === "draw_geometry"
@@ -6708,7 +7332,7 @@ export default function Home() {
                     : "border-gray-700 text-gray-300"
               }`}
             >
-              1. Upload Video
+              1. {captureMode === "upload" ? "Upload Video" : "Start Camera"}
             </li>
             <li
               className={`rounded border px-2 py-1 ${
@@ -6827,7 +7451,7 @@ export default function Home() {
                     checked={captureMode === "stream"}
                     onChange={() => setCaptureMode("stream")}
                   />
-                  Stream (WebSocket/RTSP URL)
+                  Device Camera Stream (Phone)
                 </label>
               </fieldset>
 
@@ -6861,16 +7485,60 @@ export default function Home() {
                   ) : null}
                 </label>
               ) : (
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs uppercase tracking-wide text-gray-300">Stream URL</span>
-                  <input
-                    type="text"
-                    value={streamUrl}
-                    onChange={(event) => setStreamUrl(event.target.value)}
-                    placeholder="ws://... or rtsp://..."
-                    className="rounded-md border border-gray-700 bg-black px-3 py-2 text-base outline-none ring-gray-400/40 focus:ring-1 sm:text-sm"
-                  />
-                </label>
+                <div className="space-y-2 rounded-md border border-gray-700 bg-black p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-300">Device Camera Stream</p>
+                  <p className="text-[11px] text-gray-400">
+                    Open this app on your phone and use the rear camera for best results.
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void startStreamCamera();
+                      }}
+                      className="rounded-md border border-sky-400/35 px-3 py-1.5 text-xs text-sky-100 transition hover:bg-sky-500/10"
+                    >
+                      {streamCameraActive ? "Restart Camera" : "Start Camera"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={stopStreamCamera}
+                      disabled={!streamCameraActive}
+                      className="rounded-md border border-amber-400/35 px-3 py-1.5 text-xs text-amber-100 transition hover:bg-amber-500/10 disabled:opacity-50"
+                    >
+                      Stop Camera
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void toggleStreamCameraFacingMode();
+                      }}
+                      disabled={!streamCameraActive}
+                      className="rounded-md border border-emerald-400/35 px-3 py-1.5 text-xs text-emerald-100 transition hover:bg-emerald-500/10 disabled:opacity-50"
+                    >
+                      Switch to {streamCameraFacingMode === "environment" ? "Front" : "Rear"}
+                    </button>
+                  </div>
+                  {streamCameraError ? <p className="text-xs text-rose-300">{streamCameraError}</p> : null}
+                  <div className="relative mt-2">
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      muted
+                      playsInline
+                      className="max-h-56 w-full rounded-md border border-gray-700 bg-black sm:max-h-72"
+                    />
+                    <canvas
+                      ref={overlayCanvasRef}
+                      className="pointer-events-none absolute inset-0 h-full w-full rounded-md"
+                    />
+                    {!streamCameraActive ? (
+                      <p className="pointer-events-none absolute inset-0 flex items-center justify-center text-xs text-gray-400">
+                        Camera preview inactive
+                      </p>
+                    ) : null}
+                  </div>
+                </div>
               )}
 
           </div>
@@ -6879,7 +7547,7 @@ export default function Home() {
         <section className="rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6">
           <h2 className="text-base font-semibold text-white sm:text-lg">Capture Image From Video</h2>
           <div className="mt-4">
-            {captureMode === "upload" && selectedVideoPreviewUrl ? (
+            {(captureMode === "upload" ? !!selectedVideoPreviewUrl : streamCameraActive) ? (
                 <div className="rounded-md border border-gray-700 bg-black p-3">
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-xs uppercase tracking-wide text-gray-300">Capture Reference Image From Video</p>
@@ -6955,7 +7623,11 @@ export default function Home() {
                   ) : null}
                 </div>
             ) : (
-              <p className="text-sm text-gray-300">Upload a reference video to enable frame capture and ROI selection.</p>
+              <p className="text-sm text-gray-300">
+                {captureMode === "upload"
+                  ? "Upload a reference video to enable frame capture and ROI selection."
+                  : "Start the device camera stream to enable frame capture and ROI selection."}
+              </p>
             )}
           </div>
         </section>
@@ -7031,6 +7703,73 @@ export default function Home() {
               />
             </label> */}
           </div>
+          {hasDrawnGeometry ? (
+            <div className="mt-4 rounded-md border border-gray-700 bg-black/35 p-3">
+              <p className="text-xs uppercase tracking-wide text-gray-300">ROI Line Calibration</p>
+              <p className="mt-1 text-[11px] text-gray-400">
+                Draw a line on the magnified ROI, enter its real-world length, then apply line calibration.
+              </p>
+              {roiMagnifiedDataUrl && roiSelectionPixelSize ? (
+                <>
+                  <canvas
+                    ref={roiMeasurementCanvasRef}
+                    className="mt-2 w-full cursor-crosshair rounded-md border border-gray-700 bg-black touch-none"
+                    style={{ imageRendering: "pixelated" }}
+                    onPointerDown={(event) => {
+                      event.preventDefault();
+                      startRoiMeasurementLineSelection(event.clientX, event.clientY);
+                    }}
+                    onPointerMove={(event) => {
+                      event.preventDefault();
+                      updateRoiMeasurementLineSelection(event.clientX, event.clientY);
+                    }}
+                    onPointerUp={(event) => {
+                      event.preventDefault();
+                      endRoiMeasurementLineSelection();
+                    }}
+                    onPointerLeave={endRoiMeasurementLineSelection}
+                  />
+                  <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
+                    <label className="flex flex-col gap-1">
+                      <span className="text-[11px] text-gray-400">Measured Line Length ({activeLinearUnitLabel})</span>
+                      <input
+                        type="number"
+                        min="0"
+                        step={activeLinearInputStep}
+                        value={toDisplayLinearValue(roiMeasurementLengthInches)}
+                        onChange={(event) => setRoiMeasurementLengthInches(fromDisplayLinearValue(event.target.value))}
+                        className="rounded-md border border-gray-700 bg-neutral-950 px-2 py-1.5 text-sm outline-none ring-gray-400/40 focus:ring-1"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={applyCalibrationFromRoiMeasurementLine}
+                      className="rounded-md border border-emerald-400/45 px-3 py-1.5 text-xs text-emerald-100 transition hover:bg-emerald-500/10"
+                    >
+                      Apply Line Calibration
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRoiMeasurementLine(null)}
+                      className="rounded-md border border-gray-600 px-3 py-1.5 text-xs text-gray-300 transition hover:bg-neutral-800"
+                    >
+                      Clear Line
+                    </button>
+                  </div>
+                  <p className="mt-2 text-[11px] text-gray-400">
+                    ROI size: {roiSelectionPixelSize.widthPx}px x {roiSelectionPixelSize.heightPx}px
+                    {roiMeasurementMetrics
+                      ? ` | line=${roiMeasurementMetrics.pixelLength.toFixed(1)}px | ppi=${(
+                          roiMeasurementMetrics.pixelsPerInch ?? 0
+                        ).toFixed(2)}`
+                      : " | draw line to compute ppi"}
+                  </p>
+                </>
+              ) : (
+                <p className="mt-2 text-[11px] text-gray-500">Draw target geometry first to enable magnified line calibration.</p>
+              )}
+            </div>
+          ) : null}
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <p className="text-[11px] text-gray-400">
               Draw the target in the capture section; calibration auto-runs when geometry and target dimensions are valid.
@@ -7046,63 +7785,12 @@ export default function Home() {
           </p>
 
           <div className="mt-4 space-y-3">
-            <fieldset className="space-y-2">
-              <legend className="text-xs uppercase tracking-wide text-gray-300">Tracking Mode</legend>
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-                <label className="flex items-center gap-2 rounded-md border border-gray-700 px-2 py-1.5 text-sm">
-                  <input
-                    type="radio"
-                    name="trackingMode"
-                    value="template"
-                    checked={trackingMode === "template"}
-                    onChange={() => setTrackingMode("template")}
-                  />
-                  Template
-                </label>
-                <label className="flex items-center gap-2 rounded-md border border-gray-700 px-2 py-1.5 text-sm">
-                  <input
-                    type="radio"
-                    name="trackingMode"
-                    value="meanshift"
-                    checked={trackingMode === "meanshift"}
-                    onChange={() => setTrackingMode("meanshift")}
-                  />
-                  meanShift
-                </label>
-                <label className="flex items-center gap-2 rounded-md border border-gray-700 px-2 py-1.5 text-sm">
-                  <input
-                    type="radio"
-                    name="trackingMode"
-                    value="camshift"
-                    checked={trackingMode === "camshift"}
-                    onChange={() => setTrackingMode("camshift")}
-                  />
-                  CamShift
-                </label>
-              </div>
-            </fieldset>
-
-            <label className="flex flex-col gap-1">
-              <span className="text-xs uppercase tracking-wide text-gray-300">
-                Match Threshold ({matchThreshold.toFixed(0)}%)
-              </span>
-              <input
-                type="range"
-                min="0"
-                max="100"
-                step="1"
-                value={matchThreshold}
-                onChange={(event) => setMatchThreshold(Number(event.target.value))}
-                className="accent-gray-400"
-              />
-            </label>
-
             <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
               <button
                 ref={startScanButtonRef}
                 type="button"
                 onClick={requestStartScan}
-                disabled={!opencvReady || !howlerReady}
+                disabled={!opencvReady || (captureMode === "upload" && !howlerReady)}
                 className={`w-full rounded-md border border-sky-400/35 px-3 py-2.5 text-sm text-sky-100 transition hover:bg-sky-500/10 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto ${
                   workflowStep === "scan" ? highlightActionClass : ""
                 }`}
@@ -7122,8 +7810,35 @@ export default function Home() {
         </section>
 
         <section className="rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6">
-          <h2 className="text-base font-semibold text-white sm:text-lg">Resulting Data</h2>
+          <h2 className="text-base font-semibold text-white sm:text-lg">Analysis</h2>
           <div className="mt-4 space-y-3">
+            <div className="space-y-1">
+              <p className="text-xs text-gray-400">Analyzed target view</p>
+              <canvas ref={processingCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
+            </div>
+            <div className="grid max-w-3xl grid-cols-2 gap-2 sm:gap-3">
+              <div className="space-y-1">
+                <p className="text-xs text-gray-400">Probe patch window (DBSCAN overlays)</p>
+                <canvas ref={processedPatchCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-xs text-gray-400">Contour regions view (DBSCAN groups)</p>
+                <canvas ref={processedContourCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-xs text-gray-400">Binary change mask window</p>
+                <canvas ref={processedMaskCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-xs text-gray-400">Yellow-green top-hat mask window</p>
+                <canvas ref={processedYellowGreenCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
+              </div>
+            </div>
+          </div>
+
+          <details className="mt-5 rounded-md border border-gray-700 bg-black/35 p-3">
+            <summary className="cursor-pointer text-base font-semibold text-white sm:text-lg">Resulting Data</summary>
+            <div className="mt-4 space-y-3">
             <div ref={exportButtonsRef} className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
               <button
                 type="button"
@@ -7219,9 +7934,9 @@ export default function Home() {
             ) : null}
             {shotClustering.clusters.length > 0 ? (
               <div className="rounded-md border border-gray-700 bg-black p-3">
-                <p className="text-xs uppercase tracking-wide text-gray-300">Shot Clusters (K-Means: X, Y, Time)</p>
+                <p className="text-xs uppercase tracking-wide text-gray-300">Shot Clusters (DBSCAN: X, Y, Time)</p>
                 <p className="mt-1 text-[11px] text-gray-400">
-                  Auto K selected: {shotClustering.selectedK} | Final clusters: {shotClustering.finalK}
+                  Initial clusters: {shotClustering.selectedK} | Final clusters: {shotClustering.finalK}
                   {shotClustering.closeMergeCount > 0 ? ` | merged close clusters: ${shotClustering.closeMergeCount}` : ""}
                 </p>
                 <div className="mt-2 max-h-44 space-y-1 overflow-auto">
@@ -7241,7 +7956,7 @@ export default function Home() {
                             className="inline-block h-2 w-2 rounded-full"
                             style={{ backgroundColor: hexToRgba(clusterColor, 0.95) }}
                           />
-                          C{cluster.clusterId} | shots={cluster.count} | centroid=({cluster.centroidX.toFixed(1)},{" "}
+                          DB{cluster.clusterId} | shots={cluster.count} | centroid=({cluster.centroidX.toFixed(1)},{" "}
                           {cluster.centroidY.toFixed(1)}) px | t={cluster.centroidTimeSec.toFixed(3)}s
                         </p>
                         <p className="text-gray-300">
@@ -7353,7 +8068,7 @@ export default function Home() {
                                                 color: hexToRgba(shotClusterColor ?? "#f87171", 0.95),
                                               }}
                                             >
-                                              C{shotClusterId} S{shot.shotNumber}
+                                              DB{shotClusterId} S{shot.shotNumber}
                                             </span>
                                           )}
                                           {shot.audioDecibelDbfs === null ? "" : ` | ${shot.audioDecibelDbfs.toFixed(1)}dBFS`}
@@ -7385,29 +8100,8 @@ export default function Home() {
               </div>
             ) : null}
 
-            <div className="mt-2 grid grid-cols-1 gap-3 md:grid-cols-2">
-              <div className="space-y-1">
-                <p className="text-xs text-gray-400">Analyzed target view</p>
-                <canvas ref={processingCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
-              </div>
-              <div className="space-y-1">
-                <p className="text-xs text-gray-400">Contour regions view</p>
-                <canvas ref={processedContourCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
-              </div>
-              <div className="space-y-1">
-                <p className="text-xs text-gray-400">Probe patch window</p>
-                <canvas ref={processedPatchCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
-              </div>
-              <div className="space-y-1">
-                <p className="text-xs text-gray-400">Binary change mask window</p>
-                <canvas ref={processedMaskCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
-              </div>
-              <div className="space-y-1">
-                <p className="text-xs text-gray-400">Yellow-green top-hat mask window</p>
-                <canvas ref={processedYellowGreenCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
-              </div>
             </div>
-          </div>
+          </details>
         </section>
       </main>
     </div>
