@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { isSupabaseConfigured } from "@/app/lib/supabase/config";
 import { resolveTarget } from "@/app/lib/targets/resolve";
 import { type LinearUnit } from "@/app/lib/targets/payload";
@@ -49,6 +50,13 @@ export default async function TargetLandingPage({
   const drillHref = drillRecipe
     ? `/drill?id=${encodeURIComponent(id)}&z=${encodeURIComponent(drillRecipe)}`
     : null;
+
+  // Scanning a drill target should drop straight into the scenario player rather
+  // than this info page. A decodable recipe means it's a drill, so redirect; all
+  // other targets keep showing the info page below.
+  if (drillHref && drillZones?.length) {
+    redirect(drillHref);
+  }
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-black px-4 py-12 text-white">
