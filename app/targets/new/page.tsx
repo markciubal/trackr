@@ -7,6 +7,8 @@ export const metadata = { title: "Design a target · Trackr" };
 export default async function NewTargetPage() {
   const user = isSupabaseConfigured() ? await getCurrentUser() : null;
   const baseUrl =
-    process.env.NEXT_PUBLIC_TARGET_BASE_URL || process.env.NEXT_PUBLIC_SITE_URL || "https://trkr.gg";
+    process.env.NEXT_PUBLIC_TARGET_BASE_URL ||
+    process.env.NEXT_PUBLIC_SITE_URL ||
+    "https://trackr-c8dc72cd850c.herokuapp.com";
   return <TargetDesigner canSave={Boolean(user)} baseUrl={baseUrl} />;
 }
