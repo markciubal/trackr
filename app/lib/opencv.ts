@@ -1,6 +1,20 @@
 export type CvMat = {
   clone: () => CvMat;
   delete: () => void;
+  // Present on real OpenCV mats; optional so existing call sites that only use
+  // clone/delete keep type-checking.
+  rows?: number;
+  cols?: number;
+  data32F?: Float32Array;
+};
+
+// OpenCV's QR detector+decoder (objdetect module, included in opencv.js).
+export type CvQRCodeDetector = {
+  // Returns the decoded string ("" if it can't decode) and fills `points`
+  // with the 4 corner coordinates of the located QR.
+  detectAndDecode: (img: CvMat, points?: CvMat, straightQrCode?: CvMat) => string;
+  detect: (img: CvMat, points: CvMat) => boolean;
+  delete: () => void;
 };
 
 export type CvApi = {
@@ -12,6 +26,7 @@ export type CvApi = {
   };
   Point: new (x: number, y: number) => unknown;
   Size: new (width: number, height: number) => unknown;
+  QRCodeDetector: new () => CvQRCodeDetector;
   matFromImageData: (imageData: ImageData) => CvMat;
   cvtColor: (src: CvMat, dst: CvMat, code: number, dstCn?: number) => void;
   GaussianBlur: (
@@ -58,6 +73,8 @@ export type CvApi = {
   };
   COLOR_RGBA2GRAY: number;
   THRESH_BINARY: number;
+  THRESH_BINARY_INV: number;
+  THRESH_OTSU: number;
   RETR_EXTERNAL: number;
   CHAIN_APPROX_SIMPLE: number;
   MORPH_RECT: number;

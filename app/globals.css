@@ -12,10 +12,51 @@
   --color-foreground: var(--foreground);
   --font-sans: var(--font-space-grotesk);
   --font-mono: var(--font-jetbrains-mono);
+  /* Extra-small breakpoint (~480px) so larger phones can use 2-up grids while
+     the narrowest screens stay single-column. */
+  --breakpoint-xs: 30rem;
 }
 
 body {
   background: linear-gradient(145deg, var(--surface), var(--background));
   color: var(--foreground);
   font-family: var(--font-space-grotesk), "Trebuchet MS", "Segoe UI", sans-serif;
+}
+
+/* Full-viewport "screens" progress one section at a time via vertical scroll-snap. */
+html {
+  scroll-snap-type: y proximity;
+  scroll-behavior: smooth;
+}
+
+/* Printable target sheet: print only the sheet, at true physical size. */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .ts-print-area,
+  .ts-print-area * {
+    visibility: visible;
+  }
+  .ts-print-area {
+    position: absolute;
+    left: 0;
+    top: 0;
+    overflow: visible !important;
+  }
+  .ts-print-area > div {
+    width: auto !important;
+    height: auto !important;
+    border: 0 !important;
+  }
+  .ts-sheet {
+    transform: none !important;
+    box-shadow: none !important;
+  }
+  .ts-controls {
+    display: none !important;
+  }
+  @page {
+    margin: 0;
+  }
 }

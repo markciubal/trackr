@@ -1,6 +1,8 @@
 "use client";
 
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { OnboardingGuide } from "@/app/components/onboarding/OnboardingGuide";
+import { InfoPopover } from "@/app/components/onboarding/InfoPopover";
 
 type CvMat = {
   rows: number;
@@ -28,6 +30,7 @@ type CvApi = {
   TermCriteria: new (type: number, maxCount: number, epsilon: number) => unknown;
   imread: (input: HTMLCanvasElement | HTMLImageElement | string) => CvMat;
   cvtColor: (src: CvMat, dst: CvMat, code: number) => void;
+  threshold?: (src: CvMat, dst: CvMat, thresh: number, maxval: number, type: number) => number;
   goodFeaturesToTrack?: (
     image: CvMat,
     corners: CvMat,
@@ -107,6 +110,9 @@ type CvApi = {
   moments?: (array: CvMat, binaryImage?: boolean) => { m00: number; m10: number; m01: number };
   Size: new (width: number, height: number) => { width: number; height: number };
   COLOR_RGBA2GRAY: number;
+  THRESH_BINARY?: number;
+  THRESH_BINARY_INV?: number;
+  THRESH_OTSU?: number;
   TM_CCOEFF_NORMED: number;
   TM_SQDIFF_NORMED?: number;
   INTER_AREA: number;
@@ -216,6 +222,7 @@ type HowlInstance = {
   play: (sprite?: string) => number;
   stop: () => void;
   unload: () => void;
+  rate: (rate?: number, id?: number) => number | void;
 };
 
 type HowlConstructor = new (options: {
@@ -254,6 +261,33 @@ type AudioRmsSample = {
   timeSec: number;
   rms: number;
   dbfs: number;
+};
+
+type AudioCaptureInfo = {
+  sampleRate: number;
+  channels: number;
+  durationSec: number;
+  totalSamples: number;
+  rmsSampleCount: number;
+  rmsHopSec: number;
+  meanDbfs: number;
+  thresholdDbfs: number;
+  minDbfs: number;
+  maxDbfs: number;
+  spikeCount: number;
+  signatureCount: number;
+};
+
+// A target outline the user drew (ROI), saved as a reusable detection template.
+type TargetTemplate = {
+  id: string;
+  dataUrl: string;
+  aspect: number;
+  sourceName: string;
+  targetWidthInches: number;
+  targetHeightInches: number;
+  createdAt: number;
+  roi?: RoiRect;
 };
 
 type TimeWindow = {
@@ -398,6 +432,9 @@ type LinearUnit = "in" | "ft" | "m" | "cm" | "mm";
 const TEMPLATE_REGION_DATA_URL_KEY = "trackr-template-region-data-url";
 const TEMPLATE_REGION_IMAGE_NAME_KEY = "trackr-template-region-image-name";
 const TEMPLATE_REGION_RECT_KEY = "trackr-template-region-rect";
+const TARGET_TEMPLATE_LIBRARY_KEY = "trackr-target-template-library";
+const AUTO_ADVANCE_STORAGE_KEY = "trackr-auto-advance";
+const MAX_TARGET_TEMPLATES = 12;
 const ANALYSIS_VIDEO_DATA_URL_KEY = "trackr-analysis-video-data-url";
 const ANALYSIS_VIDEO_META_KEY = "trackr-analysis-video-meta";
 const ANALYSIS_VIDEO_SESSION_MAX_BYTES = 2_800_000;
@@ -476,6 +513,7 @@ type TweakSettings = {
   subMillisecondBypassQualityGate: number;
   minVisibleHitChangeScore: number;
   maxShotDiameterInches: number;
+  expectedHoleDiameterInches: number; // caliber/hole size for calibrated size gating (0 = off)
   fallbackMaxDiameterRatio: number;
   fallbackMaxDiameterMinPx: number;
   shotCooldownMs: number;
@@ -585,6 +623,7 @@ const DEFAULT_TWEAK_SETTINGS: TweakSettings = {
   subMillisecondBypassQualityGate: 0,
   minVisibleHitChangeScore: 0.03,
   maxShotDiameterInches: 2.35,
+  expectedHoleDiameterInches: 0,
   fallbackMaxDiameterRatio: 0.18,
   fallbackMaxDiameterMinPx: 4,
   shotCooldownMs: 70,
@@ -646,7 +685,6 @@ type StoredGearsSettings = {
   unitConversionEnabled?: boolean;
   displayLinearUnit?: LinearUnit;
   tweakSettings?: Partial<TweakSettings>;
-  isGearsExpanded?: boolean;
 };
 
 function isLinearUnit(value: unknown): value is LinearUnit {
@@ -740,6 +778,7 @@ const TWEAK_CATEGORIES: TweakCategoryConfig[] = [
     fields: [
       { key: "minVisibleHitChangeScore", label: "Min Visible Hit Change Score", min: 0, max: 10, step: 0.01 },
       { key: "maxShotDiameterInches", label: "Max Shot Diameter (in)", min: 0.1, max: 10, step: 0.01 },
+      { key: "expectedHoleDiameterInches", label: "Expected Hole/Caliber (in, 0=off)", min: 0, max: 2, step: 0.01 },
       { key: "fallbackMaxDiameterRatio", label: "Fallback Max Diameter Ratio", min: 0.01, max: 1, step: 0.01 },
       { key: "fallbackMaxDiameterMinPx", label: "Fallback Max Diameter Min (px)", min: 1, max: 100, step: 1 },
       { key: "shotDetectionThresholdScale", label: "Shot Detection Threshold Scale", min: 0, max: 2, step: 0.01 },
@@ -957,6 +996,22 @@ const SIMPLE_CONTOUR_MAX_AREA = 500;
 const SIMPLE_CONTOUR_CIRCULARITY_MIN = 0.05;
 const SIMPLE_CONTOUR_CIRCULARITY_MAX = 24;
 const SIMPLE_CONTOUR_MASK_HISTORY_MAX = 4;
+// True temporal diff (frame-to-frame). A change must ALSO have jumped sharply
+// between consecutive frames recently — kills slow drift/lighting, keeps impacts.
+const USE_TEMPORAL_DIFF_GATE = true;
+const TEMPORAL_DIFF_THRESHOLD = 18; // per-pixel gray jump (0-255) that counts as a sharp change
+const TEMPORAL_DIFF_HISTORY_MAX = 8; // frames the "jump" stays valid while the change is confirmed
+// Calibrated size gate: accept holes within [min, max] x the expected caliber size.
+const EXPECTED_HOLE_MIN_FACTOR = 0.5;
+const EXPECTED_HOLE_MAX_FACTOR = 2.5;
+// Sub-pixel-ish patch registration: align the baseline to each frame's probe patch
+// (small integer-shift search) before differencing, so residual jitter/perspective
+// from the tracker stops faking hits.
+const USE_PATCH_REGISTRATION = true;
+const PATCH_REGISTRATION_MAX_SHIFT = 4; // px search radius
+const PATCH_REGISTRATION_STRIDE = 3; // sample stride for the alignment SAD (speed)
+// Auto-pick (scrub video to find/box the target automatically) is hidden for now.
+const SHOW_AUTO_PICK = false;
 const RELAXED_SHOT_MIN_SCORE = 0.01;
 const TEMPLATE_PRIMARY_WEIGHT = 0.72;
 const TEMPLATE_SECONDARY_WEIGHT = 0.28;
@@ -1092,8 +1147,15 @@ function spanAspectRatio(width: number, height: number): number {
   return longest / shortest;
 }
 
-function isLikelyGoodShot(entry: ShotLogEntry, tweaks: TweakSettings): boolean {
-  if (FORCE_OPEN_SHOT_GATES) {
+function isLikelyGoodShot(
+  entry: ShotLogEntry,
+  tweaks: TweakSettings,
+  options?: { enforceRealGate?: boolean },
+): boolean {
+  // FORCE_OPEN_SHOT_GATES logs every detection so nothing is missed during analysis, but
+  // clustering only wants shots that pass the real qualification criteria. Pass
+  // enforceRealGate to evaluate those criteria even while the gates are forced open.
+  if (FORCE_OPEN_SHOT_GATES && !options?.enforceRealGate) {
     return entry.changedPixels > 0 && entry.changeScore >= 0;
   }
   // Keep detections constrained to their active spike window/time gate.
@@ -1130,6 +1192,17 @@ function isLikelyGoodShot(entry: ShotLogEntry, tweaks: TweakSettings): boolean {
       return false;
     }
     if (entry.estimatedDiameterInches > maxShotDiameterInches) return false;
+    // Calibrated size gate: when an expected caliber/hole size is set, reject
+    // candidates well outside it (noise that's too small, artifacts too big).
+    const expectedHoleInches = tweaks.expectedHoleDiameterInches;
+    if (expectedHoleInches > 0) {
+      if (
+        entry.estimatedDiameterInches < expectedHoleInches * EXPECTED_HOLE_MIN_FACTOR ||
+        entry.estimatedDiameterInches > expectedHoleInches * EXPECTED_HOLE_MAX_FACTOR
+      ) {
+        return false;
+      }
+    }
   } else {
     const minDiameterPx = Math.max(0, Math.min(2, tweaks.colorDiameterMinPx));
     const maxDiameterPx = Math.max(minDiameterPx + 1, Math.max(560, tweaks.colorDiameterMaxPx));
@@ -1152,6 +1225,23 @@ function isLikelyGoodShot(entry: ShotLogEntry, tweaks: TweakSettings): boolean {
   }
   if (entry.audioDeltaFromMeanDb !== null && entry.audioDeltaFromMeanDb < tweaks.colorAudioDeltaMinDb) return false;
   return true;
+}
+
+// A shot "makes it" (and is eligible for space-time/quadtree grouping) when it passes the
+// real qualification gate, regardless of whether FORCE_OPEN_SHOT_GATES is logging everything.
+function shotMakesIt(entry: ShotLogEntry, tweaks: TweakSettings): boolean {
+  return isLikelyGoodShot(entry, tweaks, { enforceRealGate: true });
+}
+
+// A 0-100 "this is a real shot, not noise" confidence. Prefers the audio
+// correlation (real shots line up with an audio spike) and falls back to the
+// visual/tracking confidence when there's no usable audio.
+function shotConfidencePct(entry: ShotLogEntry): number {
+  const audio = entry.audioCorrelationScorePct;
+  if (audio !== null && Number.isFinite(audio)) {
+    return Math.max(0, Math.min(100, audio));
+  }
+  return Math.max(0, Math.min(100, entry.detectionConfidencePct));
 }
 
 function isLikelyGoodShotRelaxed(entry: ShotLogEntry, tweaks: TweakSettings): boolean {
@@ -1740,6 +1830,7 @@ function drawClusterGeometry(
   clusterColorById: Record<number, string>,
   scaleX: number,
   scaleY: number,
+  labelPrefix = "DB",
 ) {
   for (const cluster of clusterGeometry) {
     if (cluster.points.length === 0) continue;
@@ -1778,8 +1869,178 @@ function drawClusterGeometry(
     context.fillRect(labelX - 14, labelY - 20, 28, 14);
     context.fillStyle = clusterColor;
     context.font = "10px sans-serif";
-    context.fillText(`DB${cluster.clusterId}`, labelX - 13, labelY - 10);
+    context.fillText(`${labelPrefix}${cluster.clusterId}`, labelX - 13, labelY - 10);
   }
+}
+
+type QuadPoint = { x: number; y: number; id: string };
+type QuadRect = { x: number; y: number; w: number; h: number };
+
+function quadRectContains(rect: QuadRect, px: number, py: number): boolean {
+  return px >= rect.x && px < rect.x + rect.w && py >= rect.y && py < rect.y + rect.h;
+}
+
+function quadRectsIntersect(a: QuadRect, b: QuadRect): boolean {
+  return !(b.x > a.x + a.w || b.x + b.w < a.x || b.y > a.y + a.h || b.y + b.h < a.y);
+}
+
+// A point quadtree used to spatially index shots for fast neighbor queries.
+class ShotQuadtree {
+  private readonly rect: QuadRect;
+  private readonly capacity: number;
+  private readonly depth: number;
+  private readonly maxDepth: number;
+  private points: QuadPoint[] = [];
+  private divided = false;
+  private children: ShotQuadtree[] = [];
+
+  constructor(rect: QuadRect, capacity: number, depth: number, maxDepth: number) {
+    this.rect = rect;
+    this.capacity = capacity;
+    this.depth = depth;
+    this.maxDepth = maxDepth;
+  }
+
+  insert(point: QuadPoint): boolean {
+    if (!quadRectContains(this.rect, point.x, point.y)) return false;
+    if (this.points.length < this.capacity || this.depth >= this.maxDepth) {
+      this.points.push(point);
+      return true;
+    }
+    if (!this.divided) this.subdivide();
+    for (const child of this.children) {
+      if (child.insert(point)) return true;
+    }
+    this.points.push(point); // numeric edge cases: keep at this node
+    return true;
+  }
+
+  private subdivide() {
+    const { x, y, w, h } = this.rect;
+    const hw = w / 2;
+    const hh = h / 2;
+    const nextDepth = this.depth + 1;
+    this.children = [
+      new ShotQuadtree({ x, y, w: hw, h: hh }, this.capacity, nextDepth, this.maxDepth),
+      new ShotQuadtree({ x: x + hw, y, w: hw, h: hh }, this.capacity, nextDepth, this.maxDepth),
+      new ShotQuadtree({ x, y: y + hh, w: hw, h: hh }, this.capacity, nextDepth, this.maxDepth),
+      new ShotQuadtree({ x: x + hw, y: y + hh, w: hw, h: hh }, this.capacity, nextDepth, this.maxDepth),
+    ];
+    this.divided = true;
+  }
+
+  queryRange(range: QuadRect, found: QuadPoint[]) {
+    if (!quadRectsIntersect(this.rect, range)) return;
+    for (const point of this.points) {
+      if (quadRectContains(range, point.x, point.y)) found.push(point);
+    }
+    if (this.divided) {
+      for (const child of this.children) child.queryRange(range, found);
+    }
+  }
+
+  collectOccupiedLeaves(out: QuadRect[]) {
+    if (this.divided) {
+      for (const child of this.children) child.collectOccupiedLeaves(out);
+    } else if (this.points.length > 0) {
+      out.push(this.rect);
+    }
+  }
+}
+
+type QuadtreeGroupingResult = {
+  shotClusterById: Record<string, number>;
+  groupCount: number;
+  leafRects: QuadRect[];
+  radius: number;
+};
+
+// Group shots spatially: index them in a quadtree, then single-link union any shots
+// within a radius of each other. Groups are numbered by descending size. When a
+// baseRadiusPx is supplied (e.g. 6 inches × pixels-per-inch) it drives the grouping
+// distance; otherwise an adaptive radius based on shot spread is used.
+function groupShotsByQuadtree(
+  shots: ShotLogEntry[],
+  radiusScale: number,
+  baseRadiusPx?: number,
+): QuadtreeGroupingResult {
+  if (shots.length === 0) return { shotClusterById: {}, groupCount: 0, leafRects: [], radius: 0 };
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const shot of shots) {
+    if (shot.centerX < minX) minX = shot.centerX;
+    if (shot.centerY < minY) minY = shot.centerY;
+    if (shot.centerX > maxX) maxX = shot.centerX;
+    if (shot.centerY > maxY) maxY = shot.centerY;
+  }
+  const spanX = Math.max(1, maxX - minX);
+  const spanY = Math.max(1, maxY - minY);
+  const pad = Math.max(spanX, spanY) * 0.02 + 1;
+  const bounds: QuadRect = { x: minX - pad, y: minY - pad, w: spanX + pad * 2, h: spanY + pad * 2 };
+
+  const tree = new ShotQuadtree(bounds, 4, 0, 12);
+  const points: QuadPoint[] = shots.map((shot) => ({ x: shot.centerX, y: shot.centerY, id: shot.id }));
+  for (const point of points) tree.insert(point);
+
+  const scale = Math.max(0.1, radiusScale);
+  const radius =
+    baseRadiusPx && baseRadiusPx > 0
+      ? Math.max(2, baseRadiusPx * scale)
+      : Math.max(2, Math.hypot(spanX, spanY) * 0.06 * scale);
+
+  const indexById = new Map<string, number>();
+  points.forEach((point, index) => indexById.set(point.id, index));
+  const parent = points.map((_, index) => index);
+  const findRoot = (i: number): number => {
+    let root = i;
+    while (parent[root] !== root) root = parent[root];
+    let cursor = i;
+    while (parent[cursor] !== cursor) {
+      const next = parent[cursor];
+      parent[cursor] = root;
+      cursor = next;
+    }
+    return root;
+  };
+  const union = (a: number, b: number) => {
+    const rootA = findRoot(a);
+    const rootB = findRoot(b);
+    if (rootA !== rootB) parent[rootB] = rootA;
+  };
+
+  for (let i = 0; i < points.length; i += 1) {
+    const point = points[i];
+    const neighbors: QuadPoint[] = [];
+    tree.queryRange({ x: point.x - radius, y: point.y - radius, w: radius * 2, h: radius * 2 }, neighbors);
+    for (const neighbor of neighbors) {
+      if (neighbor.id === point.id) continue;
+      if (Math.hypot(point.x - neighbor.x, point.y - neighbor.y) <= radius) {
+        const neighborIndex = indexById.get(neighbor.id);
+        if (neighborIndex !== undefined) union(i, neighborIndex);
+      }
+    }
+  }
+
+  const members = new Map<number, string[]>();
+  for (let i = 0; i < points.length; i += 1) {
+    const root = findRoot(i);
+    const bucket = members.get(root) ?? [];
+    bucket.push(points[i].id);
+    members.set(root, bucket);
+  }
+  const ordered = [...members.entries()].sort((a, b) => b[1].length - a[1].length);
+  const shotClusterById: Record<string, number> = {};
+  ordered.forEach(([, ids], groupIndex) => {
+    for (const id of ids) shotClusterById[id] = groupIndex + 1;
+  });
+
+  const leafRects: QuadRect[] = [];
+  tree.collectOccupiedLeaves(leafRects);
+
+  return { shotClusterById, groupCount: ordered.length, leafRects, radius };
 }
 
 function windowIndexAtTime(timeSec: number, windows: TimeWindow[]): number {
@@ -2972,6 +3233,109 @@ function buildTemporalPersistenceMask(
   return persistent;
 }
 
+// Per-pixel frame-to-frame change: |frame[t] - frame[t-1]| >= threshold. A real
+// impact produces a sharp jump here; slow drift/lighting does not.
+function buildTemporalDiffMask(currentGray: Uint8Array, previousGray: Uint8Array, threshold: number): Uint8Array {
+  const out = new Uint8Array(currentGray.length);
+  const size = Math.min(currentGray.length, previousGray.length);
+  for (let i = 0; i < size; i += 1) {
+    if (Math.abs(currentGray[i] - previousGray[i]) >= threshold) out[i] = 1;
+  }
+  return out;
+}
+
+function intersectBinaryMasks(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const out = new Uint8Array(a.length);
+  const size = Math.min(a.length, b.length);
+  for (let i = 0; i < size; i += 1) {
+    if (a[i] === 1 && b[i] === 1) out[i] = 1;
+  }
+  return out;
+}
+
+// Find the integer (dx, dy) that best aligns the baseline gray patch to the current
+// gray patch (minimizes mean abs difference over a strided interior sample). A small
+// regularizer prefers no shift on ties. Cheap and dependency-free.
+function estimatePatchShift(
+  currentGray: Uint8Array,
+  baselineGray: Uint8Array,
+  width: number,
+  height: number,
+  maxShift: number,
+  stride: number,
+): { dx: number; dy: number } {
+  if (width <= maxShift * 2 + 2 || height <= maxShift * 2 + 2 || currentGray.length !== baselineGray.length) {
+    return { dx: 0, dy: 0 };
+  }
+  let bestDx = 0;
+  let bestDy = 0;
+  let bestScore = Infinity;
+  const step = Math.max(1, stride);
+  for (let dy = -maxShift; dy <= maxShift; dy += 1) {
+    for (let dx = -maxShift; dx <= maxShift; dx += 1) {
+      let sad = 0;
+      let count = 0;
+      for (let y = maxShift; y < height - maxShift; y += step) {
+        const cRow = y * width;
+        const bRow = (y - dy) * width;
+        for (let x = maxShift; x < width - maxShift; x += step) {
+          const c = currentGray[cRow + x];
+          const b = baselineGray[bRow + (x - dx)];
+          sad += c > b ? c - b : b - c;
+          count += 1;
+        }
+      }
+      if (count === 0) continue;
+      const score = sad / count + (Math.abs(dx) + Math.abs(dy)) * 0.001;
+      if (score < bestScore) {
+        bestScore = score;
+        bestDx = dx;
+        bestDy = dy;
+      }
+    }
+  }
+  return { dx: bestDx, dy: bestDy };
+}
+
+// Shift a single-channel patch by (dx, dy); exposed borders replicate the unshifted
+// value so the diff there stays ~0 instead of producing edge artifacts.
+function shiftGrayPatch(src: Uint8Array, width: number, height: number, dx: number, dy: number): Uint8Array {
+  if (dx === 0 && dy === 0) return src;
+  const out = new Uint8Array(src.length);
+  for (let y = 0; y < height; y += 1) {
+    const outRow = y * width;
+    const sy = y - dy;
+    const inRange = sy >= 0 && sy < height;
+    const srcRow = inRange ? sy * width : outRow;
+    for (let x = 0; x < width; x += 1) {
+      const sx = x - dx;
+      out[outRow + x] = inRange && sx >= 0 && sx < width ? src[srcRow + sx] : src[outRow + x];
+    }
+  }
+  return out;
+}
+
+// Shift an RGBA patch by (dx, dy) with the same border-replication rule.
+function shiftRgbaPatch(src: Uint8ClampedArray, width: number, height: number, dx: number, dy: number): Uint8ClampedArray {
+  if (dx === 0 && dy === 0) return src;
+  const out = new Uint8ClampedArray(src.length);
+  for (let y = 0; y < height; y += 1) {
+    const sy = y - dy;
+    const inRange = sy >= 0 && sy < height;
+    for (let x = 0; x < width; x += 1) {
+      const sx = x - dx;
+      const outIdx = (y * width + x) * 4;
+      const useShift = inRange && sx >= 0 && sx < width;
+      const srcIdx = useShift ? (sy * width + sx) * 4 : outIdx;
+      out[outIdx] = src[srcIdx];
+      out[outIdx + 1] = src[srcIdx + 1];
+      out[outIdx + 2] = src[srcIdx + 2];
+      out[outIdx + 3] = src[srcIdx + 3];
+    }
+  }
+  return out;
+}
+
 function summarizeRegionTemporalSupport(
   region: ChangedContourRegion,
   rawMask: Uint8Array,
@@ -3604,6 +3968,185 @@ function seekVideo(video: HTMLVideoElement, timeSec: number): Promise<void> {
   });
 }
 
+type DominantObjectBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  areaFraction: number;
+};
+
+// Find the largest plausible object in a frame via Otsu thresholding + contours.
+// Runs both polarities so it works for light-on-dark and dark-on-light subjects.
+function detectDominantObjectBox(cv: CvApi, canvas: HTMLCanvasElement): DominantObjectBox | null {
+  if (
+    !cv.findContours ||
+    !cv.contourArea ||
+    !cv.boundingRect ||
+    !cv.threshold ||
+    cv.RETR_EXTERNAL == null ||
+    cv.CHAIN_APPROX_SIMPLE == null ||
+    cv.THRESH_BINARY == null ||
+    cv.THRESH_BINARY_INV == null ||
+    cv.THRESH_OTSU == null
+  ) {
+    return null;
+  }
+
+  const frameWidth = canvas.width;
+  const frameHeight = canvas.height;
+  if (frameWidth <= 0 || frameHeight <= 0) return null;
+  const frameArea = frameWidth * frameHeight;
+
+  const src = cv.imread(canvas);
+  const gray = new cv.Mat();
+  const binary = new cv.Mat();
+  let best: DominantObjectBox | null = null;
+
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+    const evaluatePolarity = (thresholdType: number) => {
+      cv.threshold!(gray, binary, 0, 255, thresholdType | cv.THRESH_OTSU!);
+      const contours = new cv.MatVector();
+      const hierarchy = new cv.Mat();
+      try {
+        cv.findContours!(binary, contours, hierarchy, cv.RETR_EXTERNAL!, cv.CHAIN_APPROX_SIMPLE!);
+        const count = contours.size?.() ?? 0;
+        for (let i = 0; i < count; i += 1) {
+          const contour = contours.get?.(i);
+          if (!contour) continue;
+          try {
+            const fraction = cv.contourArea!(contour, false) / frameArea;
+            // Skip noise (too small) and whole-frame/background blobs (too large).
+            if (fraction < 0.02 || fraction > 0.85) continue;
+            const rect = cv.boundingRect!(contour);
+            if (rect.width >= frameWidth * 0.98 && rect.height >= frameHeight * 0.98) continue;
+            if (!best || fraction > best.areaFraction) {
+              best = {
+                x: rect.x / frameWidth,
+                y: rect.y / frameHeight,
+                width: rect.width / frameWidth,
+                height: rect.height / frameHeight,
+                areaFraction: fraction,
+              };
+            }
+          } finally {
+            contour.delete();
+          }
+        }
+      } finally {
+        hierarchy.delete();
+        contours.delete();
+      }
+    };
+
+    evaluatePolarity(cv.THRESH_BINARY!);
+    evaluatePolarity(cv.THRESH_BINARY_INV!);
+  } finally {
+    src.delete();
+    gray.delete();
+    binary.delete();
+  }
+
+  return best;
+}
+
+type FrameTemplate = {
+  gray: CvMat;
+  aspect: number;
+  targetWidthInches: number;
+  targetHeightInches: number;
+};
+
+type TemplateMatchResult = {
+  score: number;
+  box: { x: number; y: number; width: number; height: number };
+  targetWidthInches: number;
+  targetHeightInches: number;
+};
+
+// Slide each saved target template (at several scales) over a frame and keep the
+// strongest normalized-cross-correlation match. Returns a normalized box or null.
+function bestTemplateMatchForFrame(
+  cv: CvApi,
+  frameGray: CvMat,
+  frameWidth: number,
+  frameHeight: number,
+  templates: FrameTemplate[],
+  scales: number[],
+): TemplateMatchResult | null {
+  let best: TemplateMatchResult | null = null;
+  for (const template of templates) {
+    for (const scale of scales) {
+      const width = Math.round(scale * frameWidth);
+      const height = Math.round(width / Math.max(template.aspect, 1e-6));
+      if (width < 12 || height < 12 || width >= frameWidth || height >= frameHeight) continue;
+      const resized = new cv.Mat();
+      const result = new cv.Mat();
+      try {
+        cv.resize(template.gray, resized, new cv.Size(width, height), 0, 0, cv.INTER_AREA);
+        cv.matchTemplate(frameGray, resized, result, cv.TM_CCOEFF_NORMED);
+        const match = cv.minMaxLoc(result);
+        if (!best || match.maxVal > best.score) {
+          best = {
+            score: match.maxVal,
+            box: {
+              x: match.maxLoc.x / frameWidth,
+              y: match.maxLoc.y / frameHeight,
+              width: width / frameWidth,
+              height: height / frameHeight,
+            },
+            targetWidthInches: template.targetWidthInches,
+            targetHeightInches: template.targetHeightInches,
+          };
+        }
+      } finally {
+        resized.delete();
+        result.delete();
+      }
+    }
+  }
+  return best;
+}
+
+type DominantObjectSample = { timeSec: number; box: DominantObjectBox };
+
+// Cluster per-frame object boxes by center + size, then return the representative
+// frame of the largest (most common) cluster — its clearest/closest instance.
+function pickMostCommonObjectFrame(samples: DominantObjectSample[]): DominantObjectSample | null {
+  if (samples.length === 0) return null;
+
+  const clusters: DominantObjectSample[][] = [];
+  for (const sample of samples) {
+    const sampleCenterX = sample.box.x + sample.box.width / 2;
+    const sampleCenterY = sample.box.y + sample.box.height / 2;
+    let placed = false;
+    for (const cluster of clusters) {
+      const anchor = cluster[0].box;
+      const anchorCenterX = anchor.x + anchor.width / 2;
+      const anchorCenterY = anchor.y + anchor.height / 2;
+      const centerClose = Math.hypot(sampleCenterX - anchorCenterX, sampleCenterY - anchorCenterY) < 0.18;
+      const widthRatio = sample.box.width / Math.max(anchor.width, 1e-6);
+      const heightRatio = sample.box.height / Math.max(anchor.height, 1e-6);
+      const sizeClose = widthRatio > 0.5 && widthRatio < 2 && heightRatio > 0.5 && heightRatio < 2;
+      if (centerClose && sizeClose) {
+        cluster.push(sample);
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) clusters.push([sample]);
+  }
+
+  clusters.sort((a, b) => b.length - a.length);
+  const dominant = clusters[0];
+  return dominant.reduce<DominantObjectSample | null>(
+    (best, candidate) => (!best || candidate.box.areaFraction > best.box.areaFraction ? candidate : best),
+    null,
+  );
+}
+
 function clampRectToFrame(
   x: number,
   y: number,
@@ -3723,6 +4266,7 @@ export default function Home() {
   const [selectedVideoFile, setSelectedVideoFile] = useState<File | null>(null);
   const [selectedImageName, setSelectedImageName] = useState<string | null>(null);
   const [selectedImagePreviewUrl, setSelectedImagePreviewUrl] = useState<string | null>(null);
+  const [choosingDifferentFrame, setChoosingDifferentFrame] = useState(false);
   const [selectedVideoName, setSelectedVideoName] = useState<string | null>(null);
   const [selectedVideoPreviewUrl, setSelectedVideoPreviewUrl] = useState<string | null>(null);
   const [captureMode, setCaptureMode] = useState<"upload" | "stream">("upload");
@@ -3748,18 +4292,28 @@ export default function Home() {
   const [lastDetection, setLastDetection] = useState<DetectionLogEntry | null>(null);
   const [lastShot, setLastShot] = useState<ShotLogEntry | null>(null);
   const [roiRect, setRoiRect] = useState<RoiRect | null>(null);
+  const [referenceImageSize, setReferenceImageSize] = useState<{ width: number; height: number } | null>(null);
   const [isSelectingRoi, setIsSelectingRoi] = useState(false);
   const [roiMeasurementLengthInches, setRoiMeasurementLengthInches] = useState(1);
   const [roiMagnifiedDataUrl, setRoiMagnifiedDataUrl] = useState<string | null>(null);
   const [roiSelectionPixelSize, setRoiSelectionPixelSize] = useState<{ widthPx: number; heightPx: number } | null>(null);
   const [roiMeasurementLine, setRoiMeasurementLine] = useState<NormalizedMeasurementLine | null>(null);
   const [isDrawingRoiMeasurementLine, setIsDrawingRoiMeasurementLine] = useState(false);
+  const [roiZoom, setRoiZoom] = useState(1); // calibration image zoom (1 = fit width)
+  // Capture step: the in-progress drag is a *draft* until confirmed in a modal.
+  const [draftRoiRect, setDraftRoiRect] = useState<RoiRect | null>(null);
+  const [confirmRoiOpen, setConfirmRoiOpen] = useState(false);
+  const [confirmRoiPreview, setConfirmRoiPreview] = useState<string | null>(null);
   const [howlerReady, setHowlerReady] = useState(false);
   const [howlerError, setHowlerError] = useState<string | null>(null);
   const [spikeMetadata, setSpikeMetadata] = useState<SpikeMetadata[]>([]);
   const [audioSignatureCatalog, setAudioSignatureCatalog] = useState<AudioSignatureCatalogEntry[]>([]);
   const [audioSprites, setAudioSprites] = useState<Record<string, [number, number]>>({});
   const [spritesReady, setSpritesReady] = useState(false);
+  const [audioCaptureInfo, setAudioCaptureInfo] = useState<AudioCaptureInfo | null>(null);
+  const [audioCaptureError, setAudioCaptureError] = useState<string | null>(null);
+  const [playbackSpeed, setPlaybackSpeed] = useState(2);
+  const [targetTemplates, setTargetTemplates] = useState<TargetTemplate[]>([]);
   const [expandedSpikeIds, setExpandedSpikeIds] = useState<string[]>([]);
   const [analysisVideoCacheStatus, setAnalysisVideoCacheStatus] = useState<
     "idle" | "cached" | "too_large" | "unavailable"
@@ -3767,7 +4321,51 @@ export default function Home() {
   const [unitConversionEnabled, setUnitConversionEnabled] = useState(false);
   const [displayLinearUnit, setDisplayLinearUnit] = useState<LinearUnit>("in");
   const [tweakSettings, setTweakSettings] = useState<TweakSettings>(DEFAULT_TWEAK_SETTINGS);
-  const [isGearsExpanded, setIsGearsExpanded] = useState(false);
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [isAutoPicking, setIsAutoPicking] = useState(false);
+  const [showDetailedViews, setShowDetailedViews] = useState(false);
+  // Mirror to a ref so the long-running scan loop can skip the (expensive) per-frame
+  // detail-view drawing when those views are hidden, even if toggled mid-scan.
+  const showDetailedViewsRef = useRef(false);
+  useEffect(() => {
+    showDetailedViewsRef.current = showDetailedViews;
+  }, [showDetailedViews]);
+  const [collapsedSections, setCollapsedSections] = useState({ source: false, capture: false, calibrate: false });
+  const [currentStep, setCurrentStep] = useState(0);
+  const [autoAdvance, setAutoAdvance] = useState(false);
+  const [shotGroupMode, setShotGroupMode] = useState<"dbscan" | "quadtree">("quadtree");
+  // Shot group map background: "reference" = static frame updated as shots arrive; "live" = streamed cropped video.
+  const [shotMapLiveStream, setShotMapLiveStream] = useState(true);
+  // Map replay: play the analyzed clip on the map and reveal shots up to the current time.
+  const mapReplayVideoRef = useRef<HTMLVideoElement | null>(null);
+  const mapReplayActiveRef = useRef(false);
+  const mapRevealTimeRef = useRef<number>(Number.POSITIVE_INFINITY);
+  const [mapReplayActive, setMapReplayActive] = useState(false);
+  const [mapReplayPlaying, setMapReplayPlaying] = useState(false);
+  const [mapReplayTimeSec, setMapReplayTimeSec] = useState(0);
+  const [mapReplayDurationSec, setMapReplayDurationSec] = useState(0);
+  // Shot tooltip: hover preview, plus a pinned one that stays open on click/tap.
+  const [hoverShotInfo, setHoverShotInfo] = useState<{ shot: ShotLogEntry; left: number; top: number } | null>(null);
+  const [pinnedShotInfo, setPinnedShotInfo] = useState<{ shot: ShotLogEntry; left: number; top: number } | null>(null);
+  const [quadtreeRadiusScale, setQuadtreeRadiusScale] = useState(1);
+  const [showQuadtreeCells, setShowQuadtreeCells] = useState(true);
+  // Noise filter: shots below this confidence (0-100) are demoted to strays.
+  const [minShotConfidence, setMinShotConfidence] = useState(0);
+  // Manual grouping: shotId -> groupId (0 = stray). Overrides the automatic grouping.
+  const [manualGroupOverrides, setManualGroupOverrides] = useState<Record<string, number>>({});
+  const [manualEditMode, setManualEditMode] = useState(false);
+  const [activeManualGroup, setActiveManualGroup] = useState(1);
+  // Box-select: ids currently selected, plus the in-progress drag rectangle (shot-space).
+  const [manualSelectedIds, setManualSelectedIds] = useState<string[]>([]);
+  const [selectionBlinkOn, setSelectionBlinkOn] = useState(true);
+  const [manualSelectionRect, setManualSelectionRect] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(
+    null,
+  );
+  // Group timeline: scrub through time to watch each group form on an X/Y plot.
+  // null cursor = follow the latest time (show all).
+  const [timelineCursorSec, setTimelineCursorSec] = useState<number | null>(null);
+  const [showCentroidTrails, setShowCentroidTrails] = useState(true);
+  const sectionAutoCollapsedRef = useRef({ source: false, capture: false, calibrate: false });
 
   const activeLinearUnit: LinearUnit = unitConversionEnabled ? displayLinearUnit : "in";
   const activeLinearUnitLabel = LINEAR_UNIT_LABELS[activeLinearUnit];
@@ -3785,17 +4383,53 @@ export default function Home() {
   const formatLinearFromInches = (valueInches: number, fractionDigits = 1) =>
     `${toDisplayLinearValue(valueInches, fractionDigits).toFixed(fractionDigits)} ${activeLinearUnitLabel}`;
 
+  // The shot group map shows only the target ROI. Compute that region in image-pixel space,
+  // and restrict the shots used for grouping/stats/drawing to the ones inside it.
+  const roiPixelRect = useMemo(() => {
+    if (!roiRect || !referenceImageSize) return null;
+    const { width: imgW, height: imgH } = referenceImageSize;
+    if (imgW <= 0 || imgH <= 0) return null;
+    return {
+      sx: Math.max(0, roiRect.x * imgW),
+      sy: Math.max(0, roiRect.y * imgH),
+      sw: Math.max(1, roiRect.width * imgW),
+      sh: Math.max(1, roiRect.height * imgH),
+    };
+  }, [roiRect, referenceImageSize]);
+  const mapShots = useMemo<ShotLogEntry[]>(() => {
+    if (!roiPixelRect) return shotLogEntries;
+    const { sx, sy, sw, sh } = roiPixelRect;
+    return shotLogEntries.filter(
+      (shot) => shot.centerX >= sx && shot.centerX <= sx + sw && shot.centerY >= sy && shot.centerY <= sy + sh,
+    );
+  }, [shotLogEntries, roiPixelRect]);
+
+  // Shots that pass the real gate AND clear the confidence noise filter. These
+  // feed grouping/stats; everything else is shown as a (dimmed) stray.
+  const eligibleMapShots = useMemo<ShotLogEntry[]>(
+    () => mapShots.filter((shot) => shotMakesIt(shot, tweakSettings) && shotConfidencePct(shot) >= minShotConfidence),
+    [mapShots, tweakSettings, minShotConfidence],
+  );
+
+  // Confidence overview for the Analysis UI.
+  const confidenceSummary = useMemo(() => {
+    const gated = mapShots.filter((shot) => shotMakesIt(shot, tweakSettings));
+    const confidences = gated.map((shot) => shotConfidencePct(shot));
+    const kept = confidences.filter((c) => c >= minShotConfidence);
+    const avgKept = kept.length > 0 ? kept.reduce((sum, c) => sum + c, 0) / kept.length : 0;
+    return {
+      avgConfidence: avgKept,
+      keptCount: kept.length,
+      filteredCount: gated.length - kept.length,
+      totalGated: gated.length,
+    };
+  }, [mapShots, tweakSettings, minShotConfidence]);
+
   const shotClustering = useMemo<ShotClusteringResult>(() => {
-    let analysisTimeSec = Number.NEGATIVE_INFINITY;
-    for (const entry of logEntries) {
-      if (entry.videoTimeSec > analysisTimeSec) analysisTimeSec = entry.videoTimeSec;
-    }
-    for (const shot of shotLogEntries) {
-      if (shot.videoTimeSec > analysisTimeSec) analysisTimeSec = shot.videoTimeSec;
-    }
-    const eligibleShots = filterShotsByAnalysisAge(shotLogEntries, analysisTimeSec, CLUSTER_MIN_VISIBLE_AGE_SEC);
-    return clusterShotsBySpaceTime(eligibleShots, tweakSettings);
-  }, [logEntries, shotLogEntries, tweakSettings]);
+    // The results map is a final, static view, so no min-visible-age filter here (that's a
+    // live-scan heuristic). Group every eligible ROI shot — matching quadtree.
+    return clusterShotsBySpaceTime(eligibleMapShots, tweakSettings);
+  }, [eligibleMapShots, tweakSettings]);
   const clusterColorById = useMemo<Record<number, string>>(() => {
     const map: Record<number, string> = {};
     for (const cluster of shotClustering.clusters) {
@@ -3803,6 +4437,136 @@ export default function Home() {
     }
     return map;
   }, [shotClustering.clusters]);
+  // Default the quadtree grouping distance to 3 inches when calibrated; the slider scales it.
+  const quadtreeGroupInches = 3;
+  const quadtreeBaseRadiusPx = pixelsPerInch > 0 ? quadtreeGroupInches * pixelsPerInch : 0;
+  const quadtreeGrouping = useMemo<QuadtreeGroupingResult>(
+    () => groupShotsByQuadtree(eligibleMapShots, quadtreeRadiusScale, quadtreeBaseRadiusPx),
+    [eligibleMapShots, quadtreeRadiusScale, quadtreeBaseRadiusPx],
+  );
+
+  // Effective grouping = the active automatic method, with any manual overrides applied
+  // on top (groupId >= 1 joins that group; 0 marks the shot as a stray and removes it).
+  const autoGroupByShotId = shotGroupMode === "quadtree" ? quadtreeGrouping.shotClusterById : shotClustering.shotClusterById;
+  const effectiveGroupByShotId = useMemo<Record<string, number>>(() => {
+    const map: Record<string, number> = { ...autoGroupByShotId };
+    for (const [id, group] of Object.entries(manualGroupOverrides)) {
+      if (group >= 1) map[id] = group;
+      else delete map[id];
+    }
+    return map;
+  }, [autoGroupByShotId, manualGroupOverrides]);
+  const effectiveGroupIds = useMemo<number[]>(() => {
+    const ids = new Set<number>();
+    for (const id of Object.values(effectiveGroupByShotId)) ids.add(id);
+    return [...ids].sort((a, b) => a - b);
+  }, [effectiveGroupByShotId]);
+  const effectiveGroupColorById = useMemo<Record<number, string>>(() => {
+    const map: Record<number, string> = {};
+    for (const id of effectiveGroupIds) map[id] = clusterColorForId(id);
+    return map;
+  }, [effectiveGroupIds]);
+
+  // Per-group statistics for the shot group map, recomputed from the effective grouping
+  // (so manual edits, the active method, and the radius all flow through immediately).
+  const effectiveGroupStats = useMemo(() => {
+    const byGroup = new Map<number, ShotLogEntry[]>();
+    let strayCount = 0;
+    for (const shot of mapShots) {
+      const groupId = effectiveGroupByShotId[shot.id];
+      if (!groupId) {
+        strayCount += 1;
+        continue;
+      }
+      const bucket = byGroup.get(groupId) ?? [];
+      bucket.push(shot);
+      byGroup.set(groupId, bucket);
+    }
+    const groups = [...byGroup.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([groupId, shots]) => {
+        const count = shots.length;
+        let sumX = 0;
+        let sumY = 0;
+        for (const shot of shots) {
+          sumX += shot.centerX;
+          sumY += shot.centerY;
+        }
+        const centroidX = sumX / count;
+        const centroidY = sumY / count;
+        let extremeSpreadPx = 0;
+        for (let i = 0; i < shots.length; i += 1) {
+          for (let j = i + 1; j < shots.length; j += 1) {
+            const dist = Math.hypot(shots[i].centerX - shots[j].centerX, shots[i].centerY - shots[j].centerY);
+            if (dist > extremeSpreadPx) extremeSpreadPx = dist;
+          }
+        }
+        let radialSum = 0;
+        for (const shot of shots) {
+          radialSum += Math.hypot(shot.centerX - centroidX, shot.centerY - centroidY);
+        }
+        const meanRadialPx = radialSum / count;
+        const diameters = shots
+          .map((shot) => shot.estimatedDiameterInches)
+          .filter((value): value is number => value !== null);
+        const meanDiameterInches =
+          diameters.length > 0 ? diameters.reduce((sum, value) => sum + value, 0) / diameters.length : null;
+        const timeSorted = [...shots].sort((a, b) => a.videoTimeSec - b.videoTimeSec);
+        const timeSpanSec = timeSorted[count - 1].videoTimeSec - timeSorted[0].videoTimeSec;
+        const meanConfidence = shots.reduce((sum, shot) => sum + shotConfidencePct(shot), 0) / count;
+        return {
+          groupId,
+          count,
+          centroidX,
+          centroidY,
+          extremeSpreadPx,
+          meanRadialPx,
+          meanDiameterInches,
+          timeSpanSec,
+          meanConfidence,
+        };
+      });
+    return { groups, strayCount };
+  }, [mapShots, effectiveGroupByShotId]);
+
+  // Time-ordered grouped shots (with bounds) backing the X/Y group-timeline plot.
+  const groupTimeline = useMemo(() => {
+    const points: { id: string; x: number; y: number; t: number; group: number }[] = [];
+    let tMin = Infinity;
+    let tMax = -Infinity;
+    let xMin = Infinity;
+    let xMax = -Infinity;
+    let yMin = Infinity;
+    let yMax = -Infinity;
+    for (const shot of mapShots) {
+      const group = effectiveGroupByShotId[shot.id];
+      if (!group) continue;
+      points.push({ id: shot.id, x: shot.centerX, y: shot.centerY, t: shot.videoTimeSec, group });
+      if (shot.videoTimeSec < tMin) tMin = shot.videoTimeSec;
+      if (shot.videoTimeSec > tMax) tMax = shot.videoTimeSec;
+      if (shot.centerX < xMin) xMin = shot.centerX;
+      if (shot.centerX > xMax) xMax = shot.centerX;
+      if (shot.centerY < yMin) yMin = shot.centerY;
+      if (shot.centerY > yMax) yMax = shot.centerY;
+    }
+    points.sort((a, b) => a.t - b.t);
+    return {
+      points,
+      hasData: points.length > 0,
+      tMin: Number.isFinite(tMin) ? tMin : 0,
+      tMax: Number.isFinite(tMax) ? tMax : 0,
+      xMin: Number.isFinite(xMin) ? xMin : 0,
+      xMax: Number.isFinite(xMax) ? xMax : 1,
+      yMin: Number.isFinite(yMin) ? yMin : 0,
+      yMax: Number.isFinite(yMax) ? yMax : 1,
+    };
+  }, [mapShots, effectiveGroupByShotId]);
+  const timelineCursor = timelineCursorSec ?? groupTimeline.tMax;
+  const timelineUpToCount = groupTimeline.points.filter((point) => point.t <= timelineCursor).length;
+  const timelineGroupsActive = new Set(
+    groupTimeline.points.filter((point) => point.t <= timelineCursor).map((point) => point.group),
+  ).size;
+
   const changedTweakCount = useMemo(
     () =>
       (Object.keys(DEFAULT_TWEAK_SETTINGS) as Array<keyof TweakSettings>).filter(
@@ -3829,6 +4593,8 @@ export default function Home() {
                 : "export";
   const highlightActionClass =
     "ring-2 ring-amber-300 border-amber-300 bg-amber-500/10 text-amber-100 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]";
+  const toggleSectionCollapsed = (key: "source" | "capture" | "calibrate") =>
+    setCollapsedSections((current) => ({ ...current, [key]: !current[key] }));
   const roiMeasurementMetrics = useMemo(() => {
     if (!roiMeasurementLine || !roiSelectionPixelSize) return null;
     const dxPx = (roiMeasurementLine.endX - roiMeasurementLine.startX) * roiSelectionPixelSize.widthPx;
@@ -3973,12 +4739,18 @@ export default function Home() {
   const imagePreviewRef = useRef<HTMLImageElement | null>(null);
   const roiMeasurementCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoSourceSectionRef = useRef<HTMLElement | null>(null);
+  const captureSectionRef = useRef<HTMLElement | null>(null);
   const captureFrameButtonRef = useRef<HTMLButtonElement | null>(null);
+  const autoCapturedVideoUrlRef = useRef<string | null>(null);
   const roiContainerRef = useRef<HTMLDivElement | null>(null);
   const calibrationSectionRef = useRef<HTMLElement | null>(null);
+  const scanSectionRef = useRef<HTMLElement | null>(null);
+  const audioSectionRef = useRef<HTMLElement | null>(null);
+  const analysisSectionRef = useRef<HTMLElement | null>(null);
   const startScanButtonRef = useRef<HTMLButtonElement | null>(null);
   const exportButtonsRef = useRef<HTMLDivElement | null>(null);
   const previousWorkflowStepRef = useRef<WorkflowStep | null>(null);
+  const suppressWorkflowScrollRef = useRef(false);
   const howlRef = useRef<HowlInstance | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const spikeWindowsRef = useRef<TimeWindow[]>([]);
@@ -3991,6 +4763,7 @@ export default function Home() {
   const lastShotAtMsRef = useRef(0);
   const roiRectRef = useRef<RoiRect | null>(null);
   const roiStartRef = useRef<{ x: number; y: number } | null>(null);
+  const draftRoiRectRef = useRef<RoiRect | null>(null);
   const roiMeasurementLineStartRef = useRef<{ x: number; y: number } | null>(null);
   const roiMagnifiedImageRef = useRef<HTMLImageElement | null>(null);
   const streamMediaRef = useRef<MediaStream | null>(null);
@@ -3998,6 +4771,7 @@ export default function Home() {
   const scanVideoRef = useRef<HTMLVideoElement | null>(null);
   const analyzedPlaybackVideoRef = useRef<HTMLVideoElement | null>(null);
   const analyzedPlaybackRafRef = useRef<number | null>(null);
+  const playbackSpeedRef = useRef(2);
   const detectionTimelineRef = useRef<DetectionLogEntry[]>([]);
   const contourWindowTimelineRef = useRef<ContourWindowFrameSnapshot[]>([]);
   const yellowGreenTimelineRef = useRef<YellowGreenFrameSnapshot[]>([]);
@@ -4026,6 +4800,21 @@ export default function Home() {
   const audioRmsTimelineRef = useRef<AudioRmsSample[]>([]);
   const audioMeanDbfsRef = useRef(-120);
   const audioThresholdDbfsRef = useRef(-120);
+  const audioTimelineCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const shotGroupMapCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const shotGroupMapImageRef = useRef<{ url: string; img: HTMLImageElement } | null>(null);
+  const mapTransformRef = useRef<{
+    scaleX: number;
+    scaleY: number;
+    originX: number;
+    originY: number;
+    canvasWidth: number;
+    canvasHeight: number;
+  } | null>(null);
+  const manualDragRef = useRef<{ startX: number; startY: number; startClientX: number; startClientY: number; moved: boolean } | null>(
+    null,
+  );
+  const groupTimelineCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const activeSpikeWindowIndexRef = useRef<number>(-1);
   const pendingShotCandidateRef = useRef<PendingShotCandidate | null>(null);
   const lastUiDetectionEnabledRef = useRef(false);
@@ -4063,7 +4852,13 @@ export default function Home() {
   const startStreamCamera = useCallback(
     async (preferredFacingMode?: "environment" | "user") => {
       if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
-        const message = "Camera streaming is not supported in this browser.";
+        // The usual cause on phones: the page is served over plain http:// on a
+        // LAN IP, which isn't a secure context, so the browser hides the camera
+        // API entirely. localhost is exempt; a LAN address needs https://.
+        const insecure = typeof window !== "undefined" && !window.isSecureContext;
+        const message = insecure
+          ? "The camera needs a secure (HTTPS) connection. Open Trackr over https:// (or via localhost) — phone browsers block the camera on plain http:// addresses."
+          : "Camera streaming isn't available in this browser.";
         setStreamCameraError(message);
         setScanStatus(message);
         return false;
@@ -4114,7 +4909,18 @@ export default function Home() {
         setScanStatus(`Device camera stream ready (${facingMode === "environment" ? "rear" : "front"} camera).`);
         return true;
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Unable to access device camera.";
+        const name = error instanceof DOMException ? error.name : "";
+        let message: string;
+        if (name === "NotAllowedError" || name === "SecurityError") {
+          message =
+            "Camera permission was blocked. Allow camera access for this site in your browser settings, then retry.";
+        } else if (name === "NotFoundError" || name === "OverconstrainedError") {
+          message = "No camera was found on this device.";
+        } else if (name === "NotReadableError" || name === "TrackStartError" || name === "AbortError") {
+          message = "The camera is in use by another app. Close anything else using it and retry.";
+        } else {
+          message = error instanceof Error ? error.message : "Unable to access device camera.";
+        }
         setStreamCameraError(message);
         setScanStatus(`Camera access failed: ${message}`);
         setStreamCameraActive(false);
@@ -4149,9 +4955,6 @@ export default function Home() {
       if (sanitizedTweaks) {
         setTweakSettings((current) => ({ ...current, ...sanitizedTweaks }));
       }
-      if (typeof parsed.isGearsExpanded === "boolean") {
-        setIsGearsExpanded(parsed.isGearsExpanded);
-      }
     } catch {
       // Ignore malformed cached settings.
     } finally {
@@ -4166,14 +4969,585 @@ export default function Home() {
       unitConversionEnabled,
       displayLinearUnit,
       tweakSettings,
-      isGearsExpanded,
     };
     try {
       window.localStorage.setItem(GEARS_SETTINGS_STORAGE_KEY, JSON.stringify(payload));
     } catch {
       // Ignore storage write errors (e.g., quota/privacy mode).
     }
-  }, [unitConversionEnabled, displayLinearUnit, tweakSettings, isGearsExpanded]);
+  }, [unitConversionEnabled, displayLinearUnit, tweakSettings]);
+
+  useEffect(() => {
+    if (!isSettingsModalOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsSettingsModalOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isSettingsModalOpen]);
+
+  // Collapse each section once the user has moved past it; re-arm if they undo that progress.
+  useEffect(() => {
+    setCollapsedSections((current) => {
+      const next = { ...current };
+      let changed = false;
+      const arm = (key: "source" | "capture" | "calibrate", done: boolean) => {
+        if (done) {
+          if (!sectionAutoCollapsedRef.current[key]) {
+            sectionAutoCollapsedRef.current[key] = true;
+            if (!next[key]) {
+              next[key] = true;
+              changed = true;
+            }
+          }
+        } else {
+          sectionAutoCollapsedRef.current[key] = false;
+        }
+      };
+      arm("source", hasReferenceFrame);
+      arm("capture", hasScaleCalibration);
+      arm("calibrate", hasResultData);
+      return changed ? next : current;
+    });
+  }, [hasReferenceFrame, hasScaleCalibration, hasResultData]);
+
+  // Render the captured RMS/dBFS timeline with the spike threshold, mean, and per-spike markers.
+  useEffect(() => {
+    const canvas = audioTimelineCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, width, height);
+
+    const timeline = audioRmsTimelineRef.current;
+    if (!audioCaptureInfo || timeline.length === 0) {
+      ctx.fillStyle = "rgba(148,163,184,0.7)";
+      ctx.font = "12px monospace";
+      ctx.fillText("No audio captured yet — run a scan to populate the timeline.", 12, height / 2);
+      return;
+    }
+
+    const minDb = Math.min(audioCaptureInfo.minDbfs, audioCaptureInfo.thresholdDbfs) - 2;
+    const maxDb = Math.max(audioCaptureInfo.maxDbfs, audioCaptureInfo.thresholdDbfs) + 2;
+    const durationSec = Math.max(audioCaptureInfo.durationSec, 1e-6);
+    const dbRange = Math.max(maxDb - minDb, 1e-6);
+    const toX = (timeSec: number) => (timeSec / durationSec) * width;
+    const toY = (dbfs: number) => height - ((dbfs - minDb) / dbRange) * height;
+
+    // Spike windows (faint amber bands).
+    ctx.fillStyle = "rgba(251,191,36,0.10)";
+    for (const spike of spikeMetadata) {
+      const startX = toX(spike.windowStartSec);
+      const endX = toX(spike.windowEndSec);
+      ctx.fillRect(startX, 0, Math.max(1, endX - startX), height);
+    }
+
+    // Threshold line (red dashed) and mean line (sky).
+    ctx.strokeStyle = "rgba(248,113,113,0.8)";
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(0, toY(audioCaptureInfo.thresholdDbfs));
+    ctx.lineTo(width, toY(audioCaptureInfo.thresholdDbfs));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = "rgba(125,211,252,0.55)";
+    ctx.beginPath();
+    ctx.moveTo(0, toY(audioCaptureInfo.meanDbfs));
+    ctx.lineTo(width, toY(audioCaptureInfo.meanDbfs));
+    ctx.stroke();
+
+    // RMS dBFS curve (emerald).
+    ctx.strokeStyle = "rgba(52,211,153,0.95)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < timeline.length; i += 1) {
+      const x = toX(timeline[i].timeSec);
+      const y = toY(timeline[i].dbfs);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Spike peak markers (amber verticals).
+    ctx.fillStyle = "rgba(251,191,36,0.95)";
+    for (const spike of spikeMetadata) {
+      ctx.fillRect(toX(spike.timeSec) - 1, 0, 2, height);
+    }
+  }, [audioCaptureInfo, spikeMetadata]);
+
+  // Keep the playback-speed ref in sync and apply it live to any in-progress analyzed playback.
+  useEffect(() => {
+    playbackSpeedRef.current = playbackSpeed;
+    if (analyzedPlaybackVideoRef.current) {
+      analyzedPlaybackVideoRef.current.playbackRate = playbackSpeed;
+    }
+    if (howlRef.current?.rate) {
+      howlRef.current.rate(playbackSpeed);
+    }
+  }, [playbackSpeed]);
+
+  // Load the saved target-template library (ROIs the user has drawn before) for auto-detect.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(TARGET_TEMPLATE_LIBRARY_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) return;
+      const valid = parsed.filter(
+        (entry): entry is TargetTemplate =>
+          !!entry &&
+          typeof (entry as TargetTemplate).dataUrl === "string" &&
+          typeof (entry as TargetTemplate).aspect === "number" &&
+          (entry as TargetTemplate).aspect > 0,
+      );
+      setTargetTemplates(valid.slice(0, MAX_TARGET_TEMPLATES));
+    } catch {
+      // Ignore a malformed library.
+    }
+  }, []);
+
+  // Track the reference image's natural size so the ROI (normalized) can be converted to
+  // pixel space for cropping the shot group map and filtering shots to the target region.
+  useEffect(() => {
+    if (!selectedImagePreviewUrl) {
+      setReferenceImageSize(null);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (!cancelled) setReferenceImageSize({ width: img.naturalWidth, height: img.naturalHeight });
+    };
+    img.src = selectedImagePreviewUrl;
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedImagePreviewUrl]);
+
+  // Shared overlay: quadtree cells, group hulls, shot markers, and the manual selection,
+  // drawn in shot-space and shifted by the ROI origin. Used by both the static reference
+  // map and the live cropped-video stream.
+  const drawShotMapOverlay = (
+    ctx: CanvasRenderingContext2D,
+    scaleX: number,
+    scaleY: number,
+    originX: number,
+    originY: number,
+    revealTimeSec: number = Number.POSITIVE_INFINITY,
+  ) => {
+    const isQuad = shotGroupMode === "quadtree";
+    const groupByShotId = effectiveGroupByShotId;
+    const colorById = effectiveGroupColorById;
+    // During replay, reveal only the shots detected up to the current playback time.
+    const visibleShots = Number.isFinite(revealTimeSec)
+      ? mapShots.filter((shot) => shot.videoTimeSec <= revealTimeSec)
+      : mapShots;
+
+    ctx.save();
+    ctx.translate(-originX * scaleX, -originY * scaleY);
+
+    if (isQuad && showQuadtreeCells) {
+      ctx.strokeStyle = "rgba(148,163,184,0.28)";
+      ctx.lineWidth = 1;
+      for (const cell of quadtreeGrouping.leafRects) {
+        ctx.strokeRect(cell.x * scaleX, cell.y * scaleY, cell.w * scaleX, cell.h * scaleY);
+      }
+    }
+
+    const geometry = clusterGeometryFromShots(visibleShots, groupByShotId);
+    drawClusterGeometry(ctx, geometry, colorById, scaleX, scaleY, isQuad ? "G" : "DB");
+
+    const selectedIdSet = new Set(manualSelectedIds);
+    for (const shot of visibleShots) {
+      const cx = shot.centerX * scaleX;
+      const cy = shot.centerY * scaleY;
+      const groupId = groupByShotId[shot.id];
+      const isSelected = selectedIdSet.has(shot.id);
+      // Circle sized to the estimated bullet hole, drawn over the actual feature.
+      const bulletRadius = Math.max(3, (shot.estimatedDiameterPx / 2) * scaleX);
+      if (!groupId) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, bulletRadius, 0, Math.PI * 2);
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(148,163,184,0.6)";
+        ctx.stroke();
+      } else {
+        const color = colorById[groupId] ?? clusterColorForId(groupId);
+        ctx.beginPath();
+        ctx.arc(cx, cy, bulletRadius, 0, Math.PI * 2);
+        ctx.fillStyle = hexToRgba(color, 0.18);
+        ctx.fill();
+        ctx.lineWidth = manualEditMode && groupId === activeManualGroup ? 2.5 : 1.75;
+        ctx.strokeStyle = manualEditMode && groupId === activeManualGroup ? "#ffffff" : color;
+        ctx.stroke();
+      }
+      // Small center mark for the precise impact point.
+      ctx.beginPath();
+      ctx.arc(cx, cy, 2, 0, Math.PI * 2);
+      ctx.fillStyle = groupId ? colorById[groupId] ?? clusterColorForId(groupId) : "rgba(148,163,184,0.85)";
+      ctx.fill();
+      if (isSelected) {
+        const ring = bulletRadius + 3;
+        const blinkFill = selectionBlinkOn ? "#ffffff" : "#000000";
+        const blinkEdge = selectionBlinkOn ? "#000000" : "#ffffff";
+        ctx.beginPath();
+        ctx.arc(cx, cy, ring, 0, Math.PI * 2);
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = blinkEdge;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(cx, cy, ring, 0, Math.PI * 2);
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = blinkFill;
+        ctx.stroke();
+      }
+    }
+
+    if (manualSelectionRect) {
+      const rx0 = Math.min(manualSelectionRect.x0, manualSelectionRect.x1) * scaleX;
+      const ry0 = Math.min(manualSelectionRect.y0, manualSelectionRect.y1) * scaleY;
+      const rw = Math.abs(manualSelectionRect.x1 - manualSelectionRect.x0) * scaleX;
+      const rh = Math.abs(manualSelectionRect.y1 - manualSelectionRect.y0) * scaleY;
+      ctx.fillStyle = selectionBlinkOn ? "rgba(255,255,255,0.18)" : "rgba(0,0,0,0.3)";
+      ctx.fillRect(rx0, ry0, rw, rh);
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 4]);
+      ctx.strokeStyle = selectionBlinkOn ? "#ffffff" : "#000000";
+      ctx.strokeRect(rx0, ry0, rw, rh);
+      ctx.setLineDash([]);
+    }
+
+    ctx.restore();
+  };
+
+  // Draw the reference frame with every shot plotted, colored by group, and a convex
+  // hull around each group (DBSCAN space+time, or quadtree spatial grouping).
+  useEffect(() => {
+    if (shotMapLiveStream) return; // live mode is handled by the streaming effect below
+    const canvas = shotGroupMapCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const render = (image: HTMLImageElement | null) => {
+      const imageWidth = image?.naturalWidth ?? 0;
+      const imageHeight = image?.naturalHeight ?? 0;
+      const hasImage = imageWidth > 0 && imageHeight > 0;
+
+      // Region to show: the target ROI in image-pixel space, or the full frame as a fallback.
+      let originX = 0;
+      let originY = 0;
+      let regionW = imageWidth;
+      let regionH = imageHeight;
+      if (roiPixelRect && hasImage) {
+        originX = Math.max(0, Math.min(roiPixelRect.sx, imageWidth - 1));
+        originY = Math.max(0, Math.min(roiPixelRect.sy, imageHeight - 1));
+        regionW = Math.max(1, Math.min(roiPixelRect.sw, imageWidth - originX));
+        regionH = Math.max(1, Math.min(roiPixelRect.sh, imageHeight - originY));
+      }
+
+      const displayWidth = 760;
+      const canvasWidth = displayWidth;
+      const canvasHeight = hasImage
+        ? Math.round((displayWidth * regionH) / regionW)
+        : Math.round(displayWidth * 0.6);
+      canvas.width = canvasWidth;
+      canvas.height = canvasHeight;
+
+      ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+      if (hasImage) {
+        // Draw only the ROI crop, stretched to fill the canvas.
+        ctx.drawImage(image as HTMLImageElement, originX, originY, regionW, regionH, 0, 0, canvasWidth, canvasHeight);
+        ctx.fillStyle = "rgba(0,0,0,0.4)";
+        ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+      } else {
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+      }
+
+      if (mapShots.length === 0) {
+        ctx.fillStyle = "rgba(148,163,184,0.85)";
+        ctx.font = "16px sans-serif";
+        ctx.fillText(
+          roiPixelRect ? "No shots in the target region yet." : "No shots yet — run a scan to see grouped shot clusters.",
+          16,
+          canvasHeight / 2,
+        );
+        return;
+      }
+
+      // Shots are in frame-pixel space; reference dims = the shown region (ROI or full frame).
+      let referenceWidth = regionW;
+      let referenceHeight = regionH;
+      if (!hasImage) {
+        let maxShotX = 1;
+        let maxShotY = 1;
+        for (const shot of mapShots) {
+          if (shot.centerX > maxShotX) maxShotX = shot.centerX;
+          if (shot.centerY > maxShotY) maxShotY = shot.centerY;
+        }
+        referenceWidth = maxShotX * 1.05;
+        referenceHeight = maxShotY * 1.05;
+      }
+      const scaleX = canvasWidth / referenceWidth;
+      const scaleY = canvasHeight / referenceHeight;
+
+      // Remember the draw transform (incl. ROI origin) so manual-edit taps map screen → shot space.
+      mapTransformRef.current = { scaleX, scaleY, originX, originY, canvasWidth, canvasHeight };
+      drawShotMapOverlay(ctx, scaleX, scaleY, originX, originY);
+    };
+
+    const url = selectedImagePreviewUrl;
+    if (!url) {
+      render(null);
+      return;
+    }
+    if (shotGroupMapImageRef.current?.url === url) {
+      render(shotGroupMapImageRef.current.img);
+      return;
+    }
+    let cancelled = false;
+    const image = new Image();
+    image.onload = () => {
+      if (cancelled) return;
+      shotGroupMapImageRef.current = { url, img: image };
+      render(image);
+    };
+    image.onerror = () => {
+      if (!cancelled) render(null);
+    };
+    image.src = url;
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedImagePreviewUrl,
+    mapShots,
+    roiPixelRect,
+    shotGroupMode,
+    quadtreeGrouping,
+    showQuadtreeCells,
+    effectiveGroupByShotId,
+    effectiveGroupColorById,
+    manualEditMode,
+    activeManualGroup,
+    manualSelectedIds,
+    manualSelectionRect,
+    selectionBlinkOn,
+    shotMapLiveStream,
+  ]);
+
+  // Live mode: stream the cropped ROI of the active video onto the shot group map and
+  // overlay the same groups/shots, refreshing every animation frame.
+  useEffect(() => {
+    if (!shotMapLiveStream) return;
+    // Only run the per-frame loop when the map is actually relevant on screen.
+    if (currentStep !== 4 && !isScanning && !mapReplayActive) return;
+    const canvas = shotGroupMapCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    let raf = 0;
+
+    const draw = () => {
+      const replayActive = mapReplayActiveRef.current;
+      const replayVideo = mapReplayVideoRef.current;
+      const video =
+        replayActive && replayVideo
+          ? replayVideo
+          : (analyzedPlaybackVideoRef.current ?? scanVideoRef.current ?? videoRef.current);
+      // Replaying reveals shots up to the playhead; otherwise show everything.
+      mapRevealTimeRef.current = replayActive && replayVideo ? replayVideo.currentTime : Number.POSITIVE_INFINITY;
+      const vW = video?.videoWidth ?? 0;
+      const vH = video?.videoHeight ?? 0;
+      const displayWidth = 760;
+
+      if (!video || vW <= 0 || vH <= 0) {
+        canvas.width = displayWidth;
+        canvas.height = Math.round(displayWidth * 0.6);
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "rgba(148,163,184,0.85)";
+        ctx.font = "16px sans-serif";
+        ctx.fillText("Waiting for video — start a scan or play a spike.", 16, canvas.height / 2);
+        raf = requestAnimationFrame(draw);
+        return;
+      }
+
+      // ROI crop in video-pixel space (matches the reference frame the shots live in).
+      let originX = 0;
+      let originY = 0;
+      let regionW = vW;
+      let regionH = vH;
+      if (roiRect) {
+        originX = Math.max(0, Math.min(roiRect.x * vW, vW - 1));
+        originY = Math.max(0, Math.min(roiRect.y * vH, vH - 1));
+        regionW = Math.max(1, Math.min(roiRect.width * vW, vW - originX));
+        regionH = Math.max(1, Math.min(roiRect.height * vH, vH - originY));
+      }
+      const canvasWidth = displayWidth;
+      const canvasHeight = Math.round((displayWidth * regionH) / regionW);
+      canvas.width = canvasWidth;
+      canvas.height = canvasHeight;
+
+      ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+      ctx.drawImage(video, originX, originY, regionW, regionH, 0, 0, canvasWidth, canvasHeight);
+      ctx.fillStyle = "rgba(0,0,0,0.18)";
+      ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+
+      const scaleX = canvasWidth / regionW;
+      const scaleY = canvasHeight / regionH;
+      mapTransformRef.current = { scaleX, scaleY, originX, originY, canvasWidth, canvasHeight };
+      drawShotMapOverlay(ctx, scaleX, scaleY, originX, originY, mapRevealTimeRef.current);
+
+      raf = requestAnimationFrame(draw);
+    };
+
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    shotMapLiveStream,
+    currentStep,
+    isScanning,
+    mapReplayActive,
+    roiRect,
+    mapShots,
+    shotGroupMode,
+    quadtreeGrouping,
+    showQuadtreeCells,
+    effectiveGroupByShotId,
+    effectiveGroupColorById,
+    manualEditMode,
+    activeManualGroup,
+    manualSelectedIds,
+    manualSelectionRect,
+    selectionBlinkOn,
+  ]);
+
+  // Group timeline: X/Y plot of grouped shots revealed up to the cursor time, with each
+  // group's running centroid (and optional trail) so you can watch groups form over time.
+  useEffect(() => {
+    const canvas = groupTimelineCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, width, height);
+
+    if (!groupTimeline.hasData) {
+      ctx.fillStyle = "rgba(148,163,184,0.8)";
+      ctx.font = "15px sans-serif";
+      ctx.fillText("No grouped shots yet — run a scan and group some shots.", 16, height / 2);
+      return;
+    }
+
+    const cursor = timelineCursorSec ?? groupTimeline.tMax;
+    const spanX = Math.max(1, groupTimeline.xMax - groupTimeline.xMin);
+    const spanY = Math.max(1, groupTimeline.yMax - groupTimeline.yMin);
+    const minX = groupTimeline.xMin - spanX * 0.08;
+    const maxX = groupTimeline.xMax + spanX * 0.08;
+    const minY = groupTimeline.yMin - spanY * 0.08;
+    const maxY = groupTimeline.yMax + spanY * 0.08;
+    const margin = 10;
+    const plotW = width - margin * 2;
+    const plotH = height - margin * 2;
+    const toX = (x: number) => margin + ((x - minX) / (maxX - minX)) * plotW;
+    const toY = (y: number) => margin + ((y - minY) / (maxY - minY)) * plotH; // y down = image orientation
+
+    // Grid + frame.
+    ctx.strokeStyle = "rgba(148,163,184,0.12)";
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i += 1) {
+      const gx = margin + (plotW * i) / 4;
+      const gy = margin + (plotH * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(gx, margin);
+      ctx.lineTo(gx, margin + plotH);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(margin, gy);
+      ctx.lineTo(margin + plotW, gy);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = "rgba(148,163,184,0.3)";
+    ctx.strokeRect(margin, margin, plotW, plotH);
+
+    // Shots after the cursor: faint, so you can see where the group will grow next.
+    for (const point of groupTimeline.points) {
+      if (point.t <= cursor) continue;
+      ctx.beginPath();
+      ctx.arc(toX(point.x), toY(point.y), 2.5, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(100,116,139,0.35)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    // Accumulate running centroids per group up to the cursor.
+    const perGroup = new Map<number, { sumX: number; sumY: number; count: number; path: [number, number][] }>();
+    for (const point of groupTimeline.points) {
+      if (point.t > cursor) break;
+      const entry = perGroup.get(point.group) ?? { sumX: 0, sumY: 0, count: 0, path: [] };
+      entry.sumX += point.x;
+      entry.sumY += point.y;
+      entry.count += 1;
+      entry.path.push([entry.sumX / entry.count, entry.sumY / entry.count]);
+      perGroup.set(point.group, entry);
+    }
+
+    // Shots up to the cursor.
+    for (const point of groupTimeline.points) {
+      if (point.t > cursor) continue;
+      const color = effectiveGroupColorById[point.group] ?? clusterColorForId(point.group);
+      ctx.beginPath();
+      ctx.arc(toX(point.x), toY(point.y), 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(0,0,0,0.6)";
+      ctx.stroke();
+    }
+
+    // Centroid trails + current centroid markers.
+    for (const [group, entry] of perGroup) {
+      const color = effectiveGroupColorById[group] ?? clusterColorForId(group);
+      if (showCentroidTrails && entry.path.length > 1) {
+        ctx.beginPath();
+        for (let i = 0; i < entry.path.length; i += 1) {
+          const [px, py] = entry.path[i];
+          const sxp = toX(px);
+          const syp = toY(py);
+          if (i === 0) ctx.moveTo(sxp, syp);
+          else ctx.lineTo(sxp, syp);
+        }
+        ctx.strokeStyle = hexToRgba(color, 0.7);
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+      const [cx, cy] = entry.path[entry.path.length - 1];
+      const mx = toX(cx);
+      const my = toY(cy);
+      ctx.beginPath();
+      ctx.arc(mx, my, 8, 0, Math.PI * 2);
+      ctx.fillStyle = hexToRgba(color, 0.9);
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#ffffff";
+      ctx.stroke();
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 12px sans-serif";
+      ctx.fillText(String(group), mx + 10, my + 4);
+    }
+  }, [groupTimeline, timelineCursorSec, showCentroidTrails, effectiveGroupColorById]);
 
   useEffect(() => {
     return () => {
@@ -4246,38 +5620,9 @@ export default function Home() {
       previousWorkflowStepRef.current = workflowStep;
       return;
     }
-    if (previousStep === workflowStep) return;
     previousWorkflowStepRef.current = workflowStep;
-    if (previousStep === "draw_geometry" && (workflowStep === "calibrate" || workflowStep === "scan")) {
-      return;
-    }
-    // Keep viewport stable after analysis; avoid auto-jumping into Resulting Data/logs.
-    if (previousStep === "scan" && workflowStep === "export") {
-      return;
-    }
-
-    const targetElement =
-      workflowStep === "upload_video"
-        ? videoSourceSectionRef.current
-        : workflowStep === "capture_frame"
-          ? captureFrameButtonRef.current
-          : workflowStep === "draw_geometry"
-            ? roiContainerRef.current ?? captureFrameButtonRef.current
-            : workflowStep === "calibrate"
-              ? calibrationSectionRef.current
-              : workflowStep === "scan"
-                ? startScanButtonRef.current
-                : exportButtonsRef.current;
-
-    if (!targetElement) return;
-
-    window.requestAnimationFrame(() => {
-      targetElement.scrollIntoView({
-        behavior: "smooth",
-        block: "center",
-        inline: "nearest",
-      });
-    });
+    // Navigation is now explicit via the step wizard, so no auto-scroll on step change.
+    suppressWorkflowScrollRef.current = false;
   }, [workflowStep]);
 
   useEffect(() => {
@@ -4372,6 +5717,68 @@ export default function Home() {
     }
     return { src: selectedVideoPreviewUrl, fromSession: false };
   }, [selectedVideoFile, selectedVideoName, selectedVideoPreviewUrl]);
+
+  // --- Shot group map replay: play the analyzed clip on the map, revealing shots over time. ---
+  const ensureMapReplaySource = (): boolean => {
+    const video = mapReplayVideoRef.current;
+    if (!video) return false;
+    const source = resolvePlaybackVideoSource();
+    if (!source.src) return false;
+    if (video.src !== source.src) {
+      video.src = source.src;
+      video.load();
+    }
+    return true;
+  };
+
+  const startMapReplay = () => {
+    const video = mapReplayVideoRef.current;
+    if (!video || !ensureMapReplaySource()) {
+      setScanStatus("No video available to replay. Upload a clip and scan first.");
+      return;
+    }
+    setShotMapLiveStream(true);
+    mapReplayActiveRef.current = true;
+    setMapReplayActive(true);
+    // Restart from the top if we were parked at the end.
+    if (mapReplayDurationSec > 0 && video.currentTime >= mapReplayDurationSec - 0.05) {
+      video.currentTime = 0;
+    }
+    video.playbackRate = playbackSpeed;
+    void video.play().catch(() => {
+      setScanStatus("Couldn't start replay playback.");
+    });
+  };
+
+  const toggleMapReplay = () => {
+    if (mapReplayPlaying) {
+      mapReplayVideoRef.current?.pause();
+    } else {
+      startMapReplay();
+    }
+  };
+
+  const exitMapReplay = () => {
+    mapReplayVideoRef.current?.pause();
+    mapReplayActiveRef.current = false;
+    setMapReplayActive(false);
+    setMapReplayPlaying(false);
+    mapRevealTimeRef.current = Number.POSITIVE_INFINITY;
+  };
+
+  const scrubMapReplay = (timeSec: number) => {
+    const video = mapReplayVideoRef.current;
+    if (!video) return;
+    if (!mapReplayActiveRef.current) {
+      if (!ensureMapReplaySource()) return;
+      setShotMapLiveStream(true);
+      mapReplayActiveRef.current = true;
+      setMapReplayActive(true);
+    }
+    video.currentTime = timeSec;
+    mapRevealTimeRef.current = timeSec;
+    setMapReplayTimeSec(timeSec);
+  };
 
   const clearAnalysisCanvases = () => {
     const processedContourCanvas = processedContourCanvasRef.current;
@@ -4571,26 +5978,16 @@ export default function Home() {
     });
   };
 
-  const applyCalibrationFromRoiMeasurementLine = () => {
-    if (!roiMeasurementMetrics || !roiMeasurementMetrics.pixelsPerInch || roiMeasurementMetrics.pixelsPerInch <= 0) {
-      setScanStatus(`Draw a line and enter a positive length in ${activeLinearUnitLabel}.`);
-      return;
-    }
-
-    const nextPixelsPerInch = roiMeasurementMetrics.pixelsPerInch;
-    setPixelsPerInch(nextPixelsPerInch);
-    if (calibrationDistanceInches > 0) {
-      setFocalScalePxIn(nextPixelsPerInch * calibrationDistanceInches);
-    } else {
-      setFocalScalePxIn(0);
-    }
-    setScanStatus(
-      `Line calibration applied: ${roiMeasurementMetrics.pixelLength.toFixed(1)} px = ${formatLinearFromInches(
-        roiMeasurementMetrics.knownLengthInches,
-        3,
-      )}.`,
-    );
-  };
+  // Auto-apply line calibration as soon as a line is drawn (and a length is set),
+  // so the user doesn't have to press a separate "Apply" button.
+  useEffect(() => {
+    if (isDrawingRoiMeasurementLine) return;
+    const ppi = roiMeasurementMetrics?.pixelsPerInch;
+    if (!ppi || ppi <= 0) return;
+    setPixelsPerInch(ppi);
+    setFocalScalePxIn(calibrationDistanceInches > 0 ? ppi * calibrationDistanceInches : 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDrawingRoiMeasurementLine, roiMeasurementMetrics, calibrationDistanceInches]);
 
   const hasAnalysisCoverageForWindow = useCallback(
     (windowStartSec: number, windowEndSec: number): boolean => {
@@ -4674,6 +6071,8 @@ export default function Home() {
       setSelectedImageName(null);
       revokeBlobUrl(selectedImagePreviewUrl);
       setSelectedImagePreviewUrl(null);
+      setChoosingDifferentFrame(false);
+      autoCapturedVideoUrlRef.current = null;
       setRoiRect(null);
       roiRectRef.current = null;
       clearRoiLineCalibrationState();
@@ -4688,7 +6087,8 @@ export default function Home() {
       void cacheAnalysisVideoForSessionPlayback(file);
     };
 
-  const captureReferenceFrameFromVideo = () => {
+  const captureReferenceFrameFromVideo = (options?: { silent?: boolean }) => {
+    const silent = options?.silent ?? false;
     const videoEl = videoRef.current;
     if (!videoEl || (captureMode === "upload" ? !selectedVideoPreviewUrl : !streamCameraActive)) {
       setScanStatus(
@@ -4731,8 +6131,303 @@ export default function Home() {
     clearRoiLineCalibrationState();
     setFocalScalePxIn(0);
     clearTemplateRegionCache();
-    setScanStatus("Reference frame captured. Drag to select target geometry.");
-    window.alert("Reference frame captured. Please draw a box around the target.");
+    setChoosingDifferentFrame(false);
+    setScanStatus(
+      silent
+        ? "Using the first video frame as the reference image. Drag a rectangle around the target."
+        : "Reference frame captured. Drag a rectangle around the target.",
+    );
+    if (!silent) {
+      window.alert("Reference frame captured. Drag a rectangle around the target.");
+    }
+  };
+
+  // Default the reference image to the video's first frame as soon as an uploaded
+  // video is ready, unless the user has already captured/chosen one.
+  useEffect(() => {
+    if (captureMode !== "upload") return;
+    if (!selectedVideoPreviewUrl) return;
+    if (selectedImagePreviewUrl) return;
+    if (autoCapturedVideoUrlRef.current === selectedVideoPreviewUrl) return;
+    const videoEl = videoRef.current;
+    if (!videoEl) return;
+
+    autoCapturedVideoUrlRef.current = selectedVideoPreviewUrl;
+    let cancelled = false;
+
+    const captureNow = () => {
+      if (cancelled || selectedImagePreviewUrl) return;
+      if (videoEl.videoWidth <= 0 || videoEl.videoHeight <= 0) return;
+      captureReferenceFrameFromVideo({ silent: true });
+    };
+
+    // `seeked`/`loadeddata` can fire before the decoded frame is actually painted, which
+    // produces a black capture. Wait for a presented frame via requestVideoFrameCallback,
+    // with a timeout fallback for browsers that lack it.
+    const grab = () => {
+      if (cancelled) return;
+      let done = false;
+      const fire = () => {
+        if (done) return;
+        done = true;
+        captureNow();
+      };
+      const rvfc = (
+        videoEl as HTMLVideoElement & {
+          requestVideoFrameCallback?: (cb: () => void) => number;
+        }
+      ).requestVideoFrameCallback;
+      if (typeof rvfc === "function") {
+        rvfc.call(videoEl, fire);
+      }
+      window.setTimeout(fire, 250);
+    };
+
+    const onSeeked = () => {
+      grab();
+      cleanup();
+    };
+    const onLoadedData = () => {
+      // Use the very first frame as the reference image.
+      if (videoEl.currentTime > 0.01) {
+        videoEl.addEventListener("seeked", onSeeked, { once: true });
+        try {
+          videoEl.currentTime = 0;
+        } catch {
+          videoEl.removeEventListener("seeked", onSeeked);
+          grab();
+          cleanup();
+        }
+      } else {
+        grab();
+        cleanup();
+      }
+    };
+    const cleanup = () => {
+      videoEl.removeEventListener("loadeddata", onLoadedData);
+      videoEl.removeEventListener("seeked", onSeeked);
+    };
+
+    if (videoEl.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      onLoadedData();
+    } else {
+      videoEl.addEventListener("loadeddata", onLoadedData, { once: true });
+    }
+
+    return () => {
+      cancelled = true;
+      cleanup();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captureMode, selectedVideoPreviewUrl, selectedImagePreviewUrl]);
+
+  const autoPickReferenceFrameFromVideo = async () => {
+    if (captureMode !== "upload") {
+      setScanStatus("Auto-pick is available for uploaded videos only.");
+      return;
+    }
+    const videoEl = videoRef.current;
+    const cv = window.cv as unknown as CvApi | undefined;
+    if (!videoEl || !selectedVideoPreviewUrl) {
+      setScanStatus("Upload a video first, then auto-pick a reference frame.");
+      return;
+    }
+    if (!opencvReady || !cv) {
+      setScanStatus("OpenCV is still loading. Try auto-pick again in a moment.");
+      return;
+    }
+    const duration = videoEl.duration;
+    if (!Number.isFinite(duration) || duration <= 0 || videoEl.videoWidth <= 0) {
+      setScanStatus("Video metadata not ready yet. Play or seek the video, then auto-pick.");
+      return;
+    }
+
+    setIsAutoPicking(true);
+    suppressWorkflowScrollRef.current = true;
+    const loadedTemplates: FrameTemplate[] = [];
+    try {
+      videoEl.pause();
+
+      const sampleCount = 24;
+      const detectionScale = Math.min(1, 480 / videoEl.videoWidth);
+      const detectionCanvas = document.createElement("canvas");
+      detectionCanvas.width = Math.max(1, Math.round(videoEl.videoWidth * detectionScale));
+      detectionCanvas.height = Math.max(1, Math.round(videoEl.videoHeight * detectionScale));
+      const frameWidth = detectionCanvas.width;
+      const frameHeight = detectionCanvas.height;
+      const detectionCtx = detectionCanvas.getContext("2d", { willReadFrequently: true });
+      if (!detectionCtx) {
+        setScanStatus("Unable to prepare frame analysis canvas for auto-pick.");
+        return;
+      }
+
+      const timeForSample = (index: number) =>
+        duration * (0.04 + (0.92 * index) / Math.max(1, sampleCount - 1));
+
+      // Pad a detected box slightly so the target isn't clipped, then clamp to [0,1].
+      const padBox = (box: { x: number; y: number; width: number; height: number }): RoiRect => {
+        const pad = 0.04;
+        const rect: RoiRect = {
+          x: Math.max(0, box.x - pad),
+          y: Math.max(0, box.y - pad),
+          width: Math.min(1, box.width + pad * 2),
+          height: Math.min(1, box.height + pad * 2),
+        };
+        rect.width = Math.min(rect.width, 1 - rect.x);
+        rect.height = Math.min(rect.height, 1 - rect.y);
+        return rect;
+      };
+
+      // Seek to the chosen time, capture the full-res frame, and wire it up as the reference.
+      const finalizeReference = async (
+        timeSec: number,
+        autoRect: RoiRect,
+        dims: { widthInches: number; heightInches: number } | null,
+      ): Promise<boolean> => {
+        await seekVideo(videoEl, timeSec);
+        const width = videoEl.videoWidth;
+        const height = videoEl.videoHeight;
+        const frameCanvas = document.createElement("canvas");
+        frameCanvas.width = width;
+        frameCanvas.height = height;
+        const frameCtx = frameCanvas.getContext("2d");
+        if (!frameCtx) {
+          setScanStatus("Unable to capture the auto-picked reference frame.");
+          return false;
+        }
+        frameCtx.drawImage(videoEl, 0, 0, width, height);
+        const frameDataUrl = frameCanvas.toDataURL("image/png");
+        const frameSourceName = (selectedVideoName ?? "video").replace(/\.[^/.]+$/, "");
+        const frameName = `${frameSourceName}-auto-${timeSec.toFixed(2)}s.png`;
+
+        revokeBlobUrl(selectedImagePreviewUrl);
+        clearRoiLineCalibrationState();
+        setFocalScalePxIn(0);
+        setSelectedImageName(frameName);
+        setSelectedImagePreviewUrl(frameDataUrl);
+        roiRectRef.current = autoRect;
+        setRoiRect(autoRect);
+        lastAutoCalibrationKeyRef.current = "";
+        // Reuse the dimensions saved with the matched template so calibration can auto-run.
+        if (dims && dims.widthInches > 0 && dims.heightInches > 0 && targetWidthInches <= 0 && targetHeightInches <= 0) {
+          setTargetWidthInches(dims.widthInches);
+          setTargetHeightInches(dims.heightInches);
+        }
+
+        try {
+          const templateRegionDataUrl = await createTemplateRegionDataUrl(frameDataUrl, autoRect);
+          sessionStorage.setItem(TEMPLATE_REGION_DATA_URL_KEY, templateRegionDataUrl);
+          sessionStorage.setItem(TEMPLATE_REGION_IMAGE_NAME_KEY, frameName);
+          sessionStorage.setItem(TEMPLATE_REGION_RECT_KEY, JSON.stringify(autoRect));
+        } catch {
+          clearTemplateRegionCache();
+        }
+        return true;
+      };
+
+      // Pass 1: match against the target outlines the user has drawn before.
+      for (const template of targetTemplates.slice(0, 5)) {
+        try {
+          const image = await loadImageFromUrl(template.dataUrl);
+          if (image.naturalWidth <= 0 || image.naturalHeight <= 0) continue;
+          const templateCanvas = document.createElement("canvas");
+          const downscale = Math.min(1, 240 / image.naturalWidth);
+          templateCanvas.width = Math.max(1, Math.round(image.naturalWidth * downscale));
+          templateCanvas.height = Math.max(1, Math.round(image.naturalHeight * downscale));
+          const templateCtx = templateCanvas.getContext("2d");
+          if (!templateCtx) continue;
+          templateCtx.drawImage(image, 0, 0, templateCanvas.width, templateCanvas.height);
+          const srcMat = cv.imread(templateCanvas);
+          const gray = new cv.Mat();
+          cv.cvtColor(srcMat, gray, cv.COLOR_RGBA2GRAY);
+          srcMat.delete();
+          loadedTemplates.push({
+            gray,
+            aspect: templateCanvas.width / Math.max(templateCanvas.height, 1),
+            targetWidthInches: template.targetWidthInches,
+            targetHeightInches: template.targetHeightInches,
+          });
+        } catch {
+          // Skip a template that fails to load.
+        }
+      }
+
+      if (loadedTemplates.length > 0) {
+        const scales = [0.25, 0.38, 0.52, 0.66];
+        let best: (TemplateMatchResult & { timeSec: number }) | null = null;
+        for (let i = 0; i < sampleCount; i += 1) {
+          const timeSec = timeForSample(i);
+          setScanStatus(`Auto-pick: matching your ${loadedTemplates.length} saved target(s)… ${i + 1}/${sampleCount}`);
+          try {
+            await seekVideo(videoEl, timeSec);
+          } catch {
+            continue;
+          }
+          detectionCtx.drawImage(videoEl, 0, 0, frameWidth, frameHeight);
+          const frameMat = cv.imread(detectionCanvas);
+          const frameGray = new cv.Mat();
+          cv.cvtColor(frameMat, frameGray, cv.COLOR_RGBA2GRAY);
+          frameMat.delete();
+          const match = bestTemplateMatchForFrame(cv, frameGray, frameWidth, frameHeight, loadedTemplates, scales);
+          frameGray.delete();
+          if (match && (!best || match.score > best.score)) best = { ...match, timeSec };
+          if (best && best.score >= 0.85) break; // strong enough, stop early
+        }
+
+        if (best && best.score >= 0.45) {
+          const finalized = await finalizeReference(best.timeSec, padBox(best.box), {
+            widthInches: best.targetWidthInches,
+            heightInches: best.targetHeightInches,
+          });
+          if (finalized) {
+            setScanStatus(
+              `Auto-picked at ${best.timeSec.toFixed(2)}s by matching a target you drew before (${(
+                best.score * 100
+              ).toFixed(0)}% match). Adjust the box if needed.`,
+            );
+          }
+          return;
+        }
+        setScanStatus("No strong match to your saved targets — falling back to shape detection…");
+      }
+
+      // Pass 2: fall back to finding the most common object by shape.
+      const samples: DominantObjectSample[] = [];
+      for (let i = 0; i < sampleCount; i += 1) {
+        const timeSec = timeForSample(i);
+        setScanStatus(`Auto-pick: detecting most common object… ${i + 1}/${sampleCount}`);
+        try {
+          await seekVideo(videoEl, timeSec);
+        } catch {
+          continue;
+        }
+        detectionCtx.drawImage(videoEl, 0, 0, frameWidth, frameHeight);
+        const box = detectDominantObjectBox(cv, detectionCanvas);
+        if (box) samples.push({ timeSec, box });
+      }
+
+      const chosen = pickMostCommonObjectFrame(samples);
+      if (!chosen) {
+        setScanStatus("Auto-pick could not find a recurring object. Capture a frame manually instead.");
+        return;
+      }
+      const finalized = await finalizeReference(chosen.timeSec, padBox(chosen.box), null);
+      if (finalized) {
+        setScanStatus(
+          `Auto-picked reference frame at ${chosen.timeSec.toFixed(2)}s and placed a target box around the most common object. Adjust the box or set target dimensions next.`,
+        );
+      }
+    } catch {
+      setScanStatus("Auto-pick failed while scanning the video. Capture a frame manually instead.");
+    } finally {
+      for (const template of loadedTemplates) template.gray.delete();
+      setIsAutoPicking(false);
+      // Fallback release in case auto-pick didn't change the workflow step (so the
+      // step effect never ran to consume the flag).
+      window.setTimeout(() => {
+        suppressWorkflowScrollRef.current = false;
+      }, 600);
+    }
   };
 
   const applyCalibrationFromSelection = useCallback(
@@ -4792,15 +6487,245 @@ export default function Home() {
     [roiRect, selectedImagePreviewUrl, targetWidthInches, targetHeightInches, calibrationDistanceInches],
   );
 
-  const goToNextAfterGeometrySelection = () => {
-    const nextTarget = hasScaleCalibration ? startScanButtonRef.current : calibrationSectionRef.current;
-    if (!nextTarget) return;
+  // Wizard steps, in the same order they appear in the DOM.
+  const sectionSteps: { label: string; short: string }[] = [
+    { label: "Video Source", short: "1" },
+    { label: "Capture Image", short: "2" },
+    { label: "Calibration", short: "3" },
+    { label: "Scan", short: "4" },
+    { label: "Analysis", short: "5" },
+    { label: "Audio Capture", short: "6" },
+  ];
 
-    nextTarget.scrollIntoView({
-      behavior: "smooth",
-      block: "center",
-      inline: "nearest",
-    });
+  const goToStep = (index: number) => setCurrentStep(Math.max(0, Math.min(sectionSteps.length - 1, index)));
+
+  // Each step is its own card; jump back to the top when switching steps.
+  useEffect(() => {
+    if (typeof window !== "undefined") window.scrollTo({ top: 0, behavior: "smooth" });
+  }, [currentStep]);
+
+  // Auto-advance preference persists in localStorage.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setAutoAdvance(window.localStorage.getItem(AUTO_ADVANCE_STORAGE_KEY) === "true");
+  }, []);
+  const handleAutoAdvanceChange = (next: boolean) => {
+    setAutoAdvance(next);
+    if (typeof window !== "undefined") window.localStorage.setItem(AUTO_ADVANCE_STORAGE_KEY, String(next));
+  };
+
+  // When enabled, advance to the next step the moment the current step's milestone is met
+  // (rising edge only, so going back manually doesn't bounce you forward again).
+  const autoAdvancePrevRef = useRef({ uploaded: false, geometry: false, calib: false, scanning: false });
+  useEffect(() => {
+    const prev = autoAdvancePrevRef.current;
+    if (autoAdvance) {
+      if (!prev.uploaded && hasUploadedVideo && currentStep === 0) goToStep(1);
+      else if (!prev.geometry && hasDrawnGeometry && currentStep === 1) goToStep(2);
+      else if (!prev.calib && hasScaleCalibration && currentStep === 2) goToStep(3);
+      else if (prev.scanning && !isScanning && hasResultData && currentStep === 3) goToStep(4);
+    }
+    autoAdvancePrevRef.current = {
+      uploaded: hasUploadedVideo,
+      geometry: hasDrawnGeometry,
+      calib: hasScaleCalibration,
+      scanning: isScanning,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoAdvance, hasUploadedVideo, hasDrawnGeometry, hasScaleCalibration, hasResultData, isScanning, currentStep]);
+
+  // While a scan runs, collapse the detailed analysis views down to just the Shot Group Map.
+  useEffect(() => {
+    if (isScanning) setShowDetailedViews(false);
+  }, [isScanning]);
+
+  // Blink the manual-edit selection (black/white) so it stands out over any background.
+  useEffect(() => {
+    const active = manualEditMode && (manualSelectedIds.length > 0 || manualSelectionRect !== null);
+    if (!active) return;
+    const id = window.setInterval(() => setSelectionBlinkOn((value) => !value), 450);
+    return () => window.clearInterval(id);
+  }, [manualEditMode, manualSelectedIds, manualSelectionRect]);
+
+  // Map a pointer position to shot-space (reference-frame px) using the last draw transform.
+  const mapClientToShot = (clientX: number, clientY: number) => {
+    const canvas = shotGroupMapCanvasRef.current;
+    const transform = mapTransformRef.current;
+    if (!canvas || !transform) return null;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const internalX = (clientX - rect.left) * (canvas.width / rect.width);
+    const internalY = (clientY - rect.top) * (canvas.height / rect.height);
+    // Canvas x = (shotX - originX) * scaleX, so invert with the ROI origin offset.
+    return {
+      shotX: internalX / transform.scaleX + transform.originX,
+      shotY: internalY / transform.scaleY + transform.originY,
+    };
+  };
+
+  // Tap a single shot to move it into the active group (0 = stray).
+  const assignSingleShotAtPoint = (clientX: number, clientY: number) => {
+    const point = mapClientToShot(clientX, clientY);
+    const transform = mapTransformRef.current;
+    if (!point || !transform) return;
+    let nearestId: string | null = null;
+    let nearestDist = Infinity;
+    for (const shot of mapShots) {
+      const dist = Math.hypot((shot.centerX - point.shotX) * transform.scaleX, (shot.centerY - point.shotY) * transform.scaleY);
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        nearestId = shot.id;
+      }
+    }
+    if (!nearestId || nearestDist > 20) return;
+    const id = nearestId;
+    setManualGroupOverrides((current) => ({ ...current, [id]: activeManualGroup }));
+  };
+
+  const handleMapPointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!manualEditMode) return;
+    event.preventDefault();
+    const point = mapClientToShot(event.clientX, event.clientY);
+    if (!point) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    manualDragRef.current = {
+      startX: point.shotX,
+      startY: point.shotY,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      moved: false,
+    };
+    setManualSelectionRect(null);
+  };
+
+  const handleMapPointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const drag = manualDragRef.current;
+    if (!manualEditMode || !drag) return;
+    const movedFar = Math.hypot(event.clientX - drag.startClientX, event.clientY - drag.startClientY) > 6;
+    if (movedFar) drag.moved = true;
+    if (!drag.moved) return;
+    const point = mapClientToShot(event.clientX, event.clientY);
+    if (!point) return;
+    setManualSelectionRect({ x0: drag.startX, y0: drag.startY, x1: point.shotX, y1: point.shotY });
+  };
+
+  const handleMapPointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const drag = manualDragRef.current;
+    manualDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    if (!manualEditMode || !drag) return;
+    if (!drag.moved) {
+      // A tap: assign the nearest shot to the active group.
+      assignSingleShotAtPoint(event.clientX, event.clientY);
+      return;
+    }
+    // A drag: select every shot inside the rectangle.
+    const point = mapClientToShot(event.clientX, event.clientY);
+    if (!point) {
+      setManualSelectionRect(null);
+      return;
+    }
+    const minX = Math.min(drag.startX, point.shotX);
+    const maxX = Math.max(drag.startX, point.shotX);
+    const minY = Math.min(drag.startY, point.shotY);
+    const maxY = Math.max(drag.startY, point.shotY);
+    const ids = mapShots
+      .filter((shot) => shot.centerX >= minX && shot.centerX <= maxX && shot.centerY >= minY && shot.centerY <= maxY)
+      .map((shot) => shot.id);
+    setManualSelectedIds(ids);
+    setManualSelectionRect(null);
+  };
+
+  // Hit-test the shot map for a pointer: returns the nearest shot under the
+  // cursor (within its drawn radius + a little slack) plus its CSS position
+  // relative to the canvas, so a tooltip can be anchored over it.
+  const shotInfoAtClient = (
+    clientX: number,
+    clientY: number,
+  ): { shot: ShotLogEntry; left: number; top: number } | null => {
+    const canvas = shotGroupMapCanvasRef.current;
+    const transform = mapTransformRef.current;
+    if (!canvas || !transform) return null;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const internalX = (clientX - rect.left) * (canvas.width / rect.width);
+    const internalY = (clientY - rect.top) * (canvas.height / rect.height);
+    const shotX = internalX / transform.scaleX + transform.originX;
+    const shotY = internalY / transform.scaleY + transform.originY;
+    const revealTime = mapRevealTimeRef.current;
+    let best: ShotLogEntry | null = null;
+    let bestDist = Infinity;
+    for (const shot of mapShots) {
+      // Only hit shots that are currently drawn (revealed up to the playhead).
+      if (Number.isFinite(revealTime) && shot.videoTimeSec > revealTime) continue;
+      const dxCanvas = (shot.centerX - shotX) * transform.scaleX;
+      const dyCanvas = (shot.centerY - shotY) * transform.scaleY;
+      const distCanvas = Math.hypot(dxCanvas, dyCanvas);
+      const bulletRadiusCanvas = Math.max(3, (shot.estimatedDiameterPx / 2) * transform.scaleX);
+      const hitRadius = Math.max(bulletRadiusCanvas + 4, 12);
+      if (distCanvas <= hitRadius && distCanvas < bestDist) {
+        best = shot;
+        bestDist = distCanvas;
+      }
+    }
+    if (!best) return null;
+    const cssPerInternalX = rect.width / canvas.width;
+    const cssPerInternalY = rect.height / canvas.height;
+    const left = (best.centerX - transform.originX) * transform.scaleX * cssPerInternalX;
+    const top = (best.centerY - transform.originY) * transform.scaleY * cssPerInternalY;
+    return { shot: best, left, top };
+  };
+
+  // Pointer wrappers for the map canvas. Hovering shows a transient tooltip;
+  // clicking/tapping a shot pins it open (toggle); clicking empty space clears
+  // the pin. In manual-edit mode the existing drag/select handlers still run.
+  const onMapPointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (manualEditMode) handleMapPointerMove(event);
+    setHoverShotInfo(shotInfoAtClient(event.clientX, event.clientY));
+  };
+  const onMapPointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (manualEditMode) {
+      handleMapPointerDown(event);
+      return;
+    }
+    const info = shotInfoAtClient(event.clientX, event.clientY);
+    if (info) {
+      setPinnedShotInfo((prev) => (prev?.shot.id === info.shot.id ? null : info));
+    } else {
+      setPinnedShotInfo(null);
+    }
+  };
+  const onMapPointerLeave = () => setHoverShotInfo(null);
+
+  // Clicking a group/Stray/New: assign the current selection to it, or (with no selection)
+  // just make it the active group for tap-to-assign.
+  const chooseManualGroup = (groupId: number) => {
+    if (manualSelectedIds.length > 0) {
+      const ids = manualSelectedIds;
+      setManualGroupOverrides((current) => {
+        const next = { ...current };
+        for (const id of ids) next[id] = groupId;
+        return next;
+      });
+      setManualSelectedIds([]);
+    }
+    setActiveManualGroup(groupId);
+  };
+
+  const nextManualGroupId = () =>
+    (effectiveGroupIds.length > 0 ? effectiveGroupIds[effectiveGroupIds.length - 1] : 0) + 1;
+
+  const resetManualGroupOverrides = () => {
+    setManualGroupOverrides({});
+    setManualSelectedIds([]);
+    setManualSelectionRect(null);
+  };
+
+  const goToNextAfterGeometrySelection = () => {
+    // Advance the wizard: to Scan if already calibrated, otherwise to Calibration.
+    goToStep(hasScaleCalibration ? 3 : 2);
     setScanStatus(
       hasScaleCalibration
         ? "Geometry selected. Proceed to Start Scan when ready."
@@ -4854,9 +6779,74 @@ export default function Home() {
     }
   };
 
+  // Save a drawn ROI as a reusable target template that auto-detect can match against later.
+  const addTargetTemplate = async (nextRect: RoiRect) => {
+    if (typeof window === "undefined" || !selectedImagePreviewUrl) return;
+    if (nextRect.width < 0.02 || nextRect.height < 0.02) {
+      setScanStatus("Target box is too small to save for Auto-pick — draw a slightly larger box.");
+      return;
+    }
+    try {
+      const dataUrl = await createTemplateRegionDataUrl(selectedImagePreviewUrl, nextRect);
+      const cropped = await loadImageFromUrl(dataUrl);
+      const aspect =
+        cropped.naturalWidth > 0 && cropped.naturalHeight > 0
+          ? cropped.naturalWidth / cropped.naturalHeight
+          : nextRect.width / Math.max(nextRect.height, 1e-6);
+      const template: TargetTemplate = {
+        id: `tpl-${Date.now().toString(36)}-${Math.round(nextRect.x * 1000)}`,
+        dataUrl,
+        aspect,
+        sourceName: selectedVideoName ?? selectedImageName ?? "frame",
+        targetWidthInches,
+        targetHeightInches,
+        createdAt: Date.now(),
+        roi: nextRect,
+      };
+      // Only replace a box drawn over essentially the same spot on the same source, so
+      // distinct draws accumulate. Keep newest first, capped.
+      const sameSpot = (existing: TargetTemplate) => {
+        if (existing.sourceName !== template.sourceName) return false;
+        if (Math.abs(existing.aspect - template.aspect) >= 0.05) return false;
+        const a = existing.roi;
+        if (!a) return true; // legacy entries without a stored ROI: treat as the same spot
+        const aCx = a.x + a.width / 2;
+        const aCy = a.y + a.height / 2;
+        const bCx = nextRect.x + nextRect.width / 2;
+        const bCy = nextRect.y + nextRect.height / 2;
+        return Math.hypot(aCx - bCx, aCy - bCy) < 0.05;
+      };
+      const next = [template, ...targetTemplates.filter((existing) => !sameSpot(existing))].slice(
+        0,
+        MAX_TARGET_TEMPLATES,
+      );
+      setTargetTemplates(next);
+      try {
+        window.localStorage.setItem(TARGET_TEMPLATE_LIBRARY_KEY, JSON.stringify(next));
+        setScanStatus(`Saved target to Auto-pick library (${next.length} saved).`);
+      } catch {
+        setScanStatus("Target box drawn, but saving to the Auto-pick library failed (storage full?).");
+      }
+    } catch {
+      setScanStatus("Could not save the target box for Auto-pick (image crop failed).");
+    }
+  };
+
+  const clearTargetTemplates = () => {
+    setTargetTemplates([]);
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.removeItem(TARGET_TEMPLATE_LIBRARY_KEY);
+    } catch {
+      // Ignore.
+    }
+  };
+
   const clearRoiSelection = () => {
     roiRectRef.current = null;
     setRoiRect(null);
+    draftRoiRectRef.current = null;
+    setDraftRoiRect(null);
     clearRoiLineCalibrationState();
     setFocalScalePxIn(0);
     clearTemplateRegionCache();
@@ -4872,11 +6862,12 @@ export default function Home() {
     const x = Math.min(Math.max(clientX - bounds.left, 0), bounds.width);
     const y = Math.min(Math.max(clientY - bounds.top, 0), bounds.height);
 
-    roiStartRef.current = { x, y };
+    roiStartRef.current = { x, y }; // the top-left corner of the box
     setIsSelectingRoi(true);
+    // Only a *draft* while dragging — the real ROI isn't committed until confirm.
     const nextRect = { x: x / bounds.width, y: y / bounds.height, width: 0, height: 0 };
-    roiRectRef.current = nextRect;
-    setRoiRect(nextRect);
+    draftRoiRectRef.current = nextRect;
+    setDraftRoiRect(nextRect);
   };
 
   const updateRoiSelection = (clientX: number, clientY: number) => {
@@ -4898,20 +6889,50 @@ export default function Home() {
       width: width / bounds.width,
       height: height / bounds.height,
     };
-    roiRectRef.current = nextRect;
-    setRoiRect(nextRect);
+    draftRoiRectRef.current = nextRect;
+    setDraftRoiRect(nextRect);
   };
 
+  // Drag finished (mouseup/leave): open the confirm modal with a crop preview.
+  // Nothing downstream advances until the user confirms.
   const endRoiSelection = () => {
+    if (!isSelectingRoi) return;
     setIsSelectingRoi(false);
     roiStartRef.current = null;
-    const current = roiRectRef.current;
-    if (!current || current.width < 0.01 || current.height < 0.01) {
-      clearRoiSelection();
+    const draft = draftRoiRectRef.current;
+    if (!draft || draft.width < 0.01 || draft.height < 0.01) {
+      draftRoiRectRef.current = null;
+      setDraftRoiRect(null);
       return;
     }
-    setRoiRect(current);
-    void persistTemplateRegionSelection(current);
+    setConfirmRoiPreview(null);
+    setConfirmRoiOpen(true);
+    if (selectedImagePreviewUrl) {
+      void createTemplateRegionDataUrl(selectedImagePreviewUrl, draft)
+        .then((url) => setConfirmRoiPreview(url))
+        .catch(() => setConfirmRoiPreview(null));
+    }
+  };
+
+  const confirmRoiSelection = () => {
+    const draft = draftRoiRectRef.current;
+    setConfirmRoiOpen(false);
+    setConfirmRoiPreview(null);
+    if (!draft || draft.width < 0.01 || draft.height < 0.01) return;
+    roiRectRef.current = draft;
+    setRoiRect(draft);
+    lastAutoCalibrationKeyRef.current = "";
+    void persistTemplateRegionSelection(draft);
+    void addTargetTemplate(draft);
+    draftRoiRectRef.current = null;
+    setDraftRoiRect(null);
+  };
+
+  const retryRoiSelection = () => {
+    draftRoiRectRef.current = null;
+    setDraftRoiRect(null);
+    setConfirmRoiOpen(false);
+    setConfirmRoiPreview(null);
   };
 
   const stopScan = () => {
@@ -5162,6 +7183,10 @@ export default function Home() {
       resetShotFlowState();
       setLogEntries([]);
       setShotLogEntries([]);
+      setManualGroupOverrides({});
+      setManualSelectedIds([]);
+      setManualSelectionRect(null);
+      setTimelineCursorSec(null);
       setLastDetection(null);
       setLastShot(null);
       setDetectionEnabled(false);
@@ -5172,6 +7197,8 @@ export default function Home() {
       setAudioSignatureCatalog([]);
       setAudioSprites({});
       setSpritesReady(false);
+      setAudioCaptureInfo(null);
+      setAudioCaptureError(null);
       setIsScanning(true);
       setScanStatus(
         isStreamScan
@@ -5254,7 +7281,16 @@ export default function Home() {
         const audioTask = (async () => {
           const audioContext = new AudioContext();
           const fileBuffer = await selectedVideoFile!.arrayBuffer();
-          const decodedAudio = await audioContext.decodeAudioData(fileBuffer.slice(0));
+          let decodedAudio: AudioBuffer;
+          try {
+            decodedAudio = await audioContext.decodeAudioData(fileBuffer.slice(0));
+          } catch (decodeError) {
+            await audioContext.close();
+            const detail = decodeError instanceof Error ? decodeError.message : String(decodeError);
+            throw new Error(
+              `Browser could not decode audio from "${selectedVideoFile!.name}". The file may have no audio track or an unsupported codec. (${detail})`,
+            );
+          }
           await audioContext.close();
 
           const { spikes, spriteMap, signatureCatalog, rmsTimeline, meanDbfs, thresholdDbfs } = detectAudioSpikes(
@@ -5269,6 +7305,31 @@ export default function Home() {
           audioRmsTimelineRef.current = rmsTimeline;
           audioMeanDbfsRef.current = meanDbfs;
           audioThresholdDbfsRef.current = thresholdDbfs;
+
+          let minDbfs = Number.POSITIVE_INFINITY;
+          let maxDbfs = Number.NEGATIVE_INFINITY;
+          for (const sample of rmsTimeline) {
+            if (sample.dbfs < minDbfs) minDbfs = sample.dbfs;
+            if (sample.dbfs > maxDbfs) maxDbfs = sample.dbfs;
+          }
+          const rmsHopSec =
+            rmsTimeline.length > 1
+              ? (rmsTimeline[rmsTimeline.length - 1].timeSec - rmsTimeline[0].timeSec) / (rmsTimeline.length - 1)
+              : 0;
+          setAudioCaptureInfo({
+            sampleRate: decodedAudio.sampleRate,
+            channels: decodedAudio.numberOfChannels,
+            durationSec: decodedAudio.duration,
+            totalSamples: decodedAudio.length,
+            rmsSampleCount: rmsTimeline.length,
+            rmsHopSec,
+            meanDbfs,
+            thresholdDbfs,
+            minDbfs: Number.isFinite(minDbfs) ? minDbfs : meanDbfs,
+            maxDbfs: Number.isFinite(maxDbfs) ? maxDbfs : meanDbfs,
+            spikeCount: spikes.length,
+            signatureCount: signatureCatalog.length,
+          });
 
           if (howlRef.current) {
             howlRef.current.unload();
@@ -5303,9 +7364,11 @@ export default function Home() {
           setScanStatus("Audio spikes ready. Running detection in +/-1s windows with intensive analysis near each spike.");
         })().catch((error) => {
           const message = error instanceof Error ? error.message : String(error);
+          console.error("[audio] spike pipeline failed:", error);
           audioReadyRef.current = true;
           spikeWindowsRef.current = [{ start: 0, end: durationSec }];
           setSpritesReady(false);
+          setAudioCaptureError(message);
           setScanStatus(`Audio spike analysis failed (${message}). Scanning full video range.`);
         });
 
@@ -5340,6 +7403,10 @@ export default function Home() {
       const templateBaselineContext = templateBaselineCanvas.getContext("2d");
       let templateBaselinePatch: Uint8ClampedArray | null = null;
       let contourMaskHistory: Uint8Array[] = [];
+      // True temporal diff: previous frame's probe gray + a short window of recent
+      // frame-to-frame "jump" masks (reset whenever the baseline is re-synced).
+      let prevPatchGray: Uint8Array | null = null;
+      let temporalMaskHistory: Uint8Array[] = [];
       const syncTemplateBaselinePatch = () => {
         if (!templateBaselineContext) return false;
         if (
@@ -5369,6 +7436,8 @@ export default function Home() {
         );
         templateBaselinePatch = new Uint8ClampedArray(baselineImage.data);
         contourMaskHistory = [];
+        prevPatchGray = null;
+        temporalMaskHistory = [];
         return true;
       };
       syncTemplateBaselinePatch();
@@ -5663,14 +7732,20 @@ export default function Home() {
           let contourWindowSnapshotForFrame: ContourWindowFrameSnapshot | null = null;
           let yellowGreenSnapshotForFrame: YellowGreenFrameSnapshot | null = null;
           const changeProbeContext = changeProbeCanvas.getContext("2d");
+          // The four "Probe / Contour / Mask / Yellow-green" views are pure debug
+          // visualization. Skip all their per-frame drawing while they're hidden
+          // (the default) — this is what made scanning slow.
+          const detailedViewsVisible = showDetailedViewsRef.current;
           const processedContourCanvas = processedContourCanvasRef.current;
-          const processedContourContext = processedContourCanvas?.getContext("2d") ?? null;
+          const processedContourContext = detailedViewsVisible ? (processedContourCanvas?.getContext("2d") ?? null) : null;
           const processedPatchCanvas = processedPatchCanvasRef.current;
-          const processedPatchContext = processedPatchCanvas?.getContext("2d") ?? null;
+          const processedPatchContext = detailedViewsVisible ? (processedPatchCanvas?.getContext("2d") ?? null) : null;
           const processedMaskCanvas = processedMaskCanvasRef.current;
-          const processedMaskContext = processedMaskCanvas?.getContext("2d") ?? null;
+          const processedMaskContext = detailedViewsVisible ? (processedMaskCanvas?.getContext("2d") ?? null) : null;
           const processedYellowGreenCanvas = processedYellowGreenCanvasRef.current;
-          const processedYellowGreenContext = processedYellowGreenCanvas?.getContext("2d") ?? null;
+          const processedYellowGreenContext = detailedViewsVisible
+            ? (processedYellowGreenCanvas?.getContext("2d") ?? null)
+            : null;
           if (changeProbeContext) {
             try {
               changeProbeContext.drawImage(
@@ -5778,6 +7853,8 @@ export default function Home() {
                   lastHistogramDeltaPctRef.current = 0;
                   histogramDeltaPctForFrame = 0;
                   contourMaskHistory = [];
+                  prevPatchGray = null;
+                  temporalMaskHistory = [];
                   resetShotFlowState();
                   if (processedContourContext) {
                     drawProcessedContourView(
@@ -5815,16 +7892,38 @@ export default function Home() {
                   const tileMadThreshold = FORCE_OPEN_SHOT_GATES ? 6 : 10;
                   const tileSize = patchWidth >= 256 || patchHeight >= 256 ? 32 : 16;
 
-                  const baselineDiffMask = buildGrayDifferenceMask(currentPatchGray, baselinePatchGray, baselineDiffThreshold);
+                  // Register the baseline to this frame's patch (small integer-shift search)
+                  // to cancel residual jitter/perspective before differencing.
+                  const patchShift =
+                    USE_PATCH_REGISTRATION && !FORCE_OPEN_SHOT_GATES
+                      ? estimatePatchShift(
+                          currentPatchGray,
+                          baselinePatchGray,
+                          patchWidth,
+                          patchHeight,
+                          PATCH_REGISTRATION_MAX_SHIFT,
+                          PATCH_REGISTRATION_STRIDE,
+                        )
+                      : { dx: 0, dy: 0 };
+                  const alignedBaselineGray =
+                    patchShift.dx === 0 && patchShift.dy === 0
+                      ? baselinePatchGray
+                      : shiftGrayPatch(baselinePatchGray, patchWidth, patchHeight, patchShift.dx, patchShift.dy);
+                  const alignedBaselineRgba =
+                    patchShift.dx === 0 && patchShift.dy === 0
+                      ? activeBaselinePatch
+                      : shiftRgbaPatch(activeBaselinePatch, patchWidth, patchHeight, patchShift.dx, patchShift.dy);
+
+                  const baselineDiffMask = buildGrayDifferenceMask(currentPatchGray, alignedBaselineGray, baselineDiffThreshold);
                   const baselineLegacyMask = buildSimpleBackgroundSubtractMask(
                     currentPatchRgba,
-                    activeBaselinePatch,
+                    alignedBaselineRgba,
                     patchWidth,
                     patchHeight,
                   );
                   const tileChangeMask = buildTileMadMask(
                     currentPatchGray,
-                    baselinePatchGray,
+                    alignedBaselineGray,
                     patchWidth,
                     patchHeight,
                     tileSize,
@@ -5838,7 +7937,7 @@ export default function Home() {
                   ]);
                   const morphOpened = openBinaryMask(rawCombinedMask, patchWidth, patchHeight, 3);
                   const openedChangeMask = closeBinaryMask(morphOpened, patchWidth, patchHeight, 3);
-                  const histogramDeltaPct = computeGrayHistogramDeltaPct(currentPatchGray, baselinePatchGray);
+                  const histogramDeltaPct = computeGrayHistogramDeltaPct(currentPatchGray, alignedBaselineGray);
                   lastHistogramDeltaPctRef.current = histogramDeltaPct;
                   histogramDeltaPctForFrame = histogramDeltaPct;
                   const openedChangedPixels = countMaskPixels(openedChangeMask);
@@ -5858,20 +7957,56 @@ export default function Home() {
                     requiredPersistenceVotes,
                   );
                   const persistentChangedPixels = countMaskPixels(persistentMask);
-                  const effectiveMask = FORCE_OPEN_SHOT_GATES
+                  const baselineEffectiveMask = FORCE_OPEN_SHOT_GATES
                     ? openedChangeMask
                     : hasTemporalHistory
                       ? persistentMask
                       : openedChangeMask;
-                  const effectiveChangedPixels = FORCE_OPEN_SHOT_GATES
+                  const baselineEffectiveChangedPixels = FORCE_OPEN_SHOT_GATES
                     ? openedChangedPixels
                     : hasTemporalHistory
                       ? persistentChangedPixels
                       : openedChangedPixels;
+
+                  // True temporal diff: keep only changes that ALSO jumped sharply
+                  // frame-to-frame within the recent window. Slow drift / lighting
+                  // shifts differ from baseline but never jump, so they drop out.
+                  const frameTemporalMask =
+                    USE_TEMPORAL_DIFF_GATE &&
+                    !FORCE_OPEN_SHOT_GATES &&
+                    prevPatchGray &&
+                    prevPatchGray.length === currentPatchGray.length
+                      ? openBinaryMask(
+                          buildTemporalDiffMask(currentPatchGray, prevPatchGray, TEMPORAL_DIFF_THRESHOLD),
+                          patchWidth,
+                          patchHeight,
+                          2,
+                        )
+                      : null;
+                  const temporalImpactUnion =
+                    frameTemporalMask || temporalMaskHistory.length > 0
+                      ? mergeBinaryMasks([...(frameTemporalMask ? [frameTemporalMask] : []), ...temporalMaskHistory])
+                      : null;
+                  const applyTemporalGate =
+                    USE_TEMPORAL_DIFF_GATE &&
+                    !FORCE_OPEN_SHOT_GATES &&
+                    temporalImpactUnion !== null &&
+                    countMaskPixels(temporalImpactUnion) > 0;
+                  const effectiveMask = applyTemporalGate
+                    ? intersectBinaryMasks(baselineEffectiveMask, temporalImpactUnion as Uint8Array)
+                    : baselineEffectiveMask;
+                  const effectiveChangedPixels = applyTemporalGate
+                    ? countMaskPixels(effectiveMask)
+                    : baselineEffectiveChangedPixels;
                   const effectiveChangedRatioPct = (effectiveChangedPixels / (patchWidth * patchHeight)) * 100;
+                  // Carry this frame forward for the next iteration's temporal diff.
+                  if (frameTemporalMask) {
+                    temporalMaskHistory = [...temporalMaskHistory, frameTemporalMask].slice(-TEMPORAL_DIFF_HISTORY_MAX);
+                  }
+                  prevPatchGray = currentPatchGray;
                   const positiveDiffMap = buildPositiveBackgroundDiffMap(
                     currentPatchRgba,
-                    activeBaselinePatch,
+                    alignedBaselineRgba,
                     patchWidth,
                     patchHeight,
                   );
@@ -6650,7 +8785,7 @@ export default function Home() {
             visibleShotMarkers,
             currentSec,
             CLUSTER_MIN_VISIBLE_AGE_SEC,
-          );
+          ).filter((shot) => shotMakesIt(shot, tweakSettings));
           const clusterNowMs = performance.now();
           if (eligibleLiveShotsForClustering.length === 0) {
             if (liveClusterShotCountRef.current !== 0) {
@@ -6689,7 +8824,7 @@ export default function Home() {
           drawClusterGeometry(overlayContext, visibleClusterGeometry, liveClusterColorById, scaleX, scaleY);
           let contourRegionColorsForFrame: string[] | undefined;
           let contourRegionGroupLabelsForFrame: string[] | undefined;
-          if (contourWindowSnapshotForFrame && contourWindowSnapshotForFrame.regions.length > 0) {
+          if (detailedViewsVisible && contourWindowSnapshotForFrame && contourWindowSnapshotForFrame.regions.length > 0) {
             const cachedContourVisuals = liveContourGroupVisualsRef.current;
             const contourVisualsDue =
               cachedContourVisuals.regionColors.length === 0 ||
@@ -6868,6 +9003,13 @@ export default function Home() {
         videoEl.pause();
       }
       scanVideoRef.current = null;
+      // The final shots are exactly what's left in the live overlay at scan end
+      // (shotMarkersRef is capped to shotHistoryMaxCount), rather than the full
+      // unbounded accumulation. Skip focused per-spike re-scans so they don't
+      // replace the full result set.
+      if (!requestedWindow) {
+        setShotLogEntries(shotMarkersRef.current);
+      }
       const overlayCtx = overlayEl.getContext("2d");
       overlayCtx?.clearRect(0, 0, overlayEl.width, overlayEl.height);
       clearAnalysisCanvases();
@@ -6947,6 +9089,9 @@ export default function Home() {
   };
 
   const requestStartScan = () => {
+    // Jump straight to the Analysis step so the live detection views + shot map
+    // are on screen while the scan runs.
+    goToStep(4);
     if (isScanning || scanTaskActiveRef.current) {
       restartScanRequestedRef.current = true;
       if (isScanning) {
@@ -7035,6 +9180,7 @@ export default function Home() {
       playbackVideo.muted = false;
       playbackVideo.volume = previewVideo ? previewVideo.volume : 1;
       playbackVideo.playsInline = true;
+      playbackVideo.playbackRate = playbackSpeedRef.current;
       analyzedPlaybackVideoRef.current = playbackVideo;
 
       if (playbackVideo.readyState < HTMLMediaElement.HAVE_METADATA) {
@@ -7059,6 +9205,7 @@ export default function Home() {
 
       await seekVideo(playbackVideo, spike.windowStartSec);
       await playbackVideo.play();
+      playbackVideo.playbackRate = playbackSpeedRef.current;
 
       const renderAnalyzedFrame = () => {
         const activeVideo = analyzedPlaybackVideoRef.current;
@@ -7177,7 +9324,7 @@ export default function Home() {
           spikeShotMarkers,
           nowSec,
           CLUSTER_MIN_VISIBLE_AGE_SEC,
-        );
+        ).filter((shot) => shotMakesIt(shot, tweakSettings));
         const playbackClustering = clusterShotsBySpaceTime(eligiblePlaybackShotMarkers, tweakSettings);
         const playbackClusterByShotId = playbackClustering.shotClusterById;
         const playbackClusterColorById: Record<number, string> = {};
@@ -7294,143 +9441,143 @@ export default function Home() {
 
     if (howlRef.current) {
       howlRef.current.stop();
+      howlRef.current.rate?.(playbackSpeedRef.current);
       howlRef.current.play(spikeId);
     }
   };
 
   return (
     <div className="min-h-screen bg-black text-white">
-      <main className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-3 py-4 sm:gap-6 sm:px-8 sm:py-8">
-        <section className="rounded-xl border border-amber-500/40 bg-amber-500/5 p-4 sm:p-6">
-          <h2 className="text-base font-semibold text-amber-100 sm:text-lg">Workflow Guide</h2>
-          <p className="mt-2 text-sm text-amber-50/90">
-            Follow sections top-to-bottom. Highlighted controls are the next action to press.
-          </p>
-          <p className="mt-1 text-xs text-amber-200">
-            Current step:{" "}
-            {workflowStep === "upload_video"
-              ? captureMode === "upload"
-                ? "Upload a reference video"
-                : "Start your device camera stream"
-              : workflowStep === "capture_frame"
-                ? "Press Use Current Video Frame"
-                : workflowStep === "draw_geometry"
-                  ? "Draw target geometry on the captured frame"
-                  : workflowStep === "calibrate"
-                    ? "Set target dimensions and calibration values"
-                    : workflowStep === "scan"
-                      ? "Press Start Scan"
-                      : "Export results (Download buttons)"}
-          </p>
-          <ol className="mt-3 grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
-            <li
-              className={`rounded border px-2 py-1 ${
-                workflowStep === "upload_video"
-                  ? "border-amber-300/80 bg-amber-500/20 text-amber-100"
-                  : hasUploadedVideo
-                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-100"
-                    : "border-gray-700 text-gray-300"
-              }`}
+      <main className="mx-auto flex w-full max-w-3xl flex-col gap-3 px-3 pb-4 sm:px-8">
+        <div className="flex items-center justify-end pt-2">
+          <OnboardingGuide currentStep={currentStep} />
+        </div>
+        {confirmRoiOpen ? (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirm selected area"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+            onClick={retryRoiSelection}
+          >
+            <div
+              className="w-full max-w-sm rounded-xl border border-gray-700 bg-neutral-950 p-4 text-white shadow-2xl shadow-black/60"
+              onClick={(event) => event.stopPropagation()}
             >
-              1. {captureMode === "upload" ? "Upload Video" : "Start Camera"}
-            </li>
-            <li
-              className={`rounded border px-2 py-1 ${
-                workflowStep === "capture_frame"
-                  ? "border-amber-300/80 bg-amber-500/20 text-amber-100"
-                  : hasReferenceFrame
-                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-100"
-                    : "border-gray-700 text-gray-300"
-              }`}
+              <h2 className="text-base font-semibold">Use this selection?</h2>
+              <p className="mt-1 text-xs text-gray-400">This is the target area Trackr will measure for shots.</p>
+              <div className="mt-3 flex min-h-[8rem] items-center justify-center overflow-hidden rounded-md border border-gray-700 bg-black p-2">
+                {confirmRoiPreview ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={confirmRoiPreview} alt="Selected area preview" className="max-h-64 w-auto max-w-full rounded" />
+                ) : (
+                  <span className="text-xs text-gray-500">Preparing preview…</span>
+                )}
+              </div>
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={retryRoiSelection}
+                  className="rounded-md border border-gray-600 px-3 py-1.5 text-sm text-gray-200 transition hover:bg-neutral-800"
+                >
+                  Try again
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmRoiSelection}
+                  className="rounded-md border border-sky-400/40 bg-sky-500/15 px-3 py-1.5 text-sm font-medium text-sky-100 transition hover:bg-sky-500/25"
+                >
+                  Confirm
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {isSettingsModalOpen ? (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Gears and Tweaks settings"
+            className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm sm:items-center"
+            onClick={() => setIsSettingsModalOpen(false)}
+          >
+            <div
+              className="my-auto w-full max-w-2xl rounded-xl border border-gray-700 bg-neutral-950 p-4 shadow-2xl shadow-black/60 sm:p-6"
+              onClick={(event) => event.stopPropagation()}
             >
-              2. Use Current Video Frame
-            </li>
-            <li
-              className={`rounded border px-2 py-1 ${
-                workflowStep === "draw_geometry"
-                  ? "border-amber-300/80 bg-amber-500/20 text-amber-100"
-                  : hasDrawnGeometry
-                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-100"
-                    : "border-gray-700 text-gray-300"
-              }`}
-            >
-              3. Draw Geometry
-            </li>
-            <li
-              className={`rounded border px-2 py-1 ${
-                workflowStep === "calibrate"
-                  ? "border-amber-300/80 bg-amber-500/20 text-amber-100"
-                  : hasScaleCalibration
-                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-100"
-                    : "border-gray-700 text-gray-300"
-              }`}
-            >
-              4. Calibrate
-            </li>
-            <li
-              className={`rounded border px-2 py-1 ${
-                workflowStep === "scan"
-                  ? "border-amber-300/80 bg-amber-500/20 text-amber-100"
-                  : hasResultData
-                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-100"
-                    : "border-gray-700 text-gray-300"
-              }`}
-            >
-              5. Start Scan
-            </li>
-            <li
-              className={`rounded border px-2 py-1 ${
-                workflowStep === "export"
-                  ? "border-amber-300/80 bg-amber-500/20 text-amber-100"
-                  : "border-gray-700 text-gray-300"
-              }`}
-            >
-              6. Download Results
-            </li>
-          </ol>
-        </section>
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <h2 className="text-lg font-semibold text-white sm:text-xl">Gears and Tweaks</h2>
+                  <p className="mt-1 text-xs text-gray-400">
+                    Units, detection, audio correlation, tracking, and clustering settings.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsSettingsModalOpen(false)}
+                  aria-label="Close settings"
+                  className="min-h-9 min-w-9 rounded-md border border-gray-600 px-3 py-1.5 text-base leading-none text-gray-300 transition hover:bg-neutral-800 hover:text-gray-100 sm:min-h-0 sm:min-w-0 sm:px-2 sm:py-1 sm:text-sm"
+                >
+                  &times;
+                </button>
+              </div>
+              {changedTweakCount > 0 ? (
+                <p className="mt-3 rounded-md border border-gray-700 bg-neutral-900 px-3 py-2 text-xs text-gray-200">
+                  Warning: {changedTweakCount} custom tweak settings are active.
+                </p>
+              ) : null}
+              <div className="mt-4 max-h-[70vh] space-y-3 overflow-y-auto pr-1">
+                <UnitConverterSettings
+                  enabled={unitConversionEnabled}
+                  onEnabledChange={setUnitConversionEnabled}
+                  unit={displayLinearUnit}
+                  onUnitChange={setDisplayLinearUnit}
+                />
+                <GearsAndTweaksSection
+                  values={tweakSettings}
+                  onValueChange={updateTweakSetting}
+                  onReset={() => setTweakSettings(DEFAULT_TWEAK_SETTINGS)}
+                  changedCount={changedTweakCount}
+                />
+              </div>
+            </div>
+          </div>
+        ) : null}
 
-        <section className="rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6">
-          <h1 className="text-xl font-semibold text-white sm:text-2xl">Gears and Tweaks</h1>
-          <div className="mt-4 flex items-center justify-between gap-2">
-            <p className="text-xs uppercase tracking-wide text-gray-300">Configure Units and Advanced Settings</p>
+        <section
+          ref={videoSourceSectionRef}
+          className={`flex flex-col rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6 ${
+            currentStep === 0 ? "" : "hidden"
+          }`}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h2 className="text-base font-semibold text-white sm:text-lg">1. Video Source and Reference Video</h2>
+              <p className="mt-1 text-xs text-gray-400">
+                Pick how footage comes in — upload a clip or stream your phone&apos;s camera — then load the reference
+                video you want to measure from.
+              </p>
+            </div>
             <button
               type="button"
-              onClick={() => setIsGearsExpanded((current) => !current)}
-              className="rounded-md border border-gray-600 px-2 py-1 text-xs text-gray-200 transition hover:bg-neutral-800"
+              onClick={() => toggleSectionCollapsed("source")}
+              className="min-h-9 shrink-0 rounded-md border border-gray-600 px-3 py-1.5 text-xs text-gray-200 transition hover:bg-neutral-800 sm:min-h-0 sm:px-2 sm:py-1"
             >
-              {isGearsExpanded ? "Collapse" : "Expand"}
+              {collapsedSections.source ? "Expand" : "Collapse"}
             </button>
           </div>
-          <p className="mt-2 text-xs text-gray-400">
-            Gears and tweaks include units, detection, audio correlation, tracking, and clustering settings.
-          </p>
-          {changedTweakCount > 0 ? (
-            <p className="mt-2 rounded-md border border-gray-700 bg-neutral-900 px-3 py-2 text-xs text-gray-200">
-              Warning: {changedTweakCount} custom tweak settings are active.
+          {collapsedSections.source ? (
+            <p className="mt-3 text-xs text-emerald-200/80">
+              {captureMode === "upload"
+                ? selectedVideoName
+                  ? `Video: ${selectedVideoName}`
+                  : "Upload video selected"
+                : streamCameraActive
+                  ? "Device camera stream active"
+                  : "Device camera stream selected"}
             </p>
           ) : null}
-          {isGearsExpanded ? (
-            <div className="mt-3 space-y-3">
-              <UnitConverterSettings
-                enabled={unitConversionEnabled}
-                onEnabledChange={setUnitConversionEnabled}
-                unit={displayLinearUnit}
-                onUnitChange={setDisplayLinearUnit}
-              />
-              <GearsAndTweaksSection
-                values={tweakSettings}
-                onValueChange={updateTweakSetting}
-                onReset={() => setTweakSettings(DEFAULT_TWEAK_SETTINGS)}
-                changedCount={changedTweakCount}
-              />
-            </div>
-          ) : null}
-        </section>
-
-        <section ref={videoSourceSectionRef} className="rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6">
-          <h2 className="text-base font-semibold text-white sm:text-lg">Video Source and Reference Video</h2>
-          <div className="mt-4 space-y-3">
+          <div className={`mt-4 space-y-3 ${collapsedSections.source ? "hidden" : ""}`}>
             <fieldset className="space-y-2">
                 <legend className="text-xs uppercase tracking-wide text-gray-300">Video Source</legend>
                 <label className="flex items-center gap-2 py-1 text-base sm:text-sm">
@@ -7544,83 +9691,210 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6">
-          <h2 className="text-base font-semibold text-white sm:text-lg">Capture Image From Video</h2>
-          <div className="mt-4">
+        <section
+          ref={captureSectionRef}
+          className={`flex flex-col rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6 ${
+            currentStep === 1 ? "" : "hidden"
+          }`}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h2 className="text-base font-semibold text-white sm:text-lg">2. Capture Image From Video</h2>
+              <p className="mt-1 text-xs text-gray-400">
+                The first video frame is used as your reference image automatically — use{" "}
+                <span className="text-gray-200">Choose Different</span> to pick another. Then drag a box around the
+                target.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => toggleSectionCollapsed("capture")}
+              className="min-h-9 shrink-0 rounded-md border border-gray-600 px-3 py-1.5 text-xs text-gray-200 transition hover:bg-neutral-800 sm:min-h-0 sm:px-2 sm:py-1"
+            >
+              {collapsedSections.capture ? "Expand" : "Collapse"}
+            </button>
+          </div>
+          {collapsedSections.capture ? (
+            <p className="mt-3 text-xs text-emerald-200/80">
+              {hasDrawnGeometry ? "Reference frame captured and target box set" : "Reference frame captured"}
+            </p>
+          ) : null}
+          <div className={`mt-4 ${collapsedSections.capture ? "hidden" : ""}`}>
             {(captureMode === "upload" ? !!selectedVideoPreviewUrl : streamCameraActive) ? (
                 <div className="rounded-md border border-gray-700 bg-black p-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-xs uppercase tracking-wide text-gray-300">Capture Reference Image From Video</p>
-                    <button
-                      ref={captureFrameButtonRef}
-                      type="button"
-                      onClick={captureReferenceFrameFromVideo}
-                      className={`rounded-md border border-sky-400/35 px-3 py-1.5 text-xs text-sky-100 transition hover:bg-sky-500/10 ${
-                        workflowStep === "capture_frame" ? highlightActionClass : ""
-                      }`}
-                    >
-                      Use Current Video Frame
-                    </button>
-                  </div>
-                  {selectedImageName ? <span className="mt-2 block text-xs text-gray-400">{selectedImageName}</span> : null}
-                  {selectedImagePreviewUrl ? (
-                    <div
-                      ref={roiContainerRef}
-                      className="relative mt-2 cursor-crosshair touch-none"
-                      onPointerDown={(event) => {
-                        event.preventDefault();
-                        startRoiSelection(event.clientX, event.clientY);
-                      }}
-                      onPointerMove={(event) => {
-                        event.preventDefault();
-                        updateRoiSelection(event.clientX, event.clientY);
-                      }}
-                      onPointerUp={endRoiSelection}
-                      onPointerLeave={endRoiSelection}
-                    >
-                      <img
-                        ref={imagePreviewRef}
-                        src={selectedImagePreviewUrl}
-                        alt="Reference preview"
-                        className="w-full rounded-md border border-gray-700"
-                      />
-                      {roiRect ? (
-                        <div
-                          className="pointer-events-none absolute border-2"
-                          style={{
-                            left: `${roiRect.x * 100}%`,
-                            top: `${roiRect.y * 100}%`,
-                            width: `${roiRect.width * 100}%`,
-                            height: `${roiRect.height * 100}%`,
-                            borderColor: "#22c55e",
-                            backgroundColor: "rgba(34, 197, 94, 0.22)",
-                          }}
-                        />
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs uppercase tracking-wide text-gray-300">Reference Image From Video</p>
+                    <div className="flex items-center gap-2">
+                      {selectedImageName ? <span className="text-[11px] text-gray-400">{selectedImageName}</span> : null}
+                      {selectedImagePreviewUrl ? (
+                        <button
+                          type="button"
+                          onClick={() => setChoosingDifferentFrame((value) => !value)}
+                          aria-expanded={choosingDifferentFrame}
+                          className="min-h-8 rounded-md border border-gray-600 px-3 text-xs text-gray-200 transition hover:bg-neutral-800 sm:min-h-0 sm:py-1"
+                        >
+                          {choosingDifferentFrame ? "Cancel" : "Choose Different"}
+                        </button>
                       ) : null}
                     </div>
+                  </div>
+
+                  {selectedImagePreviewUrl ? (
+                    <>
+                      {/* Reference image is shown by default (first frame). Drag a box, or Auto-pick. */}
+                      <div
+                        ref={roiContainerRef}
+                        className="relative mt-2 cursor-crosshair touch-none"
+                        onPointerDown={(event) => {
+                          event.preventDefault();
+                          startRoiSelection(event.clientX, event.clientY);
+                        }}
+                        onPointerMove={(event) => {
+                          event.preventDefault();
+                          updateRoiSelection(event.clientX, event.clientY);
+                        }}
+                        onPointerUp={endRoiSelection}
+                        onPointerLeave={endRoiSelection}
+                      >
+                        <img
+                          ref={imagePreviewRef}
+                          src={selectedImagePreviewUrl}
+                          alt="Reference preview"
+                          className="w-full rounded-md border border-gray-700"
+                        />
+                        {(() => {
+                          const box = draftRoiRect ?? roiRect;
+                          if (!box) return null;
+                          const isDraft = draftRoiRect !== null;
+                          return (
+                            <div
+                              className="pointer-events-none absolute border-2"
+                              style={{
+                                left: `${box.x * 100}%`,
+                                top: `${box.y * 100}%`,
+                                width: `${box.width * 100}%`,
+                                height: `${box.height * 100}%`,
+                                borderColor: isDraft ? "#38bdf8" : "#22c55e",
+                                backgroundColor: isDraft ? "rgba(56, 189, 248, 0.16)" : "rgba(34, 197, 94, 0.22)",
+                                borderStyle: isDraft ? "dashed" : "solid",
+                              }}
+                            />
+                          );
+                        })()}
+                      </div>
+
+                      <p className="mt-2 text-[11px] text-gray-400">
+                        {hasDrawnGeometry
+                          ? "Target box set. Drag a new rectangle to re-box, or continue."
+                          : "Drag a rectangle around the target on the image above."}
+                      </p>
+
+                      {/* Target-picking options appear now that the reference image is shown. */}
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        {SHOW_AUTO_PICK && captureMode === "upload" ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void autoPickReferenceFrameFromVideo();
+                            }}
+                            disabled={isAutoPicking || !opencvReady}
+                            className="min-h-9 rounded-md border border-emerald-400/40 px-3 py-1.5 text-xs text-emerald-100 transition hover:bg-emerald-500/10 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0"
+                            title={
+                              targetTemplates.length > 0
+                                ? "Scrub the video and match the target outlines you've drawn before; falls back to shape detection. Picks the best frame and boxes the target automatically."
+                                : "Scrub the video to find the most common object and use that frame as the reference, with a target box drawn automatically. Draw ROIs to teach it your targets."
+                            }
+                          >
+                            {isAutoPicking
+                              ? "Auto-picking…"
+                              : targetTemplates.length > 0
+                                ? "Auto-pick target"
+                                : "Auto-pick (find common object)"}
+                          </button>
+                        ) : null}
+                        {hasDrawnGeometry ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={clearRoiSelection}
+                              className="min-h-9 rounded-md border border-gray-600 px-3 py-1.5 text-xs text-gray-300 transition hover:bg-neutral-800 sm:min-h-0"
+                            >
+                              Clear Selection
+                            </button>
+                            <button
+                              type="button"
+                              onClick={goToNextAfterGeometrySelection}
+                              className={`min-h-9 rounded-md border px-3 py-1.5 text-xs transition sm:min-h-0 ${highlightActionClass}`}
+                            >
+                              Next
+                            </button>
+                          </>
+                        ) : null}
+                      </div>
+
+                      {/* "Choose Different" reveals frame scrubbing/recapture. */}
+                      {choosingDifferentFrame ? (
+                        <div className="mt-2 rounded-md border border-gray-700 bg-neutral-900/50 p-2">
+                          <p className="text-[11px] text-gray-400">
+                            {captureMode === "upload"
+                              ? "Scrub the reference video in step 1 to the frame you want, then capture it."
+                              : "Position the camera, then capture the current frame."}
+                          </p>
+                          <button
+                            ref={captureFrameButtonRef}
+                            type="button"
+                            onClick={() => captureReferenceFrameFromVideo()}
+                            disabled={isAutoPicking}
+                            className="mt-2 min-h-9 rounded-md border border-sky-400/35 px-3 py-1.5 text-xs text-sky-100 transition hover:bg-sky-500/10 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0"
+                          >
+                            Use Current Video Frame
+                          </button>
+                        </div>
+                      ) : null}
+
+                      {SHOW_AUTO_PICK && captureMode === "upload" ? (
+                        <p className="mt-2 text-[11px] text-gray-400">
+                          {targetTemplates.length > 0 ? (
+                            <>
+                              Auto-pick is learning from{" "}
+                              <span className="text-emerald-200">
+                                {targetTemplates.length} target{targetTemplates.length === 1 ? "" : "s"}
+                              </span>{" "}
+                              you&apos;ve drawn.{" "}
+                              <button
+                                type="button"
+                                onClick={clearTargetTemplates}
+                                className="text-rose-300 underline-offset-2 hover:underline"
+                              >
+                                Clear
+                              </button>
+                            </>
+                          ) : (
+                            "Each box you draw is saved and matched on future videos to improve Auto-pick."
+                          )}
+                        </p>
+                      ) : null}
+                    </>
                   ) : (
-                    <p className="mt-2 text-xs text-gray-400">
-                      Scrub the video to the frame you want, then click Use Current Video Frame.
-                    </p>
-                  )}
-                  {hasDrawnGeometry ? (
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <div className="mt-2">
+                      <p className="text-xs text-gray-400">
+                        {captureMode === "upload"
+                          ? "Preparing the first video frame as your reference image…"
+                          : "Capture a frame from the camera to use as your reference image."}
+                      </p>
                       <button
+                        ref={captureFrameButtonRef}
                         type="button"
-                        onClick={clearRoiSelection}
-                        className="rounded-md border border-gray-600 px-2 py-1 text-xs text-gray-300 transition hover:bg-neutral-800"
+                        onClick={() => captureReferenceFrameFromVideo()}
+                        disabled={isAutoPicking}
+                        className={`mt-2 min-h-9 rounded-md border border-sky-400/35 px-3 py-1.5 text-xs text-sky-100 transition hover:bg-sky-500/10 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 ${
+                          workflowStep === "capture_frame" ? highlightActionClass : ""
+                        }`}
                       >
-                        Clear Selection
-                      </button>
-                      <button
-                        type="button"
-                        onClick={goToNextAfterGeometrySelection}
-                        className="rounded-md border border-emerald-400/45 px-3 py-1 text-xs text-emerald-100 transition hover:bg-emerald-500/10"
-                      >
-                        Next
+                        Use Current Video Frame
                       </button>
                     </div>
-                  ) : null}
+                  )}
                 </div>
             ) : (
               <p className="text-sm text-gray-300">
@@ -7634,17 +9908,140 @@ export default function Home() {
 
         <section
           ref={calibrationSectionRef}
-          className={`rounded-xl border bg-neutral-950 p-4 sm:p-6 ${
+          className={`flex flex-col rounded-xl border bg-neutral-950 p-3 sm:p-5 ${
             workflowStep === "calibrate" ? "border-amber-300/70 ring-2 ring-amber-300/35" : "border-gray-700"
-          }`}
+          } ${currentStep === 2 ? "" : "hidden"}`}
         >
-          <div className="flex items-center justify-between gap-2">
-            <h2 className="text-base font-semibold text-white sm:text-lg">Target Dimensions and Calibration</h2>
-            {focalScalePxIn > 0 ? (
-              <span className="text-[11px] text-gray-400">Calibrated scale: {focalScalePxIn.toFixed(1)}</span>
-            ) : null}
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h2 className="text-base font-semibold text-white sm:text-lg">3. Target Dimensions and Calibration</h2>
+              <p className="mt-1 text-xs text-gray-400">
+                Measure a line on the target image, or type the target&apos;s real size — calibration runs automatically.
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              {focalScalePxIn > 0 ? (
+                <span className="text-[11px] text-gray-400">Scale: {focalScalePxIn.toFixed(1)}</span>
+              ) : null}
+              <button
+                type="button"
+                onClick={() => toggleSectionCollapsed("calibrate")}
+                className="rounded-md border border-gray-600 px-2 py-1 text-xs text-gray-200 transition hover:bg-neutral-800"
+              >
+                {collapsedSections.calibrate ? "Expand" : "Collapse"}
+              </button>
+            </div>
           </div>
-          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {collapsedSections.calibrate ? (
+            <p className="mt-3 text-xs text-emerald-200/80">
+              {hasScaleCalibration
+                ? `Calibrated${focalScalePxIn > 0 ? ` · scale ${focalScalePxIn.toFixed(1)}` : ""}`
+                : "Target dimensions pending"}
+            </p>
+          ) : null}
+          <div className={collapsedSections.calibrate ? "hidden" : ""}>
+          {hasDrawnGeometry ? (
+            <div className="mt-3 rounded-md border border-gray-700 bg-black/35 p-3">
+              <p className="text-xs uppercase tracking-wide text-gray-300">ROI Line Calibration</p>
+              <p className="mt-1 text-[11px] text-gray-400">
+                Draw a line on the magnified ROI and enter its real-world length — calibration applies automatically.
+              </p>
+              {roiMagnifiedDataUrl && roiSelectionPixelSize ? (
+                <>
+                  <div className="mt-2 flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-gray-500">Drag to measure · scroll to pan when zoomed</span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        aria-label="Zoom out"
+                        onClick={() => setRoiZoom((z) => Math.max(1, Math.round((z - 0.5) * 10) / 10))}
+                        disabled={roiZoom <= 1}
+                        className="flex h-7 w-7 items-center justify-center rounded-md border border-gray-600 text-sm text-gray-200 transition hover:bg-neutral-800 disabled:opacity-40"
+                      >
+                        −
+                      </button>
+                      <span className="w-10 text-center text-[11px] tabular-nums text-gray-300">{roiZoom.toFixed(1)}×</span>
+                      <button
+                        type="button"
+                        aria-label="Zoom in"
+                        onClick={() => setRoiZoom((z) => Math.min(6, Math.round((z + 0.5) * 10) / 10))}
+                        disabled={roiZoom >= 6}
+                        className="flex h-7 w-7 items-center justify-center rounded-md border border-gray-600 text-sm text-gray-200 transition hover:bg-neutral-800 disabled:opacity-40"
+                      >
+                        +
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRoiZoom(1)}
+                        disabled={roiZoom === 1}
+                        className="ml-1 rounded-md border border-gray-600 px-2 py-1 text-[11px] text-gray-300 transition hover:bg-neutral-800 disabled:opacity-40"
+                      >
+                        Fit
+                      </button>
+                    </div>
+                  </div>
+                  <div className="mt-1 max-h-[80svh] overflow-auto rounded-md border border-gray-700 bg-black">
+                    <canvas
+                      ref={roiMeasurementCanvasRef}
+                      className="block h-auto max-w-none cursor-crosshair touch-none"
+                      style={{ width: `${roiZoom * 100}%`, imageRendering: "pixelated" }}
+                      onPointerDown={(event) => {
+                        event.preventDefault();
+                        startRoiMeasurementLineSelection(event.clientX, event.clientY);
+                      }}
+                      onPointerMove={(event) => {
+                        event.preventDefault();
+                        updateRoiMeasurementLineSelection(event.clientX, event.clientY);
+                      }}
+                      onPointerUp={(event) => {
+                        event.preventDefault();
+                        endRoiMeasurementLineSelection();
+                      }}
+                      onPointerLeave={endRoiMeasurementLineSelection}
+                    />
+                  </div>
+                  <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+                    <label className="flex flex-col gap-1">
+                      <span className="text-[11px] text-gray-400">Measured Line Length ({activeLinearUnitLabel})</span>
+                      <input
+                        type="number"
+                        min="0"
+                        step={activeLinearInputStep}
+                        value={toDisplayLinearValue(roiMeasurementLengthInches)}
+                        onChange={(event) => setRoiMeasurementLengthInches(fromDisplayLinearValue(event.target.value))}
+                        className="rounded-md border border-gray-700 bg-neutral-950 px-2 py-1.5 text-sm outline-none ring-gray-400/40 focus:ring-1"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setRoiMeasurementLine(null)}
+                      className="min-h-9 self-end rounded-md border border-gray-600 px-3 py-1.5 text-xs text-gray-300 transition hover:bg-neutral-800 sm:min-h-0"
+                    >
+                      Clear Line
+                    </button>
+                  </div>
+                  {roiMeasurementMetrics?.pixelsPerInch ? (
+                    <p className="mt-2 text-[11px] text-emerald-300/90">
+                      Auto-applied: {roiMeasurementMetrics.pixelLength.toFixed(1)} px ={" "}
+                      {formatLinearFromInches(roiMeasurementMetrics.knownLengthInches, 3)} ·{" "}
+                      {roiMeasurementMetrics.pixelsPerInch.toFixed(2)} ppi
+                    </p>
+                  ) : null}
+                  <p className="mt-2 text-[11px] text-gray-400">
+                    ROI size: {roiSelectionPixelSize.widthPx}px x {roiSelectionPixelSize.heightPx}px
+                    {roiMeasurementMetrics
+                      ? ` | line=${roiMeasurementMetrics.pixelLength.toFixed(1)}px | ppi=${(
+                          roiMeasurementMetrics.pixelsPerInch ?? 0
+                        ).toFixed(2)}`
+                      : " | draw line to compute ppi"}
+                  </p>
+                </>
+              ) : (
+                <p className="mt-2 text-[11px] text-gray-500">Draw target geometry first to enable magnified line calibration.</p>
+              )}
+            </div>
+          ) : null}
+          <div className="mt-3 grid grid-cols-1 gap-2 xs:grid-cols-2 lg:grid-cols-4">
             <label className="flex flex-col gap-1">
               <span className="text-[11px] text-gray-400">Target Width ({activeLinearUnitLabel})</span>
               <input
@@ -7689,6 +10086,19 @@ export default function Home() {
                 className="rounded-md border border-gray-700 bg-neutral-950 px-2 py-1.5 text-sm outline-none ring-gray-400/40 focus:ring-1"
               />
             </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[11px] text-gray-400">Expected hole / caliber ({activeLinearUnitLabel}, 0 = off)</span>
+              <input
+                type="number"
+                min="0"
+                step={activeLinearInputStep}
+                value={toDisplayLinearValue(tweakSettings.expectedHoleDiameterInches)}
+                onChange={(event) =>
+                  updateTweakSetting("expectedHoleDiameterInches", fromDisplayLinearValue(event.target.value))
+                }
+                className="rounded-md border border-gray-700 bg-neutral-950 px-2 py-1.5 text-sm outline-none ring-gray-400/40 focus:ring-1"
+              />
+            </label>
             {/* <label className="flex flex-col gap-1">
               <span className="text-[11px] text-gray-400">Manual Distance Override (in)</span>
               <input
@@ -7703,82 +10113,16 @@ export default function Home() {
               />
             </label> */}
           </div>
-          {hasDrawnGeometry ? (
-            <div className="mt-4 rounded-md border border-gray-700 bg-black/35 p-3">
-              <p className="text-xs uppercase tracking-wide text-gray-300">ROI Line Calibration</p>
-              <p className="mt-1 text-[11px] text-gray-400">
-                Draw a line on the magnified ROI, enter its real-world length, then apply line calibration.
-              </p>
-              {roiMagnifiedDataUrl && roiSelectionPixelSize ? (
-                <>
-                  <canvas
-                    ref={roiMeasurementCanvasRef}
-                    className="mt-2 w-full cursor-crosshair rounded-md border border-gray-700 bg-black touch-none"
-                    style={{ imageRendering: "pixelated" }}
-                    onPointerDown={(event) => {
-                      event.preventDefault();
-                      startRoiMeasurementLineSelection(event.clientX, event.clientY);
-                    }}
-                    onPointerMove={(event) => {
-                      event.preventDefault();
-                      updateRoiMeasurementLineSelection(event.clientX, event.clientY);
-                    }}
-                    onPointerUp={(event) => {
-                      event.preventDefault();
-                      endRoiMeasurementLineSelection();
-                    }}
-                    onPointerLeave={endRoiMeasurementLineSelection}
-                  />
-                  <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
-                    <label className="flex flex-col gap-1">
-                      <span className="text-[11px] text-gray-400">Measured Line Length ({activeLinearUnitLabel})</span>
-                      <input
-                        type="number"
-                        min="0"
-                        step={activeLinearInputStep}
-                        value={toDisplayLinearValue(roiMeasurementLengthInches)}
-                        onChange={(event) => setRoiMeasurementLengthInches(fromDisplayLinearValue(event.target.value))}
-                        className="rounded-md border border-gray-700 bg-neutral-950 px-2 py-1.5 text-sm outline-none ring-gray-400/40 focus:ring-1"
-                      />
-                    </label>
-                    <button
-                      type="button"
-                      onClick={applyCalibrationFromRoiMeasurementLine}
-                      className="rounded-md border border-emerald-400/45 px-3 py-1.5 text-xs text-emerald-100 transition hover:bg-emerald-500/10"
-                    >
-                      Apply Line Calibration
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setRoiMeasurementLine(null)}
-                      className="rounded-md border border-gray-600 px-3 py-1.5 text-xs text-gray-300 transition hover:bg-neutral-800"
-                    >
-                      Clear Line
-                    </button>
-                  </div>
-                  <p className="mt-2 text-[11px] text-gray-400">
-                    ROI size: {roiSelectionPixelSize.widthPx}px x {roiSelectionPixelSize.heightPx}px
-                    {roiMeasurementMetrics
-                      ? ` | line=${roiMeasurementMetrics.pixelLength.toFixed(1)}px | ppi=${(
-                          roiMeasurementMetrics.pixelsPerInch ?? 0
-                        ).toFixed(2)}`
-                      : " | draw line to compute ppi"}
-                  </p>
-                </>
-              ) : (
-                <p className="mt-2 text-[11px] text-gray-500">Draw target geometry first to enable magnified line calibration.</p>
-              )}
-            </div>
-          ) : null}
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            <p className="text-[11px] text-gray-400">
-              Draw the target in the capture section; calibration auto-runs when geometry and target dimensions are valid.
-            </p>
           </div>
         </section>
 
-        <section className="rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6">
-          <h2 className="text-base font-semibold text-white sm:text-lg">Scan</h2>
+        <section
+          ref={scanSectionRef}
+          className={`flex flex-col rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6 ${
+            currentStep === 3 ? "" : "hidden"
+          }`}
+        >
+          <h2 className="text-base font-semibold text-white sm:text-lg">4. Scan</h2>
           <p className="mt-2 text-sm text-gray-300">
             Uses audio spike windows plus ROI-to-reference differencing and tile-based patch-change scoring against the
             initial reference image, with yellow/green top-hat connected-components as the hit determinant for shot logging.
@@ -7809,14 +10153,546 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6">
-          <h2 className="text-base font-semibold text-white sm:text-lg">Analysis</h2>
-          <div className="mt-4 space-y-3">
+        <section
+          ref={analysisSectionRef}
+          className={`flex flex-col rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6 ${
+            currentStep === 4 ? "" : "hidden"
+          }`}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h2 className="text-base font-semibold text-white sm:text-lg">5. Analysis</h2>
+              <p className="mt-1 text-xs text-gray-400">
+                Watch the detection views as the scan runs, then open Resulting Data to review and export hits. Use
+                Settings to fine-tune detection if results look off.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsSettingsModalOpen(true)}
+              className="flex min-h-9 shrink-0 items-center gap-1.5 rounded-md border border-gray-600 px-3 py-1.5 text-xs text-gray-200 transition hover:bg-neutral-800 sm:min-h-0 sm:px-2.5 sm:py-1"
+              aria-haspopup="dialog"
+              aria-expanded={isSettingsModalOpen}
+            >
+              <span aria-hidden="true">⚙</span>
+              Settings
+              {changedTweakCount > 0 ? (
+                <span className="rounded-full bg-amber-500/20 px-1.5 text-[10px] font-semibold text-amber-200">
+                  {changedTweakCount}
+                </span>
+              ) : null}
+            </button>
+          </div>
+
+          <div className="mt-4 rounded-md border border-gray-700 bg-black p-3 sm:p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-sm font-semibold uppercase tracking-wide text-gray-200">
+                Shot Group Map — target region
+              </p>
+              <div className="inline-flex overflow-hidden rounded-md border border-gray-600 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setShotGroupMode("dbscan")}
+                  className={`min-h-9 px-3 py-1.5 transition sm:min-h-0 sm:px-2 sm:py-1 ${
+                    shotGroupMode === "dbscan" ? "bg-sky-500/20 text-sky-100" : "text-gray-300 hover:bg-neutral-800"
+                  }`}
+                  aria-pressed={shotGroupMode === "dbscan"}
+                >
+                  Space+Time (DBSCAN)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShotGroupMode("quadtree")}
+                  className={`min-h-9 border-l border-gray-600 px-3 py-1.5 transition sm:min-h-0 sm:px-2 sm:py-1 ${
+                    shotGroupMode === "quadtree" ? "bg-sky-500/20 text-sky-100" : "text-gray-300 hover:bg-neutral-800"
+                  }`}
+                  aria-pressed={shotGroupMode === "quadtree"}
+                >
+                  Spatial (Quadtree)
+                </button>
+              </div>
+              <div className="inline-flex overflow-hidden rounded-md border border-gray-600 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setShotMapLiveStream(false)}
+                  className={`min-h-9 px-3 py-1.5 transition sm:min-h-0 sm:px-2 sm:py-1 ${
+                    !shotMapLiveStream ? "bg-sky-500/20 text-sky-100" : "text-gray-300 hover:bg-neutral-800"
+                  }`}
+                  aria-pressed={!shotMapLiveStream}
+                  title="Static reference frame, updated as shots are detected"
+                >
+                  Reference
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShotMapLiveStream(true)}
+                  className={`min-h-9 border-l border-gray-600 px-3 py-1.5 transition sm:min-h-0 sm:px-2 sm:py-1 ${
+                    shotMapLiveStream ? "bg-sky-500/20 text-sky-100" : "text-gray-300 hover:bg-neutral-800"
+                  }`}
+                  aria-pressed={shotMapLiveStream}
+                  title="Stream the cropped ROI of the live video"
+                >
+                  Live video
+                </button>
+              </div>
+            </div>
+            <p className="mt-2 text-sm text-gray-300">
+              {effectiveGroupIds.length} group{effectiveGroupIds.length === 1 ? "" : "s"}
+              {Object.keys(manualGroupOverrides).length > 0 ? " (manually edited)" : ""} ·{" "}
+              {shotGroupMode === "quadtree"
+                ? quadtreeBaseRadiusPx > 0
+                  ? `quadtree at ${(quadtreeGroupInches * quadtreeRadiusScale).toFixed(1)} in (${quadtreeGrouping.radius.toFixed(
+                      0,
+                    )} px)`
+                  : `quadtree at ${quadtreeGrouping.radius.toFixed(0)} px (calibrate for inch-based groups)`
+                : "DBSCAN over normalized X, Y, time"}
+            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11px] text-gray-300">
+              <span>
+                Avg confidence:{" "}
+                <span
+                  className={
+                    confidenceSummary.avgConfidence >= 60
+                      ? "font-semibold text-emerald-300"
+                      : confidenceSummary.avgConfidence >= 35
+                        ? "font-semibold text-amber-300"
+                        : "font-semibold text-rose-300"
+                  }
+                >
+                  {confidenceSummary.avgConfidence.toFixed(0)}%
+                </span>
+                <span className="text-gray-500"> ({confidenceSummary.keptCount} shots)</span>
+              </span>
+              <label className="flex items-center gap-1.5">
+                <span className="flex items-center gap-1 text-gray-400">
+                  Noise filter ≥
+                  <InfoPopover title="Noise filter" tipId="tip-noise-filter" placement="top">
+                    Hides shots below this confidence (they drop to dimmed strays, not deleted). Raise it to clear out
+                    false positives; lower it if real hits disappear.
+                  </InfoPopover>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={90}
+                  step={5}
+                  value={minShotConfidence}
+                  onChange={(event) => setMinShotConfidence(Number(event.target.value))}
+                  className="w-28"
+                  aria-label="Minimum shot confidence"
+                />
+                <span className="tabular-nums">{minShotConfidence}%</span>
+              </label>
+              {confidenceSummary.filteredCount > 0 ? (
+                <span className="text-rose-300/90">
+                  {confidenceSummary.filteredCount} filtered as noise (shown as strays)
+                </span>
+              ) : null}
+            </div>
+            <div className="relative mt-2">
+              <canvas
+                ref={shotGroupMapCanvasRef}
+                onPointerDown={onMapPointerDown}
+                onPointerMove={onMapPointerMove}
+                onPointerUp={manualEditMode ? handleMapPointerUp : undefined}
+                onPointerLeave={onMapPointerLeave}
+                className={`w-full rounded-md border border-gray-700 bg-black ${
+                  manualEditMode
+                    ? "cursor-crosshair touch-none"
+                    : hoverShotInfo
+                      ? "cursor-pointer"
+                      : ""
+                }`}
+              />
+              {(() => {
+                const info = pinnedShotInfo ?? hoverShotInfo;
+                if (!info) return null;
+                const shot = info.shot;
+                const pinned = pinnedShotInfo !== null;
+                const groupId = effectiveGroupByShotId[shot.id];
+                const conf = shotConfidencePct(shot);
+                const sizeLabel =
+                  shot.estimatedDiameterInches !== null
+                    ? `⌀ ${formatLinearFromInches(shot.estimatedDiameterInches, 2)}`
+                    : `⌀ ${shot.estimatedDiameterPx.toFixed(0)} px`;
+                return (
+                  <div
+                    className={`absolute z-30 w-44 rounded-lg border border-gray-600 bg-neutral-900/95 p-2 text-[11px] leading-snug text-gray-200 shadow-xl shadow-black/50 ${
+                      pinned ? "" : "pointer-events-none"
+                    }`}
+                    style={{
+                      left: info.left,
+                      top: info.top,
+                      transform: "translate(-50%, calc(-100% - 10px))",
+                    }}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-white">Shot S{shot.shotNumber}</span>
+                      {pinned ? (
+                        <button
+                          type="button"
+                          onClick={() => setPinnedShotInfo(null)}
+                          aria-label="Close"
+                          className="-mr-0.5 -mt-0.5 flex h-4 w-4 items-center justify-center rounded text-gray-400 transition hover:bg-neutral-700 hover:text-white"
+                        >
+                          ×
+                        </button>
+                      ) : null}
+                    </div>
+                    <p className="mt-0.5">
+                      <span className={groupId ? "text-gray-200" : "text-gray-400"}>
+                        {groupId ? `Group ${groupId}` : "Stray"}
+                      </span>{" "}
+                      · {conf.toFixed(0)}% conf
+                    </p>
+                    <p className="text-gray-300">
+                      t={shot.videoTimeSec.toFixed(2)}s · {sizeLabel}
+                    </p>
+                    <p className="text-gray-400">
+                      ({shot.centerX.toFixed(0)}, {shot.centerY.toFixed(0)}) px
+                      {shot.audioDecibelDbfs !== null ? ` · ${shot.audioDecibelDbfs.toFixed(0)} dBFS` : ""}
+                    </p>
+                    {!pinned ? (
+                      <p className="mt-0.5 text-[10px] text-gray-500">Click to keep open</p>
+                    ) : null}
+                  </div>
+                );
+              })()}
+            </div>
+            <video
+              ref={mapReplayVideoRef}
+              muted
+              playsInline
+              preload="metadata"
+              className="hidden"
+              onLoadedMetadata={(event) => setMapReplayDurationSec(event.currentTarget.duration || 0)}
+              onTimeUpdate={(event) => setMapReplayTimeSec(event.currentTarget.currentTime || 0)}
+              onPlay={() => setMapReplayPlaying(true)}
+              onPause={() => setMapReplayPlaying(false)}
+              onEnded={() => setMapReplayPlaying(false)}
+            />
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-gray-300">
+              <button
+                type="button"
+                onClick={toggleMapReplay}
+                className="min-h-8 rounded-md border border-sky-400/40 bg-sky-500/15 px-3 font-medium text-sky-100 transition hover:bg-sky-500/25 sm:min-h-0 sm:py-1"
+              >
+                {mapReplayPlaying ? "❚❚ Pause" : "▶ Replay"}
+              </button>
+              <input
+                type="range"
+                min={0}
+                max={Math.max(0.1, mapReplayDurationSec)}
+                step={0.05}
+                value={Math.min(mapReplayTimeSec, mapReplayDurationSec || 0)}
+                onChange={(event) => scrubMapReplay(Number(event.target.value))}
+                disabled={mapReplayDurationSec <= 0}
+                aria-label="Replay position"
+                className="min-w-[7rem] flex-1 disabled:opacity-40"
+              />
+              <span className="tabular-nums text-gray-400">
+                {Math.floor(Math.max(0, mapReplayTimeSec) / 60)}:
+                {String(Math.floor(Math.max(0, mapReplayTimeSec) % 60)).padStart(2, "0")} /{" "}
+                {Math.floor(Math.max(0, mapReplayDurationSec) / 60)}:
+                {String(Math.floor(Math.max(0, mapReplayDurationSec) % 60)).padStart(2, "0")}
+              </span>
+              {mapReplayActive ? (
+                <button
+                  type="button"
+                  onClick={exitMapReplay}
+                  className="min-h-8 rounded-md border border-gray-600 px-2.5 text-gray-200 transition hover:bg-neutral-800 sm:min-h-0 sm:py-1"
+                >
+                  Exit replay
+                </button>
+              ) : null}
+            </div>
+            <p className="mt-1.5 text-xs text-gray-400">
+              Circles are sized to each hit; press Replay to watch shots land over time. Colored = grouped, dimmed
+              hollow = strays.
+            </p>
+
+            {/* Live per-group statistics, recomputed from the effective (manually editable) grouping. */}
+            {effectiveGroupStats.groups.length > 0 ? (
+              <div className="mt-4">
+                <div className="flex flex-wrap items-baseline justify-between gap-2">
+                  <p className="text-sm font-semibold uppercase tracking-wide text-gray-200">Group Statistics</p>
+                  <p className="text-xs text-gray-400">
+                    {effectiveGroupStats.groups.length} group{effectiveGroupStats.groups.length === 1 ? "" : "s"}
+                    {effectiveGroupStats.strayCount > 0 ? ` · ${effectiveGroupStats.strayCount} stray` : ""}
+                    {pixelsPerInch > 0 ? "" : " · calibrate for inch units"}
+                  </p>
+                </div>
+                <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  {effectiveGroupStats.groups.map((group) => {
+                    const color = effectiveGroupColorById[group.groupId] ?? clusterColorForId(group.groupId);
+                    const spread =
+                      pixelsPerInch > 0
+                        ? formatLinearFromInches(group.extremeSpreadPx / pixelsPerInch, 2)
+                        : `${group.extremeSpreadPx.toFixed(0)} px`;
+                    const meanRadius =
+                      pixelsPerInch > 0
+                        ? formatLinearFromInches(group.meanRadialPx / pixelsPerInch, 2)
+                        : `${group.meanRadialPx.toFixed(0)} px`;
+                    return (
+                      <div
+                        key={group.groupId}
+                        className="rounded-md border px-3 py-2 text-sm text-gray-100"
+                        style={{ borderColor: hexToRgba(color, 0.5), backgroundColor: hexToRgba(color, 0.08) }}
+                      >
+                        <p className="flex items-center gap-2 text-base">
+                          <span className="inline-block h-3.5 w-3.5 rounded-full" style={{ backgroundColor: color }} />
+                          <span className="font-semibold">Group {group.groupId}</span>
+                          <span className="text-sm text-gray-400">
+                            · {group.count} shot{group.count === 1 ? "" : "s"}
+                          </span>
+                          <span
+                            className={`ml-auto rounded-full px-2 py-0.5 text-xs font-semibold ${
+                              group.meanConfidence >= 60
+                                ? "bg-emerald-500/20 text-emerald-200"
+                                : group.meanConfidence >= 35
+                                  ? "bg-amber-500/20 text-amber-200"
+                                  : "bg-rose-500/20 text-rose-200"
+                            }`}
+                          >
+                            {group.meanConfidence.toFixed(0)}% conf
+                          </span>
+                        </p>
+                        <p className="mt-1 text-gray-200">
+                          spread <span className="font-semibold text-white">{spread}</span> · mean radius {meanRadius}
+                          {group.meanDiameterInches !== null
+                            ? ` · ⌀ ${formatLinearFromInches(group.meanDiameterInches, 2)}`
+                            : ""}
+                        </p>
+                        <p className="mt-0.5 text-xs text-gray-400">
+                          center ({group.centroidX.toFixed(0)}, {group.centroidY.toFixed(0)}) px
+                          {group.timeSpanSec > 0 ? ` · span ${group.timeSpanSec.toFixed(2)}s` : ""}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+
+            {/* Group Timeline: X/Y plot with a time slider to watch groups form over time. */}
+            {groupTimeline.hasData ? (
+              <div className="mt-4">
+                <div className="flex flex-wrap items-baseline justify-between gap-2">
+                  <p className="text-sm font-semibold uppercase tracking-wide text-gray-200">Group Timeline (X / Y over time)</p>
+                  <label className="flex items-center gap-1.5 text-xs text-gray-400">
+                    <input
+                      type="checkbox"
+                      checked={showCentroidTrails}
+                      onChange={(event) => setShowCentroidTrails(event.target.checked)}
+                    />
+                    Centroid trails
+                  </label>
+                </div>
+                <canvas
+                  ref={groupTimelineCanvasRef}
+                  width={760}
+                  height={320}
+                  className="mt-2 w-full rounded-md border border-gray-700 bg-black"
+                />
+                <input
+                  type="range"
+                  min={groupTimeline.tMin}
+                  max={groupTimeline.tMax}
+                  step={Math.max(0.01, (groupTimeline.tMax - groupTimeline.tMin) / 200)}
+                  value={timelineCursor}
+                  onChange={(event) => setTimelineCursorSec(Number(event.target.value))}
+                  className="mt-3 w-full"
+                  aria-label="Group timeline time"
+                />
+                <div className="mt-1 flex flex-wrap items-center justify-between gap-2 text-xs text-gray-400">
+                  <span>
+                    t = <span className="tabular-nums text-gray-100">{timelineCursor.toFixed(2)}s</span> /{" "}
+                    {groupTimeline.tMax.toFixed(2)}s
+                  </span>
+                  <span>
+                    {timelineUpToCount} shot{timelineUpToCount === 1 ? "" : "s"} · {timelineGroupsActive} group
+                    {timelineGroupsActive === 1 ? "" : "s"} so far
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setTimelineCursorSec(null)}
+                    className="min-h-8 rounded border border-gray-600 px-3 text-gray-300 transition hover:bg-neutral-800 sm:min-h-0 sm:py-0.5"
+                  >
+                    Show all
+                  </button>
+                </div>
+                <p className="mt-1 text-xs text-gray-500">
+                  Filled dots = shots up to the selected time · rings = running group centers · faint = later shots.
+                </p>
+              </div>
+            ) : null}
+
+            {/* Manual Edit: pick an active group, then tap shots on the map to move them in. */}
+            <div className="mt-3 rounded-md border border-gray-800 bg-neutral-900/40 p-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-sm font-semibold uppercase tracking-wide text-gray-200">Manual Edit</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setManualEditMode((value) => !value);
+                    setManualSelectedIds([]);
+                    setManualSelectionRect(null);
+                  }}
+                  className={`min-h-9 rounded-md border px-3 text-xs transition ${
+                    manualEditMode
+                      ? "border-emerald-400/60 bg-emerald-500/15 text-emerald-100"
+                      : "border-gray-600 text-gray-200 hover:bg-neutral-800"
+                  }`}
+                  aria-pressed={manualEditMode}
+                >
+                  {manualEditMode ? "Editing — Done" : "Manual Edit"}
+                </button>
+              </div>
+              {manualEditMode ? (
+                <>
+                  <p className="mt-2 text-sm text-gray-300">
+                    {manualSelectedIds.length > 0
+                      ? `${manualSelectedIds.length} selected — click a group, New, or Stray to reassign them.`
+                      : "Tap a shot to move it into the active group, or drag a box to select several, then click a group."}
+                  </p>
+                  <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                    {effectiveGroupIds.map((groupId) => (
+                      <button
+                        key={groupId}
+                        type="button"
+                        onClick={() => chooseManualGroup(groupId)}
+                        className={`flex min-h-8 items-center gap-1.5 rounded-full border px-3 text-xs transition sm:min-h-0 sm:py-1 ${
+                          manualSelectedIds.length === 0 && activeManualGroup === groupId
+                            ? "border-white bg-neutral-800 text-white"
+                            : "border-gray-700 text-gray-200 hover:bg-neutral-800"
+                        }`}
+                      >
+                        <span
+                          className="inline-block h-2.5 w-2.5 rounded-full"
+                          style={{ backgroundColor: effectiveGroupColorById[groupId] ?? clusterColorForId(groupId) }}
+                        />
+                        Group {groupId}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => chooseManualGroup(nextManualGroupId())}
+                      className={`min-h-8 rounded-full border px-3 text-xs transition sm:min-h-0 sm:py-1 ${
+                        manualSelectedIds.length === 0 && !effectiveGroupIds.includes(activeManualGroup) && activeManualGroup >= 1
+                          ? "border-white bg-neutral-800 text-white"
+                          : "border-sky-500/40 text-sky-100 hover:bg-sky-500/10"
+                      }`}
+                    >
+                      + New group
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => chooseManualGroup(0)}
+                      className={`min-h-8 rounded-full border px-3 text-xs transition sm:min-h-0 sm:py-1 ${
+                        manualSelectedIds.length === 0 && activeManualGroup === 0
+                          ? "border-white bg-neutral-800 text-white"
+                          : "border-gray-600 text-gray-300 hover:bg-neutral-800"
+                      }`}
+                    >
+                      Stray
+                    </button>
+                    {manualSelectedIds.length > 0 ? (
+                      <button
+                        type="button"
+                        onClick={() => setManualSelectedIds([])}
+                        className="min-h-8 rounded-full border border-gray-600 px-3 text-[11px] text-gray-300 transition hover:bg-neutral-800 sm:min-h-0 sm:py-0.5"
+                      >
+                        Clear selection ({manualSelectedIds.length})
+                      </button>
+                    ) : null}
+                    {Object.keys(manualGroupOverrides).length > 0 ? (
+                      <button
+                        type="button"
+                        onClick={resetManualGroupOverrides}
+                        className="min-h-8 rounded-full border border-rose-500/40 px-3 text-[11px] text-rose-200 transition hover:bg-rose-500/10 sm:min-h-0 sm:py-0.5"
+                      >
+                        Reset edits ({Object.keys(manualGroupOverrides).length})
+                      </button>
+                    ) : null}
+                  </div>
+                  {manualSelectedIds.length === 0 ? (
+                    <p className="mt-2 text-[11px] text-gray-500">
+                      Active:{" "}
+                      {activeManualGroup === 0
+                        ? "Stray (ungroup)"
+                        : effectiveGroupIds.includes(activeManualGroup)
+                          ? `Group ${activeManualGroup}`
+                          : `New group ${activeManualGroup}`}
+                    </p>
+                  ) : null}
+                </>
+              ) : null}
+            </div>
+
+            {shotGroupMode === "quadtree" ? (
+              <div className="mt-2 flex flex-wrap items-center gap-4 text-[11px] text-gray-300">
+                <label className="flex items-center gap-2">
+                  <span className="text-gray-400">Group radius</span>
+                  <input
+                    type="range"
+                    min="0.2"
+                    max="3"
+                    step="0.05"
+                    value={quadtreeRadiusScale}
+                    onChange={(event) => setQuadtreeRadiusScale(Number(event.target.value))}
+                  />
+                  <span className="tabular-nums">
+                    {quadtreeBaseRadiusPx > 0
+                      ? `${(quadtreeGroupInches * quadtreeRadiusScale).toFixed(1)} in`
+                      : `${quadtreeRadiusScale.toFixed(2)}×`}
+                  </span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={showQuadtreeCells}
+                    onChange={(event) => setShowQuadtreeCells(event.target.checked)}
+                  />
+                  Show quadtree cells
+                </label>
+              </div>
+            ) : null}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setShowDetailedViews((value) => !value)}
+            className="mt-3 self-start rounded-md border border-gray-600 px-3 py-1.5 text-xs text-gray-200 transition hover:bg-neutral-800"
+            aria-expanded={showDetailedViews}
+          >
+            {showDetailedViews ? "Hide detailed views" : `Show detailed views${isScanning ? " (scan running)" : ""}`}
+          </button>
+          <div className={`mt-4 space-y-3 ${showDetailedViews ? "" : "hidden"}`}>
             <div className="space-y-1">
-              <p className="text-xs text-gray-400">Analyzed target view</p>
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-gray-400">Analyzed target view</p>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-gray-400">Play speed</span>
+                  {[0.5, 1, 2, 4].map((speed) => (
+                    <button
+                      key={speed}
+                      type="button"
+                      onClick={() => setPlaybackSpeed(speed)}
+                      className={`min-h-8 rounded-md border px-3 text-xs transition sm:min-h-0 sm:px-2 sm:py-0.5 sm:text-[11px] ${
+                        playbackSpeed === speed
+                          ? "border-sky-400 bg-sky-500/20 text-sky-100"
+                          : "border-gray-600 text-gray-300 hover:bg-neutral-800"
+                      }`}
+                      aria-pressed={playbackSpeed === speed}
+                    >
+                      {speed}x
+                    </button>
+                  ))}
+                </div>
+              </div>
               <canvas ref={processingCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
             </div>
-            <div className="grid max-w-3xl grid-cols-2 gap-2 sm:gap-3">
+            <div className="grid max-w-3xl grid-cols-1 gap-2 xs:grid-cols-2 sm:gap-3">
               <div className="space-y-1">
                 <p className="text-xs text-gray-400">Probe patch window (DBSCAN overlays)</p>
                 <canvas ref={processedPatchCanvasRef} className="w-full rounded-md border border-gray-700 bg-black" />
@@ -7890,18 +10766,6 @@ export default function Home() {
                     ? "unavailable (fallback uses focused re-analysis)"
                     : "pending"}
             </p>
-            {audioRmsTimelineRef.current.length > 0 ? (
-              <p className="text-sm text-gray-300">
-                Audio baseline: {audioMeanDbfsRef.current.toFixed(1)} dBFS | spike threshold:{" "}
-                {audioThresholdDbfsRef.current.toFixed(1)} dBFS
-              </p>
-            ) : null}
-            {audioSignatureCatalog.length > 0 ? (
-              <p className="text-sm text-gray-300">
-                Audio signatures: {audioSignatureCatalog.length} unique | top signature has{" "}
-                {audioSignatureCatalog[0].count} spikes
-              </p>
-            ) : null}
             <p className="text-sm text-gray-300">Log entries: {logEntries.length}</p>
             <p className="text-sm text-gray-300">Shot changes: {shotLogEntries.length}</p>
             <p className="text-sm text-gray-300">
@@ -7973,136 +10837,311 @@ export default function Home() {
               </div>
             ) : null}
 
-            {spikeMetadata.length > 0 ? (
-              <div className="rounded-md border border-gray-700 bg-black p-3">
-                <p className="text-xs uppercase tracking-wide text-gray-300">Spike Metadata</p>
-                {audioSignatureCatalog.length > 0 ? (
-                  <div className="mt-2 max-h-28 space-y-1 overflow-auto rounded border border-gray-800 bg-neutral-900/40 p-2 text-[11px] text-gray-300">
-                    {audioSignatureCatalog.map((entry) => (
-                      <p key={entry.signatureId}>
-                        Sig {entry.signatureId} | spikes={entry.count} | peak={entry.meanPeakDbfs.toFixed(1)} dBFS | sub-peaks=
-                        {entry.meanSubPeakCount.toFixed(1)} | spread={entry.meanSubPeakSpreadSec.toFixed(3)}s
-                      </p>
-                    ))}
-                  </div>
-                ) : null}
-                <div className="mt-2 max-h-72 overflow-auto space-y-1">
-                  {spikeMetadata.map((spike) => (
-                    <div key={spike.id} className="rounded border border-gray-800 px-2 py-2 text-xs text-gray-300">
-                      {(() => {
-                        const isExpanded = expandedSpikeIds.includes(spike.id);
-                        const shotCount = spikeShotSummaryById[spike.id]?.count ?? 0;
-                        return (
-                          <>
-                            <div className="flex items-start justify-between gap-3">
-                              <div className="flex items-start gap-2">
-                                <button
-                                  type="button"
-                                  onClick={() => toggleSpikeExpanded(spike.id)}
-                                  className="mt-0.5 h-5 w-5 rounded border border-gray-600 text-center text-xs leading-4 text-gray-200 transition hover:bg-neutral-800"
-                                  aria-expanded={isExpanded}
-                                  aria-label={`${isExpanded ? "Collapse" : "Expand"} details for ${spike.id}`}
-                                >
-                                  {isExpanded ? "-" : "+"}
-                                </button>
-                                <div>
-                                  <p>
-                                    {spike.id} | t={spike.timeSec.toFixed(2)}s | rms={spike.strength.toFixed(4)} | db=
-                                    {rmsToDbfs(spike.strength).toFixed(1)} dBFS
-                                  </p>
-                                  <p className="text-[11px] text-gray-400">
-                                    Window: {spike.windowStartSec.toFixed(2)}s - {spike.windowEndSec.toFixed(2)}s | Sig{" "}
-                                    {spike.signatureId} | sub-peaks={spike.subPeakTimesSec.length}
-                                  </p>
-                                </div>
-                              </div>
-                              <div className="flex flex-col items-end gap-1">
-                                <button
-                                  type="button"
-                                  onClick={() => playSpikeSprite(spike.id)}
-                                  disabled={isScanning}
-                                  className="rounded border border-sky-500/30 px-2 py-0.5 text-[11px] text-sky-100 hover:bg-sky-500/10 disabled:opacity-50"
-                                >
-                                  Play
-                                </button>
-                                <p className="text-[11px] text-gray-300">Shots: {shotCount}</p>
-                              </div>
-                            </div>
-
-                            {isExpanded ? (
-                              shotCount > 0 ? (
-                                <div className="mt-2 rounded border border-gray-800 bg-neutral-900/50 p-2 text-[11px] text-gray-300">
-                                  <p>
-                                    MPI: ({(spikeShotSummaryById[spike.id]?.meanPointOfImpactX ?? 0).toFixed(1)},{" "}
-                                    {(spikeShotSummaryById[spike.id]?.meanPointOfImpactY ?? 0).toFixed(1)}) px | Extreme Spread:{" "}
-                                    {(spikeShotSummaryById[spike.id]?.extremeSpreadPx ?? 0).toFixed(1)} px | Mean Radius:{" "}
-                                    {(spikeShotSummaryById[spike.id]?.meanRadiusPx ?? 0).toFixed(1)} px
-                                  </p>
-                                  <p className="mt-0.5">
-                                    H Spread: {(spikeShotSummaryById[spike.id]?.horizontalSpreadPx ?? 0).toFixed(1)} px | V Spread:{" "}
-                                    {(spikeShotSummaryById[spike.id]?.verticalSpreadPx ?? 0).toFixed(1)} px | Avg Size:{" "}
-                                    {spikeShotSummaryById[spike.id]?.averageDiameterInches === null
-                                      ? "n/a"
-                                      : formatLinearFromInches(spikeShotSummaryById[spike.id]?.averageDiameterInches ?? 0, 2)}
-                                    {" | "}Avg Change: {(spikeShotSummaryById[spike.id]?.averageChangeScore ?? 0).toFixed(3)}
-                                  </p>
-                                  <div className="mt-1 space-y-0.5">
-                                    {spikeShotSummaryById[spike.id]?.shots.map((shot) => {
-                                      const shotClusterId = shotClustering.shotClusterById[shot.id];
-                                      const shotClusterColor =
-                                        shotClusterId === undefined
-                                          ? null
-                                          : clusterColorById[shotClusterId] ?? clusterColorForId(shotClusterId);
-                                      return (
-                                        <p key={shot.id} className="text-gray-400">
-                                          S{shot.shotNumber} | t={shot.videoTimeSec.toFixed(3)}s
-                                          {shot.timeSincePreviousShotSec === null
-                                            ? ""
-                                            : ` | dt=${shot.timeSincePreviousShotSec.toFixed(3)}s`}
-                                          {shotClusterId === undefined ? null : (
-                                            <span
-                                              className="mx-1 inline-flex items-center rounded border px-1 py-0 text-[10px]"
-                                              style={{
-                                                borderColor: hexToRgba(shotClusterColor ?? "#f87171", 0.65),
-                                                backgroundColor: hexToRgba(shotClusterColor ?? "#f87171", 0.15),
-                                                color: hexToRgba(shotClusterColor ?? "#f87171", 0.95),
-                                              }}
-                                            >
-                                              DB{shotClusterId} S{shot.shotNumber}
-                                            </span>
-                                          )}
-                                          {shot.audioDecibelDbfs === null ? "" : ` | ${shot.audioDecibelDbfs.toFixed(1)}dBFS`}
-                                          {shot.audioCorrelationScorePct === null
-                                            ? ""
-                                            : ` | a-match=${shot.audioCorrelationScorePct.toFixed(0)}%`}
-                                          {" | "}x={shot.centerX}, y={shot.centerY} | size{" "}
-                                          {shot.estimatedDiameterInches === null
-                                            ? `${shot.estimatedDiameterPx.toFixed(1)} px`
-                                            : formatLinearFromInches(shot.estimatedDiameterInches, 2)}
-                                        </p>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                              ) : (
-                                <p className="mt-1 text-[11px] text-gray-500">No shots linked to this spike.</p>
-                              )
-                            ) : null}
-                          </>
-                        );
-                      })()}
-                    </div>
-                  ))}
-                </div>
-                <p className="mt-2 text-xs text-gray-400">
-                  Sprites generated: {Object.keys(audioSprites).length}
-                </p>
-              </div>
-            ) : null}
-
             </div>
           </details>
         </section>
+
+        <section
+          ref={audioSectionRef}
+          className={`flex flex-col rounded-xl border border-gray-700 bg-neutral-950 p-4 sm:p-6 ${
+            currentStep === 5 ? "" : "hidden"
+          }`}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h2 className="text-base font-semibold text-white sm:text-lg">6. Audio Capture</h2>
+              <p className="mt-1 text-xs text-gray-400">
+                Every shot is gated by an audio spike. This screen shows exactly what the audio pipeline captures —
+                signal properties, the detection threshold, the RMS/dBFS timeline, acoustic signatures, and every
+                detected spike.
+              </p>
+            </div>
+            <span className="shrink-0 rounded-md border border-gray-700 px-2 py-1 text-[11px] text-gray-300">
+              {spikeMetadata.length} spikes
+            </span>
+          </div>
+
+          <div className="mt-4 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
+            <div className="rounded-md border border-gray-700 bg-black p-2">
+              <p className="text-gray-400">Howler</p>
+              <p className="text-gray-100">{howlerReady ? "ready" : "loading"}</p>
+            </div>
+            <div className="rounded-md border border-gray-700 bg-black p-2">
+              <p className="text-gray-400">Sprites</p>
+              <p className="text-gray-100">
+                {spritesReady ? "ready" : "pending"} ({Object.keys(audioSprites).length})
+              </p>
+            </div>
+            <div className="rounded-md border border-gray-700 bg-black p-2">
+              <p className="text-gray-400">Spikes</p>
+              <p className="text-gray-100">{spikeMetadata.length}</p>
+            </div>
+            <div className="rounded-md border border-gray-700 bg-black p-2">
+              <p className="text-gray-400">Signatures</p>
+              <p className="text-gray-100">{audioSignatureCatalog.length}</p>
+            </div>
+          </div>
+
+          <p className="mt-4 text-xs uppercase tracking-wide text-gray-300">Captured Signal</p>
+          {audioCaptureInfo ? (
+            <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-gray-300 sm:grid-cols-3">
+              <p>
+                Sample rate: <span className="text-gray-100">{audioCaptureInfo.sampleRate.toLocaleString()} Hz</span>
+              </p>
+              <p>
+                Channels: <span className="text-gray-100">{audioCaptureInfo.channels}</span>
+              </p>
+              <p>
+                Duration: <span className="text-gray-100">{audioCaptureInfo.durationSec.toFixed(2)} s</span>
+              </p>
+              <p>
+                Total samples: <span className="text-gray-100">{audioCaptureInfo.totalSamples.toLocaleString()}</span>
+              </p>
+              <p>
+                RMS frames: <span className="text-gray-100">{audioCaptureInfo.rmsSampleCount.toLocaleString()}</span>
+              </p>
+              <p>
+                RMS hop: <span className="text-gray-100">{(audioCaptureInfo.rmsHopSec * 1000).toFixed(1)} ms</span>
+              </p>
+              <p>
+                Mean level: <span className="text-gray-100">{audioCaptureInfo.meanDbfs.toFixed(1)} dBFS</span>
+              </p>
+              <p>
+                Spike threshold: <span className="text-rose-200">{audioCaptureInfo.thresholdDbfs.toFixed(1)} dBFS</span>
+              </p>
+              <p>
+                Peak / floor:{" "}
+                <span className="text-gray-100">
+                  {audioCaptureInfo.maxDbfs.toFixed(1)} / {audioCaptureInfo.minDbfs.toFixed(1)} dBFS
+                </span>
+              </p>
+            </div>
+          ) : audioCaptureError ? (
+            <div className="mt-2 rounded border border-rose-700/60 bg-rose-950/40 p-2 text-[11px] text-rose-200">
+              <p className="font-semibold text-rose-100">Audio pipeline failed</p>
+              <p className="mt-1 break-words">{audioCaptureError}</p>
+            </div>
+          ) : (
+            <p className="mt-2 text-[11px] text-gray-500">
+              Run a scan to capture audio. Detected signal properties will appear here.
+            </p>
+          )}
+
+          <p className="mt-4 text-xs uppercase tracking-wide text-gray-300">RMS / dBFS Timeline</p>
+          <canvas
+            ref={audioTimelineCanvasRef}
+            width={760}
+            height={140}
+            className="mt-2 w-full rounded-md border border-gray-700 bg-black"
+          />
+          <p className="mt-1 text-[10px] text-gray-500">
+            <span className="text-emerald-300">emerald</span> = RMS level ·{" "}
+            <span className="text-rose-300">red dashed</span> = spike threshold · <span className="text-sky-300">sky</span>{" "}
+            = mean · <span className="text-amber-300">amber</span> = detected spikes &amp; windows
+          </p>
+
+          <p className="mt-4 text-xs uppercase tracking-wide text-gray-300">Detection Parameters</p>
+          <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-gray-300 sm:grid-cols-3">
+            <p>
+              Analysis window: <span className="text-gray-100">{tweakSettings.audioWindowSize} samples</span>
+            </p>
+            <p>
+              Threshold: <span className="text-gray-100">mean + {tweakSettings.audioSpikeStdDevMultiplier}σ</span>
+            </p>
+            <p>
+              Min spike gap: <span className="text-gray-100">{tweakSettings.audioSpikeMinGapSec.toFixed(2)} s</span>
+            </p>
+            <p>
+              Peak window: <span className="text-gray-100">±{tweakSettings.audioPeakWindowHalfSec.toFixed(2)} s</span>
+            </p>
+            <p>
+              Energy offset: <span className="text-gray-100">{tweakSettings.audioEnergyOffsetDb} dB</span>
+            </p>
+            <p>
+              Energy scale: <span className="text-gray-100">{tweakSettings.audioEnergyScaleDb} dB</span>
+            </p>
+            <p>
+              Weights E/T/V:{" "}
+              <span className="text-gray-100">
+                {tweakSettings.audioWeightEnergy}/{tweakSettings.audioWeightTimeAlignment}/
+                {tweakSettings.audioWeightVisual}
+              </span>
+            </p>
+            <p>
+              Visual floor: <span className="text-gray-100">{tweakSettings.audioVisualScoreFloor}</span>
+            </p>
+            <p>
+              No-spike align: <span className="text-gray-100">{tweakSettings.audioNoSpikeAlignmentScore}</span>
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setIsSettingsModalOpen(true)}
+            className="mt-2 text-[11px] text-sky-300 underline-offset-2 hover:underline"
+          >
+            Adjust in Settings →
+          </button>
+
+          {audioSignatureCatalog.length > 0 ? (
+            <>
+              <p className="mt-4 text-xs uppercase tracking-wide text-gray-300">
+                Acoustic Signatures ({audioSignatureCatalog.length})
+              </p>
+              <div className="mt-2 max-h-32 space-y-1 overflow-auto rounded border border-gray-800 bg-neutral-900/40 p-2 text-[11px] text-gray-300">
+                {audioSignatureCatalog.map((entry) => (
+                  <p key={entry.signatureId}>
+                    Sig {entry.signatureId} · key {entry.signatureKey} · spikes={entry.count} · peak=
+                    {entry.meanPeakDbfs.toFixed(1)} dBFS · sub-peaks={entry.meanSubPeakCount.toFixed(1)} · spread=
+                    {entry.meanSubPeakSpreadSec.toFixed(3)}s
+                  </p>
+                ))}
+              </div>
+            </>
+          ) : null}
+
+          <p className="mt-4 text-xs uppercase tracking-wide text-gray-300">Detected Spikes ({spikeMetadata.length})</p>
+          {spikeMetadata.length > 0 ? (
+            <div className="mt-2 max-h-80 space-y-1 overflow-auto">
+              {spikeMetadata.map((spike) => (
+                <div key={spike.id} className="rounded border border-gray-800 px-2 py-2 text-xs text-gray-300">
+                  {(() => {
+                    const isExpanded = expandedSpikeIds.includes(spike.id);
+                    const shotCount = spikeShotSummaryById[spike.id]?.count ?? 0;
+                    return (
+                      <>
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex items-start gap-2">
+                            <button
+                              type="button"
+                              onClick={() => toggleSpikeExpanded(spike.id)}
+                              className="mt-0.5 h-8 w-8 rounded border border-gray-600 text-center text-base leading-none text-gray-200 transition hover:bg-neutral-800 sm:h-5 sm:w-5 sm:text-xs sm:leading-4"
+                              aria-expanded={isExpanded}
+                              aria-label={`${isExpanded ? "Collapse" : "Expand"} details for ${spike.id}`}
+                            >
+                              {isExpanded ? "-" : "+"}
+                            </button>
+                            <div>
+                              <p>
+                                {spike.id} | t={spike.timeSec.toFixed(2)}s | rms={spike.strength.toFixed(4)} | db=
+                                {rmsToDbfs(spike.strength).toFixed(1)} dBFS
+                              </p>
+                              <p className="text-[11px] text-gray-400">
+                                Window: {spike.windowStartSec.toFixed(2)}s - {spike.windowEndSec.toFixed(2)}s | Sig{" "}
+                                {spike.signatureId} ({spike.signatureKey}) | sub-peaks={spike.subPeakTimesSec.length} |
+                                sprite={spike.spriteStartMs.toFixed(0)}ms +{spike.spriteDurationMs.toFixed(0)}ms
+                              </p>
+                              {spike.subPeakTimesSec.length > 0 ? (
+                                <p className="text-[10px] text-gray-500">
+                                  sub-peaks @ {spike.subPeakTimesSec.map((t) => `${t.toFixed(3)}s`).join(", ")}
+                                </p>
+                              ) : null}
+                            </div>
+                          </div>
+                          <div className="flex flex-col items-end gap-1">
+                            <button
+                              type="button"
+                              onClick={() => playSpikeSprite(spike.id)}
+                              disabled={isScanning}
+                              className="min-h-8 rounded border border-sky-500/30 px-3 text-xs text-sky-100 hover:bg-sky-500/10 disabled:opacity-50 sm:min-h-0 sm:px-2 sm:py-0.5 sm:text-[11px]"
+                            >
+                              Play
+                            </button>
+                            <p className="text-[11px] text-gray-300">Shots: {shotCount}</p>
+                          </div>
+                        </div>
+
+                        {isExpanded ? (
+                          shotCount > 0 ? (
+                            <div className="mt-2 rounded border border-gray-800 bg-neutral-900/50 p-2 text-[11px] text-gray-300">
+                              <p>
+                                MPI: ({(spikeShotSummaryById[spike.id]?.meanPointOfImpactX ?? 0).toFixed(1)},{" "}
+                                {(spikeShotSummaryById[spike.id]?.meanPointOfImpactY ?? 0).toFixed(1)}) px | Extreme Spread:{" "}
+                                {(spikeShotSummaryById[spike.id]?.extremeSpreadPx ?? 0).toFixed(1)} px | Mean Radius:{" "}
+                                {(spikeShotSummaryById[spike.id]?.meanRadiusPx ?? 0).toFixed(1)} px
+                              </p>
+                              <div className="mt-1 space-y-0.5">
+                                {spikeShotSummaryById[spike.id]?.shots.map((shot) => (
+                                  <p key={shot.id} className="text-gray-400">
+                                    S{shot.shotNumber} | t={shot.videoTimeSec.toFixed(3)}s
+                                    {shot.audioDecibelDbfs === null ? "" : ` | ${shot.audioDecibelDbfs.toFixed(1)}dBFS`}
+                                    {shot.audioCorrelationScorePct === null
+                                      ? ""
+                                      : ` | a-match=${shot.audioCorrelationScorePct.toFixed(0)}%`}
+                                    {" | "}x={shot.centerX}, y={shot.centerY}
+                                  </p>
+                                ))}
+                              </div>
+                            </div>
+                          ) : (
+                            <p className="mt-1 text-[11px] text-gray-500">No shots linked to this spike.</p>
+                          )
+                        ) : null}
+                      </>
+                    );
+                  })()}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-2 text-[11px] text-gray-500">
+              No spikes detected yet — run a scan on an uploaded video with audio.
+            </p>
+          )}
+        </section>
+
+        {/* Wizard navigation: move between steps without scrolling. */}
+        <nav
+          aria-label="Workflow steps"
+          className="sticky bottom-0 z-30 -mx-3 mt-1 border-t border-gray-800 bg-black/90 px-3 py-2 backdrop-blur sm:mx-0 sm:rounded-xl sm:border"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              onClick={() => goToStep(currentStep - 1)}
+              disabled={currentStep === 0}
+              className="min-h-9 rounded-md border border-gray-600 px-3 text-sm text-gray-200 transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              ← Back
+            </button>
+            <span className="text-center text-xs text-gray-300 sm:text-sm">
+              Step {currentStep + 1} of {sectionSteps.length} · {sectionSteps[currentStep].label}
+            </span>
+            <button
+              type="button"
+              onClick={() => goToStep(currentStep + 1)}
+              disabled={currentStep === sectionSteps.length - 1}
+              className="min-h-9 rounded-md border border-sky-400/45 px-3 text-sm text-sky-100 transition hover:bg-sky-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Next →
+            </button>
+          </div>
+          <div className="mt-2 flex items-center justify-center gap-1.5">
+            {sectionSteps.map((step, index) => (
+              <button
+                key={step.short}
+                type="button"
+                onClick={() => goToStep(index)}
+                aria-label={`Step ${index + 1}: ${step.label}`}
+                aria-current={currentStep === index}
+                className={`h-8 min-w-8 rounded-full border text-xs font-semibold transition ${
+                  currentStep === index
+                    ? "border-sky-400 bg-sky-500/20 text-sky-100"
+                    : "border-gray-700 text-gray-400 hover:bg-neutral-800"
+                }`}
+              >
+                {step.short}
+              </button>
+            ))}
+          </div>
+          <label className="mt-2 flex items-center justify-center gap-2 text-xs text-gray-400">
+            <input
+              type="checkbox"
+              checked={autoAdvance}
+              onChange={(event) => handleAutoAdvanceChange(event.target.checked)}
+            />
+            Auto-advance to next step when ready
+          </label>
+        </nav>
       </main>
     </div>
   );
