@@ -1,21 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ONBOARDING_TIPS, hasUnseenTips, markTipsSeen, resetOnboarding } from "@/app/lib/onboarding";
+import { ONBOARDING_TIPS, markTipsSeen, resetOnboarding } from "@/app/lib/onboarding";
 
 // The onboarding interface: one unobtrusive "Guide" button that opens a popover
-// with a welcome + the numbered steps, highlighting the user's current step. It
-// auto-opens once for first-timers and re-surfaces whenever a new tip is added
-// to the registry (so it grows with the product). Re-openable anytime.
+// with a welcome + the numbered steps, highlighting the user's current step.
+// Stays closed by default — the user opens it on demand; "Restart tour" reopens.
 export function OnboardingGuide({ currentStep }: { currentStep: number }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    // One-time auto-open from client-only localStorage; intentional in an effect.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (hasUnseenTips()) setOpen(true);
-  }, []);
 
   useEffect(() => {
     if (!open) return;
