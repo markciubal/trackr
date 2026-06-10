@@ -35,6 +35,18 @@ import {
 
 type Phase = "setup" | "announcing" | "playing" | "done";
 
+// Shape returned by GET /api/targets?id= — enough to rebuild the drill and cache
+// a usable local target.
+type CatalogTarget = {
+  name: string | null;
+  unit: "mm" | "cm" | "in";
+  widthValue: number;
+  heightValue: number;
+  qrSizeValue: number;
+  drillRecipe: string | null;
+  drillPaletteVersion: number | null;
+};
+
 export function DrillRunner() {
   // Seed the current zones came from (null = unknown, e.g. an old save); when
   // known it's stored with the scenario so printed QRs can carry just a recipe.
@@ -56,22 +68,69 @@ export function DrillRunner() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setScenarioTargets(listTargets().filter((target) => (target.zones?.length ?? 0) > 0));
-    // Deep-link: /drill?id=XXXX loads that target's zones (used by the designer's
-    // "Test drill" and by scanned QRs). A scanned QR also carries the zones
-    // inline (?z=...), so the drill works even if this device never saved the id.
+
+    // Deep-link: /drill?id=XXXX loads that target's zones (the designer's "Test
+    // drill" and scanned QRs). Resolution order: (1) this device saved it, (2) a
+    // recipe rode along inline as ?z=, (3) foreign device with only the id —
+    // fetch the recipe from the catalog once and cache it for offline reuse.
     const params = new URLSearchParams(window.location.search);
     const id = params.get("id");
     const rawZ = params.get("z");
-    const stored = id ? getTarget(id) : null;
-    const recipe = stored?.zones?.length ? null : decodeRecipe(rawZ);
-    const linked = stored?.zones?.length ? stored.zones : recipe ? zonesFromRecipe(recipe) : decodeZones(rawZ);
-    if (linked?.length) {
+
+    const apply = (linked: ScenarioZone[], seedValue: number | null) => {
+      if (!linked.length) return;
       setZones(linked);
       setZoneCount(linked.length);
       setLength(linked.length);
       setAttrs(attributesFromZones(linked));
-      setSeed(stored?.zones?.length ? (stored.drillSeed ?? null) : (recipe?.seed ?? null));
+      setSeed(seedValue);
+    };
+
+    // 1) Saved locally → exact zones (works fully offline).
+    const stored = id ? getTarget(id) : null;
+    if (stored?.zones?.length) {
+      apply(stored.zones, stored.drillSeed ?? null);
+      return;
     }
+    // 2) Recipe carried inline (legacy QR or the landing-page link).
+    const recipe = decodeRecipe(rawZ);
+    const inline = recipe ? zonesFromRecipe(recipe) : decodeZones(rawZ);
+    if (inline?.length) {
+      apply(inline, recipe?.seed ?? null);
+      return;
+    }
+    // 3) Id-only → resolve from the catalog, then cache the whole target.
+    if (!id) return;
+    let cancelled = false;
+    fetch(`/api/targets?id=${encodeURIComponent(id)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: CatalogTarget | null) => {
+        if (cancelled || !data?.drillRecipe) return;
+        const fetched = decodeRecipe(data.drillRecipe);
+        const zones = fetched
+          ? zonesFromRecipe(fetched, data.drillPaletteVersion ?? undefined)
+          : null;
+        if (!zones?.length) return;
+        apply(zones, fetched?.seed ?? null);
+        saveTarget(
+          createTargetInfo({
+            id,
+            name: data.name ?? "Scanned target",
+            unit: data.unit,
+            widthValue: data.widthValue,
+            heightValue: data.heightValue,
+            qrSizeValue: data.qrSizeValue,
+            scoringId: "drill",
+            zones,
+            drillSeed: fetched?.seed ?? undefined,
+          }),
+        );
+        setScenarioTargets(listTargets().filter((target) => (target.zones?.length ?? 0) > 0));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {

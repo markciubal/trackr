@@ -78,6 +78,12 @@ create table if not exists public.targets (
 );
 create index if not exists targets_owner_id_idx on public.targets (owner_id);
 
+-- Drill layout, resolved by id. The QR carries only the short id (kept minimal so
+-- it scans from a distance), so a scanned drill target's zones are rebuilt from
+-- the recipe stored here via scenario.ts zonesFromParam(recipe, palette_version).
+alter table public.targets add column if not exists drill_recipe text;
+alter table public.targets add column if not exists drill_palette_version int;
+
 alter table public.targets enable row level security;
 
 drop policy if exists "targets_select_published" on public.targets;

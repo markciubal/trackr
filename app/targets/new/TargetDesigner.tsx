@@ -24,7 +24,9 @@ import {
   DEFAULT_SCENARIO_ATTRIBUTES,
   MAX_SCENARIO_ZONES,
   SCENARIO_ATTRIBUTE_OPTIONS,
+  SCENARIO_PALETTE_VERSION,
   attributesFromZones,
+  encodeRecipe,
   generateScenarioZones,
   generateSeed,
   type ScenarioAttribute,
@@ -119,7 +121,10 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
   useEffect(() => {
     if (!payloadUrl) return;
     let cancelled = false;
-    QRCode.toString(payloadUrl, { type: "svg", margin: 0, errorCorrectionLevel: "M" })
+    // ECC "L": the payload is a tiny id-only URL, so the lowest error-correction
+    // level keeps the QR at version 1 (21×21) — the biggest modules, best read
+    // from a distance. Clean prints don't need M's extra damage tolerance.
+    QRCode.toString(payloadUrl, { type: "svg", margin: 0, errorCorrectionLevel: "L" })
       .then((svg) => {
         if (!cancelled) setQrSvg(svg);
       })
@@ -233,10 +238,27 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
     setSaveState("saving");
     setSaveError(null);
     try {
+      // Drill targets carry their layout only by id now, so the recipe must be
+      // persisted to the catalog for any device that scans the print to rebuild
+      // the exact zones (see scenario.ts encodeRecipe / zonesFromParam).
+      const drillRecipe =
+        scoringId === "drill" && scenarioSeed !== null && scenarioZones.length > 0
+          ? encodeRecipe({ count: scenarioZones.length, attributes: scenarioAttrs, seed: scenarioSeed })
+          : null;
       const res = await fetch("/api/targets", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ id: targetId, name, unit, widthValue, heightValue, qrSizeValue, scoringId }),
+        body: JSON.stringify({
+          id: targetId,
+          name,
+          unit,
+          widthValue,
+          heightValue,
+          qrSizeValue,
+          scoringId,
+          drillRecipe,
+          drillPaletteVersion: drillRecipe ? SCENARIO_PALETTE_VERSION : null,
+        }),
       });
       const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
       if (data.ok) {

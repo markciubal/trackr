@@ -3,6 +3,9 @@
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { OnboardingGuide } from "@/app/components/onboarding/OnboardingGuide";
 import { InfoPopover } from "@/app/components/onboarding/InfoPopover";
+import { detectTargetInCanvas } from "@/app/lib/targets/detect";
+import { pixelsPerInchFromQr, toInches, type LinearUnit as TargetLinearUnit } from "@/app/lib/targets/payload";
+import { getTarget } from "@/app/lib/targets/store";
 
 type CvMat = {
   rows: number;
@@ -4285,6 +4288,16 @@ export default function Home() {
   const [calibrationDistanceInches, setCalibrationDistanceInches] = useState(252);
   const [manualDistanceOverrideInches] = useState(0);
   const [focalScalePxIn, setFocalScalePxIn] = useState(0);
+  // Target opened via its QR (the /?t={id} handoff from the phone-camera scan).
+  // Holds the QR's known printed size, which is the calibration reference now
+  // that the QR itself no longer carries it inline.
+  const [qrTarget, setQrTarget] = useState<{
+    id: string;
+    name: string | null;
+    qrSizeValue: number;
+    unit: TargetLinearUnit;
+  } | null>(null);
+  const [qrCalibrationStatus, setQrCalibrationStatus] = useState<string | null>(null);
   const matchThreshold = 20;
   const trackingMode: TrackingMode = "template";
   const [logEntries, setLogEntries] = useState<DetectionLogEntry[]>([]);
@@ -5988,6 +6001,86 @@ export default function Home() {
     setFocalScalePxIn(calibrationDistanceInches > 0 ? ppi * calibrationDistanceInches : 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isDrawingRoiMeasurementLine, roiMeasurementMetrics, calibrationDistanceInches]);
+
+  // Stage 2 of the QR handoff: a phone camera scanned the target's id-only QR
+  // and opened Trackr at /?t={id}. Resolve that id (local store first, else the
+  // catalog) to learn the QR's printed size + target dimensions, so the in-app
+  // scanner can calibrate by measuring the QR. Runs once on mount.
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get("t")?.trim();
+    if (!id) return;
+
+    const adopt = (name: string | null, qrSizeValue: number, unit: TargetLinearUnit, w?: number, h?: number) => {
+      if (!(qrSizeValue > 0)) return;
+      setQrTarget({ id, name, qrSizeValue, unit });
+      if (w && w > 0) setTargetWidthInches(toInches(w, unit));
+      if (h && h > 0) setTargetHeightInches(toInches(h, unit));
+      setQrCalibrationStatus(`Loaded ${name ?? id}. Point the camera at it and calibrate from the QR.`);
+    };
+
+    const local = getTarget(id);
+    if (local) {
+      adopt(local.name, local.qrSizeValue, local.unit, local.widthValue, local.heightValue);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/targets?id=${encodeURIComponent(id)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { name?: string | null; qrSizeValue?: number; unit?: TargetLinearUnit; widthValue?: number; heightValue?: number } | null) => {
+        if (cancelled || !data) return;
+        const unit: TargetLinearUnit = data.unit === "mm" || data.unit === "cm" || data.unit === "in" ? data.unit : "in";
+        adopt(data.name ?? null, Number(data.qrSizeValue), unit, data.widthValue, data.heightValue);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // One-shot calibrate: detect the target QR in the current camera frame, then
+  // turn its measured pixel side length into pixels-per-inch using the QR's known
+  // printed size (from the resolved target above, or carried inline by a legacy
+  // QR). This is the data-extraction half of the two-stage reader handoff.
+  const calibrateFromQr = useCallback(() => {
+    const cv = window.cv;
+    if (!opencvReady || !cv?.QRCodeDetector) {
+      setQrCalibrationStatus("OpenCV is still loading — try again in a moment.");
+      return;
+    }
+    const videoEl = videoRef.current;
+    if (!videoEl || videoEl.videoWidth <= 0 || videoEl.videoHeight <= 0) {
+      setQrCalibrationStatus("Point the camera at the target first.");
+      return;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
+    ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+
+    const { qr, target } = detectTargetInCanvas(cv, canvas);
+    if (!qr || qr.qrSidePx <= 0) {
+      setQrCalibrationStatus("No QR found in frame — move closer or steady the camera.");
+      return;
+    }
+    // Prefer the resolved target's printed size; fall back to a legacy QR that
+    // still carries its size inline.
+    const sizeUnit: TargetLinearUnit = qrTarget?.unit ?? target?.payload.unit ?? "in";
+    const knownSize = qrTarget?.qrSizeValue ?? target?.payload.qrSizeValue ?? 0;
+    if (!(knownSize > 0)) {
+      setQrCalibrationStatus("Found a QR, but its printed size is unknown — open the target via its QR while online once.");
+      return;
+    }
+    const ppi = pixelsPerInchFromQr(qr.qrSidePx, knownSize, sizeUnit);
+    if (!ppi || ppi <= 0) {
+      setQrCalibrationStatus("Couldn't compute scale from the QR.");
+      return;
+    }
+    setPixelsPerInch(ppi);
+    setFocalScalePxIn(calibrationDistanceInches > 0 ? ppi * calibrationDistanceInches : 0);
+    setQrCalibrationStatus(`Calibrated: ${ppi.toFixed(1)} px/in from a ${knownSize} ${sizeUnit} QR.`);
+  }, [opencvReady, qrTarget, calibrationDistanceInches]);
 
   const hasAnalysisCoverageForWindow = useCallback(
     (windowStartSec: number, windowEndSec: number): boolean => {
@@ -10112,6 +10205,20 @@ export default function Home() {
                 className="rounded-md border border-gray-700 bg-neutral-950 px-2 py-1.5 text-sm outline-none ring-gray-400/40 focus:ring-1"
               />
             </label> */}
+          </div>
+          <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+            <button
+              type="button"
+              onClick={calibrateFromQr}
+              disabled={!opencvReady}
+              className="inline-flex items-center justify-center rounded-md border border-sky-400/40 bg-sky-500/15 px-3 py-1.5 text-sm font-medium text-sky-100 transition hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Calibrate from QR
+            </button>
+            <span className="text-[11px] text-gray-400">
+              {qrCalibrationStatus ??
+                "Scan a Trackr target's QR with your phone to open it here, then measure scale straight from the QR."}
+            </span>
           </div>
           </div>
         </section>

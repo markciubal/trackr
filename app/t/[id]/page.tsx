@@ -39,13 +39,15 @@ export default async function TargetLandingPage({
   const spec = record ?? readQuerySpec(sp);
   const openInTrackrHref = `/?t=${encodeURIComponent(id)}`;
 
-  // Drill targets carry their layout in the QR (?z=...) — either a tiny seed
-  // recipe or a legacy per-zone string; link straight into the drill with the
-  // same payload so any device rebuilds the exact layout.
-  const rawZones = Array.isArray(sp.z) ? sp.z[0] : sp.z;
-  const drillZones = zonesFromParam(rawZones ?? null);
-  const drillHref = rawZones
-    ? `/drill?id=${encodeURIComponent(id)}&z=${encodeURIComponent(rawZones)}`
+  // Drill layout: new id-only QRs resolve the recipe from the catalog by id;
+  // legacy prints carried it inline as ?z=. Either way we hand the recipe to the
+  // drill page so the device rebuilds the exact zones without another lookup.
+  const legacyZ = Array.isArray(sp.z) ? sp.z[0] : sp.z;
+  const drillRecipe = record?.drillRecipe ?? legacyZ ?? null;
+  const drillPaletteVersion = record?.drillPaletteVersion ?? undefined;
+  const drillZones = zonesFromParam(drillRecipe, drillPaletteVersion);
+  const drillHref = drillRecipe
+    ? `/drill?id=${encodeURIComponent(id)}&z=${encodeURIComponent(drillRecipe)}`
     : null;
 
   return (

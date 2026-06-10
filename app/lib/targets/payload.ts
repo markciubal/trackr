@@ -1,28 +1,22 @@
-// Hybrid "smart target" QR payload.
+// "Smart target" QR payload.
 //
-// The QR encodes a short URL: {base}/t/{id}?w=&h=&u=&q=&s=&z=&v=
-//   id  short catalog code (resolves to a Supabase row: rings, SKU, owner, ...)
-//   w,h target width/height in `u`
-//   u   units: mm | cm | in
-//   q   printed side length of the QR square, in `u` (the calibration reference)
-//   s   optional scoring/ring-layout id
-//   z   optional drill layout — preferably a tiny {count, attrs, seed} recipe
-//       that regenerates the zones on scan; legacy prints carry the full
-//       per-zone encoding (see scenario.ts encodeRecipe / encodeZones)
-//   pv  palette version for `z` (which frozen shape/color/pattern set to
-//       regenerate from); absent ⇒ 1. Lets the palette evolve without breaking
-//       targets already printed.
-//   v   payload schema version
+// The QR encodes the shortest possible URL: {base}/t/{id} — UPPERCASED, e.g.
+// HTTPS://TRKR.GG/T/ABC1234. Uppercase + only the symbols `:/.` keeps the string
+// inside the QR "alphanumeric" charset (5.5 bits/char vs 8 in byte mode), so a
+// 25-char URL fits a version-1 (21×21) QR. Fewer, bigger modules ⇒ it scans from
+// much farther away. The id is all the QR carries; everything else (calibration
+// w/h/u/q, drill layout) is resolved by id from the Supabase catalog or local
+// store. Scanning with a phone camera just opens the /t/{id} product page (a
+// middleware redirect maps the uppercase /T/ path to the lowercase route).
 //
-// The inline w/h/u/q let the app auto-calibrate with no network; the id unlocks
-// the catalog/sales/anti-copy side when online. Scanning with a phone camera
-// just opens the /t/{id} product page.
+// LEGACY: older prints encode a lowercase URL with an inline query string
+//   {base}/t/{id}?w=&h=&u=&q=&s=&z=&pv=&v=
+// carrying self-describing calibration + drill recipe. decodeTargetPayload still
+// parses that form (detected by the presence of query params) so prints already
+// in the wild keep working forever.
 
 import {
-  SCENARIO_PALETTE_VERSION,
   decodeRecipe,
-  encodeRecipe,
-  encodeZones,
   zonesFromParam,
   type ScenarioRecipe,
   type ScenarioZone,
@@ -72,39 +66,42 @@ export function hasInlineCalibration(payload: TargetPayload): boolean {
   );
 }
 
+// Build the printed QR string: an id-only URL, uppercased so the whole thing
+// stays in the QR alphanumeric charset (version-1 21×21 QR ⇒ scans from a
+// distance). Calibration + drill layout are resolved by id, not baked in. The id
+// is already uppercase Crockford base32, so toUpperCase only normalizes the
+// scheme/host/path and never corrupts it.
 export function encodeTargetPayload(payload: TargetPayload, baseUrl: string): string {
   const base = (baseUrl || "").replace(/\/+$/, "");
-  const params = new URLSearchParams();
-  if (typeof payload.widthValue === "number") params.set("w", trimNumber(payload.widthValue));
-  if (typeof payload.heightValue === "number") params.set("h", trimNumber(payload.heightValue));
-  params.set("u", payload.unit);
-  if (typeof payload.qrSizeValue === "number") params.set("q", trimNumber(payload.qrSizeValue));
-  if (payload.scoringId) params.set("s", payload.scoringId);
-  const paletteVersion = payload.paletteVersion ?? SCENARIO_PALETTE_VERSION;
-  if (payload.drill) {
-    params.set("z", encodeRecipe(payload.drill));
-    params.set("pv", String(paletteVersion));
-  } else if (payload.zones?.length) {
-    params.set("z", encodeZones(payload.zones, paletteVersion));
-    params.set("pv", String(paletteVersion));
-  }
-  params.set("v", String(payload.version || TARGET_PAYLOAD_VERSION));
-  return `${base}${TARGET_PATH_PREFIX}${encodeURIComponent(payload.id)}?${params.toString()}`;
+  return `${base}${TARGET_PATH_PREFIX}${payload.id}`.toUpperCase();
 }
 
-// Parse a scanned string. Accepts the full URL form; returns null if it isn't a
-// recognizable target payload. id-only payloads (no inline calibration) are
-// still returned so the app can resolve them from the catalog.
+// Parse a scanned string. Handles all three forms:
+//   • new id-only:   HTTPS://TRKR.GG/T/ABC1234       (no query string)
+//   • legacy query:  https://trkr.gg/t/ABC1234?w=&h=&u=&q=&s=&z=&pv=&v=
+//   • bare no scheme: TRKR.GG/T/ABC1234              (some camera apps strip it)
+// Returns null if it isn't a recognizable target payload. id-only payloads carry
+// no inline calibration — the app resolves those from the catalog / local store.
 export function decodeTargetPayload(text: string): TargetPayload | null {
   if (!text) return null;
+  const trimmed = text.trim();
   let url: URL;
   try {
-    url = new URL(text.trim());
+    url = new URL(trimmed);
   } catch {
-    return null;
+    // No scheme (e.g. "TRKR.GG/T/ABC1234") — retry assuming https.
+    try {
+      url = new URL(`https://${trimmed}`);
+    } catch {
+      return null;
+    }
   }
-  const match = url.pathname.match(/\/t\/([^/]+)\/?$/);
+  // Case-insensitive, un-anchored: matches both /t/ and /T/, stops at ?/#.
+  const match = url.pathname.match(/\/t\/([^/?#]+)/i);
   if (!match) return null;
+  // The id is uppercase Crockford base32 in every form we emit — capture it
+  // verbatim (lookups are case-sensitive). safeDecode is harmless on un-encoded
+  // ids and still unwraps any percent-encoding in legacy prints.
   const id = safeDecode(match[1]);
   if (!id) return null;
 
@@ -151,10 +148,6 @@ export function generateTargetId(length = 7): string {
   let out = "";
   for (let i = 0; i < length; i += 1) out += ID_ALPHABET[bytes[i] % ID_ALPHABET.length];
   return out;
-}
-
-function trimNumber(value: number): string {
-  return String(Number(value.toFixed(4)));
 }
 
 function numberOrUndefined(raw: string | null): number | undefined {

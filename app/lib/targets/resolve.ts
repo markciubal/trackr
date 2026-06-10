@@ -10,6 +10,8 @@ export type TargetRecord = {
   unit: LinearUnit;
   qrSizeValue: number;
   scoringId: string | null;
+  drillRecipe: string | null; // encodeRecipe() output; rebuilds zones by id
+  drillPaletteVersion: number | null;
   isPaid: boolean;
 };
 
@@ -22,7 +24,7 @@ export async function resolveTarget(id: string): Promise<TargetRecord | null> {
 
   const { data } = await supabase
     .from("targets")
-    .select("id,name,width_value,height_value,unit,qr_size_value,scoring_id,is_paid")
+    .select("id,name,width_value,height_value,unit,qr_size_value,scoring_id,drill_recipe,drill_palette_version,is_paid")
     .eq("id", id)
     .maybeSingle();
   if (!data) return null;
@@ -36,6 +38,11 @@ export async function resolveTarget(id: string): Promise<TargetRecord | null> {
     unit,
     qrSizeValue: Number(data.qr_size_value),
     scoringId: data.scoring_id ?? null,
+    drillRecipe: data.drill_recipe ?? null,
+    drillPaletteVersion:
+      data.drill_palette_version === null || data.drill_palette_version === undefined
+        ? null
+        : Number(data.drill_palette_version),
     isPaid: Boolean(data.is_paid),
   };
 }
