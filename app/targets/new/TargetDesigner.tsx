@@ -26,15 +26,50 @@ import {
   SCENARIO_ATTRIBUTE_OPTIONS,
   SCENARIO_PALETTE_VERSION,
   attributesFromZones,
+  decodeRecipe,
   encodeRecipe,
   generateScenarioZones,
   generateSeed,
+  zonesFromRecipe,
   type ScenarioAttribute,
   type ScenarioZone,
 } from "@/app/lib/targets/scenario";
 import { ScenarioBoard } from "@/app/components/scenario/ScenarioBoard";
 
 const UNITS: LinearUnit[] = ["in", "cm", "mm"];
+
+// A target row from GET /api/targets (the signed-in user's saved targets).
+type AccountTargetRow = {
+  id: string;
+  name: string | null;
+  unit: LinearUnit;
+  widthValue: number;
+  heightValue: number;
+  qrSizeValue: number;
+  scoringId: string | null;
+  drillRecipe: string | null;
+  drillPaletteVersion: number | null;
+  createdAt: number;
+};
+
+// Rebuild a local TargetInfo from an account row so it loads/renders the same as
+// a device-saved one — including drill zones reconstructed from the saved recipe.
+function accountRowToTargetInfo(row: AccountTargetRow): TargetInfo {
+  const recipe = row.drillRecipe ? decodeRecipe(row.drillRecipe) : null;
+  const zones = recipe ? zonesFromRecipe(recipe, row.drillPaletteVersion ?? undefined) : undefined;
+  return createTargetInfo({
+    id: row.id,
+    name: row.name ?? "Target",
+    unit: row.unit,
+    widthValue: row.widthValue,
+    heightValue: row.heightValue,
+    qrSizeValue: row.qrSizeValue,
+    scoringId: (row.scoringId as ScoringId | null) ?? "none",
+    zones,
+    drillSeed: recipe?.seed,
+    createdAt: row.createdAt || undefined,
+  });
+}
 
 export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl: string }) {
   const [presetId, setPresetId] = useState(TARGET_PRESETS[0].id);
@@ -52,6 +87,9 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
   const [saveError, setSaveError] = useState<string | null>(null);
   // Locally-saved targets (keyed by their random id), loaded client-side.
   const [savedTargets, setSavedTargets] = useState<TargetInfo[]>([]);
+  // Targets saved to this account (fetched when signed in), so a given id loads
+  // back on any device. Merged with the local ones for display.
+  const [accountTargets, setAccountTargets] = useState<TargetInfo[]>([]);
   const [localSaved, setLocalSaved] = useState(false);
   // Scenario ("drill") mode: scoring "drill" carries shape/color/number/pattern
   // zones, and they ride along inside the QR payload (z param).
@@ -91,31 +129,39 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
     setSavedTargets(listTargets());
   }, []);
 
+  // Pull the account's saved targets when signed in, so ids saved on another
+  // device load back here. Local saves stay the source of truth on conflict.
+  useEffect(() => {
+    if (!canSave) return;
+    let cancelled = false;
+    fetch("/api/targets")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { targets?: AccountTargetRow[] } | null) => {
+        if (cancelled || !data?.targets) return;
+        setAccountTargets(data.targets.map(accountRowToTargetInfo));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [canSave]);
+
+  // Account + local targets, deduped by id (local wins — it reflects the latest
+  // edit on this device), newest first.
+  const allTargets = useMemo(() => {
+    const byId = new Map<string, TargetInfo>();
+    for (const target of accountTargets) byId.set(target.id, target);
+    for (const target of savedTargets) byId.set(target.id, target);
+    return [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
+  }, [accountTargets, savedTargets]);
+
+  // The QR encodes only the target id (HTTPS://<domain>/T/{ID}) — scoring, size,
+  // and drill layout are resolved by that id from the catalog/local store, not
+  // baked in. So the QR image depends solely on the id + base domain; changing
+  // other fields intentionally leaves it unchanged (apply them by saving).
   const payloadUrl = useMemo(
-    () =>
-      targetId
-        ? encodeTargetPayload(
-            {
-              id: targetId,
-              unit,
-              widthValue,
-              heightValue,
-              qrSizeValue,
-              scoringId,
-              // Drill targets carry their layout in the QR so any device that
-              // scans the print can rebuild the exact same drill — as a tiny
-              // seed recipe when we have one, else as the full zone list.
-              drill:
-                scoringId === "drill" && scenarioSeed !== null && scenarioZones.length > 0
-                  ? { count: scenarioZones.length, attributes: scenarioAttrs, seed: scenarioSeed }
-                  : undefined,
-              zones: scoringId === "drill" ? scenarioZones : undefined,
-              version: TARGET_PAYLOAD_VERSION,
-            },
-            baseUrl,
-          )
-        : "",
-    [targetId, unit, widthValue, heightValue, qrSizeValue, scoringId, scenarioZones, scenarioSeed, scenarioAttrs, baseUrl],
+    () => (targetId ? encodeTargetPayload({ id: targetId, unit, version: TARGET_PAYLOAD_VERSION }, baseUrl) : ""),
+    [targetId, unit, baseUrl],
   );
 
   useEffect(() => {
@@ -178,14 +224,6 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
       drillSeed: isScenario ? (scenarioSeed ?? undefined) : undefined,
     });
 
-  // Persist the current design under its random id so it can be reused and
-  // recognized later by the OpenCV QR detector. No account required.
-  const saveLocal = () => {
-    saveTarget(currentTargetInfo());
-    setSavedTargets(listTargets());
-    setLocalSaved(true);
-  };
-
   const loadTarget = (target: TargetInfo) => {
     setTargetId(target.id);
     setName(target.name);
@@ -232,14 +270,32 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
   const deleteTarget = (id: string) => {
     removeTarget(id);
     setSavedTargets(listTargets());
+    if (canSave) {
+      // Also remove it from the account so it doesn't reappear on next load.
+      setAccountTargets((prev) => prev.filter((t) => t.id !== id));
+      fetch(`/api/targets?id=${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
+    }
   };
 
+  // Save the target under its id. Always persists to this device (so it works
+  // offline and the OpenCV detector can recognize it); when signed in, also
+  // saves the id→value to the account so it loads back on any device.
   const save = async () => {
-    setSaveState("saving");
+    const info = currentTargetInfo();
+    saveTarget(info);
+    setSavedTargets(listTargets());
+    setLocalSaved(true);
     setSaveError(null);
+
+    if (!canSave) {
+      setSaveState("idle");
+      return;
+    }
+
+    setSaveState("saving");
     try {
       // Drill targets carry their layout only by id now, so the recipe must be
-      // persisted to the catalog for any device that scans the print to rebuild
+      // persisted to the account for any device that scans the print to rebuild
       // the exact zones (see scenario.ts encodeRecipe / zonesFromParam).
       const drillRecipe =
         scoringId === "drill" && scenarioSeed !== null && scenarioZones.length > 0
@@ -263,13 +319,15 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
       const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
       if (data.ok) {
         setSaveState("saved");
+        // Reflect the just-saved target in the account list immediately.
+        setAccountTargets((prev) => [info, ...prev.filter((t) => t.id !== info.id)]);
       } else {
         setSaveState("error");
-        setSaveError(data.error ?? "Could not save.");
+        setSaveError(data.error ?? "Saved on this device, but couldn't save to your account.");
       }
     } catch {
       setSaveState("error");
-      setSaveError("Network error.");
+      setSaveError("Saved on this device, but couldn't reach your account.");
     }
   };
 
@@ -331,7 +389,10 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
                 min={0}
                 step="any"
                 value={widthValue}
-                onChange={(event) => setWidthValue(Number(event.target.value))}
+                onChange={(event) => {
+                  setWidthValue(Number(event.target.value));
+                  setLocalSaved(false);
+                }}
                 className={`mt-1 ${numberInput}`}
               />
             </label>
@@ -342,7 +403,10 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
                 min={0}
                 step="any"
                 value={heightValue}
-                onChange={(event) => setHeightValue(Number(event.target.value))}
+                onChange={(event) => {
+                  setHeightValue(Number(event.target.value));
+                  setLocalSaved(false);
+                }}
                 className={`mt-1 ${numberInput}`}
               />
             </label>
@@ -350,7 +414,10 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
               <span className="text-xs text-gray-400">Units</span>
               <select
                 value={unit}
-                onChange={(event) => setUnit(event.target.value as LinearUnit)}
+                onChange={(event) => {
+                  setUnit(event.target.value as LinearUnit);
+                  setLocalSaved(false);
+                }}
                 className="mt-1 w-full rounded-md border border-gray-700 bg-black px-2 py-1.5 text-sm"
               >
                 {UNITS.map((u) => (
@@ -370,7 +437,10 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
                 min={0}
                 step="any"
                 value={qrSizeValue}
-                onChange={(event) => setQrSizeValue(Number(event.target.value))}
+                onChange={(event) => {
+                  setQrSizeValue(Number(event.target.value));
+                  setLocalSaved(false);
+                }}
                 className={`mt-1 ${numberInput}`}
               />
             </label>
@@ -530,32 +600,39 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
             </button>
             <button
               type="button"
-              onClick={saveLocal}
-              className="rounded-md border border-emerald-400/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100 transition hover:bg-emerald-500/20"
+              onClick={save}
+              disabled={saveState === "saving"}
+              className="rounded-md border border-emerald-400/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100 transition hover:bg-emerald-500/20 disabled:opacity-50"
             >
-              {localSaved ? "Saved ✓" : "Save target"}
+              {saveState === "saving"
+                ? "Saving…"
+                : localSaved
+                  ? canSave
+                    ? "Saved to account ✓"
+                    : "Saved ✓"
+                  : canSave
+                    ? "Save to account"
+                    : "Save target"}
             </button>
-            {canSave ? (
-              <button
-                type="button"
-                onClick={save}
-                disabled={saveState === "saving"}
-                className="rounded-md border border-emerald-400/40 px-3 py-2 text-sm text-emerald-100 transition hover:bg-emerald-500/10 disabled:opacity-50"
-              >
-                {saveState === "saving" ? "Saving…" : saveState === "saved" ? "Saved ✓" : "Save to catalog"}
-              </button>
-            ) : null}
           </div>
+          {!localSaved ? (
+            <p className="rounded-md border border-amber-400/30 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-100">
+              The QR encodes only the target ID, so it doesn&apos;t change when you edit. Scoring, size, and drill changes
+              reach a scan only after you <span className="font-semibold">Save</span>.
+            </p>
+          ) : null}
           {saveError ? <p className="text-xs text-rose-300">{saveError}</p> : null}
           <p className="break-all font-mono text-[10px] text-gray-600" suppressHydrationWarning>
             {payloadUrl}
           </p>
 
-          {savedTargets.length > 0 ? (
+          {allTargets.length > 0 ? (
             <div className="border-t border-gray-800 pt-3">
-              <p className="text-xs font-semibold text-gray-300">My targets ({savedTargets.length})</p>
+              <p className="text-xs font-semibold text-gray-300">
+                My targets ({allTargets.length}){canSave ? " · synced to your account" : ""}
+              </p>
               <ul className="mt-2 space-y-1">
-                {savedTargets.map((target) => (
+                {allTargets.map((target) => (
                   <li
                     key={target.id}
                     className={`flex items-center gap-2 rounded-md border px-2 py-1.5 text-xs ${

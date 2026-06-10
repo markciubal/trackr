@@ -97,3 +97,7 @@ create policy "targets_insert_own" on public.targets
 drop policy if exists "targets_update_own" on public.targets;
 create policy "targets_update_own" on public.targets
   for update using (auth.uid() = owner_id) with check (auth.uid() = owner_id);
+
+drop policy if exists "targets_delete_own" on public.targets;
+create policy "targets_delete_own" on public.targets
+  for delete using (auth.uid() = owner_id);
