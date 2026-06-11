@@ -90,6 +90,8 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
   // Targets saved to this account (fetched when signed in), so a given id loads
   // back on any device. Merged with the local ones for display.
   const [accountTargets, setAccountTargets] = useState<TargetInfo[]>([]);
+  // Human-readable account sync status, so list/sync failures are visible.
+  const [accountStatus, setAccountStatus] = useState<string | null>(null);
   const [localSaved, setLocalSaved] = useState(false);
   // Scenario ("drill") mode: scoring "drill" carries shape/color/number/pattern
   // zones, and they ride along inside the QR payload (z param).
@@ -129,18 +131,81 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
     setSavedTargets(listTargets());
   }, []);
 
-  // Pull the account's saved targets when signed in, so ids saved on another
-  // device load back here. Local saves stay the source of truth on conflict.
+  // When signed in: load the account's saved targets, then push up any local
+  // targets the account doesn't have yet. The push is what rescues designs saved
+  // before sign-in (or before account-sync existed) — they only lived in this
+  // browser's localStorage, so this is the first time they reach the account.
+  // Status is surfaced so failures aren't silent.
   useEffect(() => {
     if (!canSave) return;
     let cancelled = false;
-    fetch("/api/targets")
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data: { targets?: AccountTargetRow[] } | null) => {
-        if (cancelled || !data?.targets) return;
-        setAccountTargets(data.targets.map(accountRowToTargetInfo));
-      })
-      .catch(() => {});
+    (async () => {
+      let account: TargetInfo[];
+      try {
+        const res = await fetch("/api/targets");
+        if (!res.ok) {
+          if (!cancelled) setAccountStatus(`Couldn't load account targets (HTTP ${res.status}).`);
+          return;
+        }
+        const data = (await res.json()) as { targets?: AccountTargetRow[] };
+        account = (data.targets ?? []).map(accountRowToTargetInfo);
+      } catch {
+        if (!cancelled) setAccountStatus("Couldn't reach your account (offline?).");
+        return;
+      }
+      if (cancelled) return;
+      setAccountTargets(account);
+      setAccountStatus(`${account.length} in your account.`);
+
+      const accountIds = new Set(account.map((t) => t.id));
+      const toSync = listTargets().filter((t) => !accountIds.has(t.id));
+      if (!toSync.length) return;
+
+      const synced: TargetInfo[] = [];
+      let firstError: string | null = null;
+      for (const t of toSync) {
+        if (cancelled) return;
+        const drillRecipe =
+          t.zones?.length && typeof t.drillSeed === "number"
+            ? encodeRecipe({ count: t.zones.length, attributes: attributesFromZones(t.zones), seed: t.drillSeed })
+            : null;
+        try {
+          const res = await fetch("/api/targets", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              id: t.id,
+              name: t.name,
+              unit: t.unit,
+              widthValue: t.widthValue,
+              heightValue: t.heightValue,
+              qrSizeValue: t.qrSizeValue,
+              scoringId: t.scoringId,
+              drillRecipe,
+              drillPaletteVersion: drillRecipe ? SCENARIO_PALETTE_VERSION : null,
+            }),
+          });
+          const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+          if (data.ok) synced.push(t);
+          else if (!firstError) firstError = data.error ?? `HTTP ${res.status}`;
+        } catch {
+          if (!firstError) firstError = "network error";
+        }
+      }
+      if (cancelled) return;
+      if (synced.length) {
+        setAccountTargets((prev) => {
+          const byId = new Map(prev.map((t) => [t.id, t] as const));
+          for (const t of synced) byId.set(t.id, t);
+          return [...byId.values()];
+        });
+      }
+      setAccountStatus(
+        `${account.length + synced.length} in your account` +
+          (synced.length ? ` · synced ${synced.length} from this device` : "") +
+          (firstError ? ` · ${toSync.length - synced.length} failed (${firstError})` : ""),
+      );
+    })();
     return () => {
       cancelled = true;
     };
@@ -626,11 +691,12 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
             {payloadUrl}
           </p>
 
-          {allTargets.length > 0 ? (
+          {allTargets.length > 0 || (canSave && accountStatus) ? (
             <div className="border-t border-gray-800 pt-3">
-              <p className="text-xs font-semibold text-gray-300">
-                My targets ({allTargets.length}){canSave ? " · synced to your account" : ""}
-              </p>
+              <p className="text-xs font-semibold text-gray-300">My targets ({allTargets.length})</p>
+              {canSave && accountStatus ? (
+                <p className="text-[10px] text-gray-500">{accountStatus}</p>
+              ) : null}
               <ul className="mt-2 space-y-1">
                 {allTargets.map((target) => (
                   <li

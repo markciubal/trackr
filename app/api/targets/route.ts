@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/app/lib/supabase/server";
 
 export const runtime = "nodejs";
+// Reads the auth cookie + per-user data; never serve a cached response.
+export const dynamic = "force-dynamic";
 
 // Save a designed target to the catalog so its QR id resolves to rich data.
 export async function POST(request: Request) {
