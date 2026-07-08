@@ -20,12 +20,23 @@ import {
   generateScenarioZones,
   generateSeed,
   generateTimedSchedule,
+  randomZoneStep,
   registerHit,
   scoreDrill,
   startDrill,
   zonesFromRecipe,
 } from "@/app/lib/targets/scenario";
-import { cancelSpeech, speak, speakSequence } from "@/app/lib/targets/speech";
+import {
+  DEFAULT_VOICE_SETTINGS,
+  type VoiceSettings,
+  canSpeak,
+  cancelSpeech,
+  listVoices,
+  loadVoiceSettings,
+  setVoiceSettings,
+  speak,
+  speakSequence,
+} from "@/app/lib/targets/speech";
 import {
   createTargetInfo,
   getTarget,
@@ -57,7 +68,8 @@ export function DrillRunner() {
   );
   const [zoneCount, setZoneCount] = useState(6);
   const [attrs, setAttrs] = useState<ScenarioAttribute[]>(DEFAULT_SCENARIO_ATTRIBUTES);
-  const [mode, setMode] = useState<CalloutMode>("sequence");
+  // Random timing is the default — the most realistic training mode.
+  const [mode, setMode] = useState<CalloutMode>("timed");
   const [length, setLength] = useState(6);
   // Timed mode: approximate drill length in seconds. The real span is jittered
   // ±25% per run and the callout moments inside it are random.
@@ -70,6 +82,35 @@ export function DrillRunner() {
   // shuffling, zone-count, or attribute changes — the on-screen drill must keep
   // matching the physical print. Unlocking detaches from the target.
   const [lockedSource, setLockedSource] = useState<string | null>(null);
+  // Voice settings popover: which system voice reads the callouts + rate/pitch/
+  // volume. Persisted (localStorage) and applied to every utterance.
+  const [showVoiceSettings, setShowVoiceSettings] = useState(false);
+  const [voiceSettings, setVoiceSettingsState] = useState<VoiceSettings>(DEFAULT_VOICE_SETTINGS);
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+
+  useEffect(() => {
+    // Load the persisted settings and the device's installed voices (the list
+    // often arrives asynchronously via "voiceschanged").
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setVoiceSettingsState(loadVoiceSettings());
+    const refreshVoices = () => setVoices(listVoices());
+    refreshVoices();
+    if (canSpeak()) window.speechSynthesis.addEventListener?.("voiceschanged", refreshVoices);
+    return () => {
+      if (canSpeak()) window.speechSynthesis.removeEventListener?.("voiceschanged", refreshVoices);
+    };
+  }, []);
+
+  const updateVoiceSettings = (patch: Partial<VoiceSettings>) => {
+    const next = { ...voiceSettings, ...patch };
+    setVoiceSettingsState(next);
+    setVoiceSettings(next); // applies to all speech + persists
+  };
+
+  const testVoice = () => {
+    cancelSpeech();
+    speak("Red. 12. Striped. Go!");
+  };
   // How far the announcer has gotten (timed mode): hits past this index wait
   // for their callout, and the banner hides not-yet-called steps.
   const [announcedIndex, setAnnouncedIndex] = useState(-1);
@@ -82,6 +123,15 @@ export function DrillRunner() {
     calloutAtMs: number[];
     endAtMs: number;
   } | null>(null);
+  // Pause support: while paused, hits are ignored, speech stops, and (timed
+  // mode) the pending callout timers are disarmed. timedElapsedMsRef tracks how
+  // much of the timed schedule already ran, so resuming re-arms the remaining
+  // callouts with their remaining delays; pausedAtRef shifts the reaction clock
+  // so pause time never counts against the shooter.
+  const [paused, setPaused] = useState(false);
+  const pausedAtRef = useRef(0);
+  const armedAtRef = useRef(0);
+  const timedElapsedMsRef = useRef(0);
   const stepStartRef = useRef<number>(0);
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -206,8 +256,12 @@ export function DrillRunner() {
   // cleanup) and is where timer-driven work belongs. Each callout first scores
   // any still-unanswered earlier call as a miss, then announces its step.
   useEffect(() => {
-    if (!timedRun) return;
+    if (!timedRun || paused) return;
     const { steps, calloutAtMs, endAtMs } = timedRun;
+    // Re-arm relative to how much of the schedule already ran before a pause
+    // (0 on a fresh start): each pending callout keeps its remaining delay.
+    const alreadyMs = timedElapsedMsRef.current;
+    armedAtRef.current = Date.now();
 
     const advanceMisses = (uptoIndex: number): DrillState | null => {
       let state = drillRef.current;
@@ -253,17 +307,70 @@ export function DrillRunner() {
 
     const timers: number[] = [];
     for (let index = 0; index < calloutAtMs.length; index += 1) {
-      timers.push(window.setTimeout(() => fireCallout(index), calloutAtMs[index]));
+      const delayMs = calloutAtMs[index] - alreadyMs;
+      if (delayMs <= 0) continue; // fired before the pause
+      timers.push(window.setTimeout(() => fireCallout(index), delayMs));
     }
-    timers.push(window.setTimeout(finish, endAtMs));
+    timers.push(window.setTimeout(finish, Math.max(0, endAtMs - alreadyMs)));
     return () => {
       for (const timer of timers) window.clearTimeout(timer);
     };
-  }, [timedRun]);
+  }, [timedRun, paused]);
+
+  // Pause: freeze the drill. Speech stops, hits are ignored, and the reaction
+  // clock (plus the timed schedule) stops counting until Resume.
+  const pauseDrill = () => {
+    if (phase !== "playing" || paused) return;
+    cancelSpeech();
+    pausedAtRef.current = Date.now();
+    if (mode === "timed" && timedRun) {
+      timedElapsedMsRef.current += Math.max(0, Date.now() - armedAtRef.current);
+    }
+    setPaused(true);
+  };
+
+  const resumeDrill = () => {
+    if (!paused) return;
+    setPaused(false);
+    // Re-speak the pending call so the shooter doesn't resume blind.
+    if (mode === "reactive" && drill) {
+      const step = currentStep(drill);
+      if (step) announceStep(step);
+    } else if (mode === "timed" && drill && drill.index === announcedIndexRef.current) {
+      const step = drill.steps[announcedIndexRef.current];
+      if (step) speak(step.spoken);
+    }
+  };
+
+  // On resume, restart the current step's reaction window — pause time never
+  // counts against the shooter. (Effect scope so the clock read is legal.)
+  useEffect(() => {
+    if (paused || pausedAtRef.current === 0) return;
+    pausedAtRef.current = 0;
+    stepStartRef.current = Date.now();
+  }, [paused]);
+
+  // Stop: abandon the run entirely and go back to setup (zones untouched).
+  const stopDrill = () => {
+    cancelSpeech();
+    setTimedRun(null);
+    setPaused(false);
+    timedElapsedMsRef.current = 0;
+    pausedAtRef.current = 0;
+    announcedIndexRef.current = -1;
+    setAnnouncedIndex(-1);
+    drillRef.current = null;
+    setDrill(null);
+    setPhase("setup");
+    setFeedback({});
+  };
 
   const start = () => {
     cancelSpeech();
     setTimedRun(null);
+    setPaused(false);
+    timedElapsedMsRef.current = 0;
+    pausedAtRef.current = 0;
     setFeedback({});
     announcedIndexRef.current = -1;
     setAnnouncedIndex(-1);
@@ -325,7 +432,7 @@ export function DrillRunner() {
   };
 
   const handleHit = (zoneId: string) => {
-    if (phase !== "playing" || !drill) return;
+    if (phase !== "playing" || !drill || paused) return;
     // Timed mode: the shooter can't answer a call that hasn't happened yet —
     // after answering the current call, further hits wait for the next one.
     if (mode === "timed" && drill.index > announcedIndexRef.current) return;
@@ -370,6 +477,18 @@ export function DrillRunner() {
     setLockedSource(null);
   };
 
+  // Ad-hoc callout: pressing any zone immediately speaks ONE random property of
+  // it (among the enabled attributes) — as if that target were called on the
+  // spot. Outside a run it replaces any pending speech; during a run it queues
+  // behind the live callouts so they're never cut off.
+  const handleZonePress = (zoneId: string) => {
+    if (phase === "announcing" || paused) return;
+    const zone = zones.find((candidate) => candidate.id === zoneId);
+    if (!zone) return;
+    if (phase !== "playing") cancelSpeech();
+    speak(randomZoneStep(zone, attrs).spoken);
+  };
+
   const saveScenario = () => {
     const info = createTargetInfo({
       name: `Scenario ${zones.length}-zone`,
@@ -407,6 +526,8 @@ export function DrillRunner() {
               <p className="text-sm text-gray-400">Press Start. The app calls a sequence — shoot the zones in that order.</p>
             ) : phase === "announcing" ? (
               <p className="text-lg font-semibold text-amber-200">Listen…</p>
+            ) : phase === "playing" && paused ? (
+              <p className="text-lg font-semibold text-sky-200">⏸ Paused — hits are ignored until you resume.</p>
             ) : phase === "playing" && mode === "timed" && drill && drill.index > announcedIndex ? (
               // Timed mode between calls: the next step exists but hasn't been
               // announced yet — don't reveal it.
@@ -457,6 +578,7 @@ export function DrillRunner() {
             feedback={feedback}
             interactive={phase === "playing"}
             onHitZone={handleHit}
+            onZonePress={handleZonePress}
           />
           <p className="text-[11px] text-gray-500">
             Tap/click a zone to register a hit. (This same engine accepts live shot-detection impacts — that wiring is
@@ -466,7 +588,106 @@ export function DrillRunner() {
 
         {/* Controls */}
         <aside className="space-y-4">
-          <h1 className="text-xl font-semibold">Scenario drill</h1>
+          <div className="flex items-center justify-between gap-2">
+            <h1 className="text-xl font-semibold">Scenario drill</h1>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowVoiceSettings((prev) => !prev)}
+                aria-expanded={showVoiceSettings}
+                aria-label="Voice settings"
+                title="Voice settings"
+                className="rounded-md border border-gray-700 px-2.5 py-1.5 text-sm text-gray-300 transition hover:bg-neutral-900"
+              >
+                ⚙️ Voice
+              </button>
+              {showVoiceSettings ? (
+                <div className="absolute right-0 top-full z-20 mt-2 w-72 space-y-3 rounded-lg border border-gray-700 bg-neutral-950 p-3 shadow-xl">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-semibold text-gray-200">Callout voice</p>
+                    <button
+                      type="button"
+                      onClick={() => setShowVoiceSettings(false)}
+                      aria-label="Close voice settings"
+                      className="text-gray-500 transition hover:text-gray-200"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Voice</span>
+                    <select
+                      value={voiceSettings.voiceURI ?? ""}
+                      onChange={(event) => updateVoiceSettings({ voiceURI: event.target.value || null })}
+                      className="mt-1 w-full rounded-md border border-gray-700 bg-black px-2 py-1.5 text-xs"
+                    >
+                      <option value="">System default</option>
+                      {voices.map((voice) => (
+                        <option key={voice.voiceURI} value={voice.voiceURI}>
+                          {voice.name} ({voice.lang}){voice.default ? " · default" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="mt-1 text-[10px] leading-relaxed text-gray-500">
+                      Male, female, and accent options come from the voices installed on this device.
+                    </p>
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Speed: {voiceSettings.rate.toFixed(2)}×</span>
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={2}
+                      step={0.05}
+                      value={voiceSettings.rate}
+                      onChange={(event) => updateVoiceSettings({ rate: Number(event.target.value) })}
+                      className="mt-1 w-full"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Pitch: {voiceSettings.pitch.toFixed(2)}</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={2}
+                      step={0.05}
+                      value={voiceSettings.pitch}
+                      onChange={(event) => updateVoiceSettings({ pitch: Number(event.target.value) })}
+                      className="mt-1 w-full"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Volume: {Math.round(voiceSettings.volume * 100)}%</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={voiceSettings.volume}
+                      onChange={(event) => updateVoiceSettings({ volume: Number(event.target.value) })}
+                      className="mt-1 w-full"
+                    />
+                  </label>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={testVoice}
+                      className="flex-1 rounded-md border border-sky-400/40 bg-sky-500/15 px-2 py-1.5 text-xs font-medium text-sky-100 transition hover:bg-sky-500/25"
+                    >
+                      ▶ Test voice
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updateVoiceSettings({ ...DEFAULT_VOICE_SETTINGS })}
+                      className="rounded-md border border-gray-600 px-2 py-1.5 text-xs text-gray-200 transition hover:bg-neutral-800"
+                    >
+                      Reset
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </div>
 
           <div className="space-y-3 rounded-lg border border-gray-800 p-3">
             {lockedSource ? (
@@ -552,6 +773,15 @@ export function DrillRunner() {
               <div className="mt-1 grid grid-cols-2 gap-2">
                 <button
                   type="button"
+                  onClick={() => chooseMode("timed")}
+                  className={`col-span-2 rounded-md border px-2 py-1.5 text-xs ${
+                    mode === "timed" ? "border-sky-400/50 bg-sky-500/15 text-sky-100" : "border-gray-700 text-gray-300"
+                  }`}
+                >
+                  Random timing — calls at surprise moments
+                </button>
+                <button
+                  type="button"
                   onClick={() => chooseMode("sequence")}
                   className={`rounded-md border px-2 py-1.5 text-xs ${
                     mode === "sequence" ? "border-sky-400/50 bg-sky-500/15 text-sky-100" : "border-gray-700 text-gray-300"
@@ -567,15 +797,6 @@ export function DrillRunner() {
                   }`}
                 >
                   One at a time
-                </button>
-                <button
-                  type="button"
-                  onClick={() => chooseMode("timed")}
-                  className={`col-span-2 rounded-md border px-2 py-1.5 text-xs ${
-                    mode === "timed" ? "border-sky-400/50 bg-sky-500/15 text-sky-100" : "border-gray-700 text-gray-300"
-                  }`}
-                >
-                  Random timing — calls at surprise moments
                 </button>
               </div>
               {mode === "timed" ? (
@@ -605,6 +826,24 @@ export function DrillRunner() {
               >
                 {phase === "playing" || phase === "done" ? "Restart" : "Start"}
               </button>
+              {phase === "playing" ? (
+                <button
+                  type="button"
+                  onClick={paused ? resumeDrill : pauseDrill}
+                  className="rounded-md border border-sky-400/40 bg-sky-500/15 px-3 py-2 text-sm font-medium text-sky-100 transition hover:bg-sky-500/25"
+                >
+                  {paused ? "▶ Resume" : "⏸ Pause"}
+                </button>
+              ) : null}
+              {phase === "playing" || phase === "announcing" ? (
+                <button
+                  type="button"
+                  onClick={stopDrill}
+                  className="rounded-md border border-rose-400/40 bg-rose-500/10 px-3 py-2 text-sm font-medium text-rose-100 transition hover:bg-rose-500/20"
+                >
+                  ⏹ Stop
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={() => regenerate()}

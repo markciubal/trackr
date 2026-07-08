@@ -1,11 +1,33 @@
 "use client";
 
-import { useId } from "react";
+import { useEffect, useId, useState } from "react";
 import { useColorBlindMode } from "@/app/lib/accessibility";
-import { colorMeta, zonePattern, type ScenarioZone, type ZonePattern } from "@/app/lib/targets/scenario";
+import {
+  attributesFromZones,
+  colorMeta,
+  patternSpoken,
+  shapeSpoken,
+  zonePattern,
+  type ScenarioZone,
+  type ZonePattern,
+} from "@/app/lib/targets/scenario";
 
 // Visual feedback per zone after a hit is registered.
 export type ZoneFeedback = Record<string, "correct" | "wrong">;
+
+// Human-readable trait list for a zone, e.g. "Square · Yellow · Solid · 12".
+// Disabled attributes (black fill, number 0) are omitted. When patterns are in
+// play for this zone set, "Solid" is a real, callable pattern value and is
+// named like any other; when the pattern attribute is off entirely (every zone
+// solid), it's omitted as noise.
+function zoneTraits(zone: ScenarioZone, includeNumber: boolean, patternsInPlay: boolean): string {
+  const parts = [shapeSpoken(zone.shape)];
+  if (zone.color !== "black") parts.push(colorMeta(zone.color).spoken);
+  const pattern = zonePattern(zone);
+  if (patternsInPlay || pattern !== "solid") parts.push(patternSpoken(pattern));
+  if (includeNumber && zone.number > 0) parts.push(String(zone.number));
+  return parts.join(" · ");
+}
 
 // Returns the SVG points for a regular polygon / star / cross inscribed in a
 // circle of radius r at (cx, cy). Coordinates are in the 0..100 viewBox space.
@@ -130,6 +152,7 @@ export function ScenarioBoard({
   zones,
   onHitZone,
   onMiss,
+  onZonePress,
   feedback = {},
   interactive = true,
   bare = false,
@@ -138,6 +161,10 @@ export function ScenarioBoard({
   zones: ScenarioZone[];
   onHitZone?: (zoneId: string) => void;
   onMiss?: () => void;
+  // Fires for EVERY press on a zone, in every phase (unlike onHitZone, which
+  // only fires while interactive). Used for ad-hoc feedback like speaking a
+  // property of the pressed zone.
+  onZonePress?: (zoneId: string) => void;
   feedback?: ZoneFeedback;
   interactive?: boolean;
   // bare = no card chrome/background; for overlaying onto a printable target.
@@ -148,9 +175,18 @@ export function ScenarioBoard({
   // (designer preview + drill page). Sanitized because useId's ":" breaks url(#…).
   const patternPrefix = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const [colorBlind] = useColorBlindMode();
+  // Click-to-inspect: the last clicked zone's full trait readout, shown in a
+  // banner at the top of the board for a moment (works in every phase — during
+  // play it rides along with the hit registration).
+  const [inspectedId, setInspectedId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!inspectedId) return;
+    const timer = window.setTimeout(() => setInspectedId(null), 2500);
+    return () => window.clearTimeout(timer);
+  }, [inspectedId]);
 
   const handleClick = (event: React.MouseEvent<SVGSVGElement>) => {
-    if (!interactive) return;
     const svg = event.currentTarget;
     const rect = svg.getBoundingClientRect();
     const x = (event.clientX - rect.left) / rect.width;
@@ -165,9 +201,16 @@ export function ScenarioBoard({
         hit = zone.id;
       }
     }
+    setInspectedId(hit);
+    if (hit) onZonePress?.(hit);
+    if (!interactive) return;
     if (hit) onHitZone?.(hit);
     else onMiss?.();
   };
+
+  const inspectedZone = inspectedId ? (zones.find((zone) => zone.id === inspectedId) ?? null) : null;
+  // "Solid" is only worth naming when patterns actually distinguish zones here.
+  const patternsInPlay = attributesFromZones(zones).includes("pattern");
 
   return (
     <svg
@@ -203,6 +246,8 @@ export function ScenarioBoard({
         // Yellow needs a dark number for contrast; everything else gets white.
         const textColor = zone.color === "yellow" ? "#111827" : "#ffffff";
         const fill = pattern === "solid" ? meta.hex : `url(#${patternPrefix}-${zone.id})`;
+        const r = zone.radius * 100;
+        const captionSize = Math.max(1.7, Math.min(2.4, r * 0.17));
         return (
           <g key={zone.id} opacity={state === "wrong" ? 0.55 : 1}>
             <ZoneShapeEl zone={zone} fill={fill} stroke={stroke} />
@@ -225,9 +270,49 @@ export function ScenarioBoard({
                 {zone.number}
               </text>
             ) : null}
+            {/* Very small trait caption under the symbol (shape · color · pattern). */}
+            <text
+              x={cx}
+              y={cy + r + 0.8}
+              fontSize={captionSize}
+              textAnchor="middle"
+              dominantBaseline="hanging"
+              pointerEvents="none"
+              fill={bare ? "#374151" : "#9ca3af"}
+              style={{ fontFamily: "var(--font-jetbrains-mono), monospace" }}
+            >
+              {zoneTraits(zone, false, patternsInPlay)}
+            </text>
           </g>
         );
       })}
+      {/* Click-to-inspect banner: the clicked zone's full characteristics. */}
+      {inspectedZone ? (
+        <g pointerEvents="none">
+          <rect
+            x={2}
+            y={1.5}
+            width={96}
+            height={6.4}
+            rx={1.2}
+            fill={bare ? "#ffffff" : "rgba(9, 9, 11, 0.88)"}
+            stroke={bare ? "#111827" : "#52525b"}
+            strokeWidth={0.25}
+          />
+          <text
+            x={50}
+            y={4.7}
+            textAnchor="middle"
+            dominantBaseline="central"
+            fontSize={3.2}
+            fontWeight={600}
+            fill={bare ? "#111827" : "#f9fafb"}
+            style={{ fontFamily: "var(--font-jetbrains-mono), monospace" }}
+          >
+            {zoneTraits(inspectedZone, true, patternsInPlay)}
+          </text>
+        </g>
+      ) : null}
     </svg>
   );
 }

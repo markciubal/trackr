@@ -453,6 +453,25 @@ export function decodeZones(
   return zones;
 }
 
+// One ad-hoc callout for a single zone: a randomly chosen attribute (among the
+// enabled ones that actually apply to this zone), phrased exactly like a drill
+// step would be. Used when a zone is pressed directly — the app announces a
+// random property of it on the spot.
+export function randomZoneStep(
+  zone: ScenarioZone,
+  attributes: ScenarioAttribute[],
+  rng: () => number = Math.random,
+): DrillStep {
+  const applicable = (attributes.length > 0 ? attributes : DEFAULT_SCENARIO_ATTRIBUTES).filter((attr) => {
+    if (attr === "color") return zone.color !== "black";
+    if (attr === "number") return zone.number > 0;
+    return true; // shape always applies; pattern includes "Solid" as a real value
+  });
+  const kinds = applicable.length > 0 ? applicable : (["shape"] as ScenarioAttribute[]);
+  const kind = kinds[Math.floor(rng() * kinds.length)];
+  return makeStep(zone, kind);
+}
+
 function makeStep(zone: ScenarioZone, kind: PromptKind): DrillStep {
   if (kind === "color") {
     const meta = colorMeta(zone.color);

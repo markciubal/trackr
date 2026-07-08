@@ -5151,6 +5151,46 @@ export default function Home() {
   useEffect(() => {
     showDetailedViewsRef.current = showDetailedViews;
   }, [showDetailedViews]);
+  // Live-stream re-baseline: when set, the scan loop re-anchors the "known
+  // image" — the CURRENT camera view of the target becomes both the tracking
+  // template and the clean background for subtraction. Logged shots stay.
+  const rebaselineRequestedRef = useRef(false);
+  // Keep the phone screen awake while a live camera scan runs — mobile screens
+  // sleeping mid-scan kill the stream. Best-effort (API optional, may be
+  // denied); re-acquired when the tab becomes visible again.
+  const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
+  useEffect(() => {
+    if (!(isScanning && captureMode === "stream")) return;
+    const nav = navigator as Navigator & {
+      wakeLock?: { request: (type: "screen") => Promise<{ release: () => Promise<void> }> };
+    };
+    if (!nav.wakeLock) return;
+    let cancelled = false;
+    const acquire = async () => {
+      try {
+        const sentinel = await nav.wakeLock!.request("screen");
+        if (cancelled) {
+          void sentinel.release().catch(() => undefined);
+          return;
+        }
+        wakeLockRef.current = sentinel;
+      } catch {
+        // Permission/battery policy — the scan still runs, screen may sleep.
+      }
+    };
+    void acquire();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void acquire();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      const sentinel = wakeLockRef.current;
+      wakeLockRef.current = null;
+      if (sentinel) void sentinel.release().catch(() => undefined);
+    };
+  }, [isScanning, captureMode]);
   // Audio-gated scanning: skip playback straight to the 0.5s windows around
   // detected gunshot spikes. Turn off to scan every frame — the fallback when
   // the clip's audio doesn't line up with the visible impacts.
@@ -5174,6 +5214,89 @@ export default function Home() {
   const trailEndCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const trailAudioCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const lastTrailDrawAtMsRef = useRef(0);
+  // Sound-track hover inspector: every audio data point at the hovered instant.
+  const scanDurationSecRef = useRef(0);
+  const [audioHover, setAudioHover] = useState<{ xPct: number; lines: string[] } | null>(null);
+
+  const handleAudioTrailHover = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
+    const durationSec = scanDurationSecRef.current;
+    const samples = audioRmsTimelineRef.current;
+    if (durationSec <= 0 || samples.length === 0) {
+      setAudioHover(null);
+      return;
+    }
+    const timeSec = frac * durationSec;
+
+    let nearestSample = samples[0];
+    let nearestSampleDelta = Number.POSITIVE_INFINITY;
+    for (const sample of samples) {
+      const delta = Math.abs(sample.timeSec - timeSec);
+      if (delta < nearestSampleDelta) {
+        nearestSampleDelta = delta;
+        nearestSample = sample;
+      }
+    }
+    const meanDbfs = audioMeanDbfsRef.current;
+    const thresholdDbfs = audioThresholdDbfsRef.current;
+
+    const spikes = spikeEventsRef.current;
+    let nearestSpike: SpikeMetadata | null = null;
+    let nearestSpikeDelta = Number.POSITIVE_INFINITY;
+    let previousSpike: SpikeMetadata | null = null;
+    let nextSpike: SpikeMetadata | null = null;
+    for (const spike of spikes) {
+      const delta = Math.abs(spike.timeSec - timeSec);
+      if (delta < nearestSpikeDelta) {
+        nearestSpikeDelta = delta;
+        nearestSpike = spike;
+      }
+      if (spike.timeSec <= timeSec && (!previousSpike || spike.timeSec > previousSpike.timeSec)) previousSpike = spike;
+      if (spike.timeSec > timeSec && (!nextSpike || spike.timeSec < nextSpike.timeSec)) nextSpike = spike;
+    }
+
+    const windows = spikeWindowsRef.current;
+    const windowIdx = windowIndexAtTime(timeSec, windows);
+
+    const lines: string[] = [];
+    const deltaFromMean = nearestSample.dbfs - meanDbfs;
+    lines.push(`t ${timeSec.toFixed(2)}s · loudness ${nearestSample.dbfs.toFixed(1)} dBFS (rms ${nearestSample.rms.toFixed(4)})`);
+    lines.push(
+      `vs mean ${deltaFromMean >= 0 ? "+" : ""}${deltaFromMean.toFixed(1)} dB · mean ${meanDbfs.toFixed(1)} · spike tolerance ${thresholdDbfs.toFixed(1)} dBFS${
+        nearestSample.dbfs >= thresholdDbfs ? " · ABOVE tolerance" : ""
+      }`,
+    );
+    if (windowIdx >= 0) {
+      const win = windows[windowIdx];
+      const winEnd = Number.isFinite(win.end) ? win.end.toFixed(2) : "∞";
+      const winLen = Number.isFinite(win.end) ? `${(win.end - win.start).toFixed(2)}s long` : "open-ended";
+      lines.push(`scan window ${windowIdx + 1}/${windows.length}: ${win.start.toFixed(2)}–${winEnd}s (${winLen})`);
+    } else {
+      lines.push("outside every scan window — frames here are skipped");
+    }
+    if (nearestSpike) {
+      const spikeDelta = timeSec - nearestSpike.timeSec;
+      lines.push(
+        `nearest bang @ ${nearestSpike.timeSec.toFixed(2)}s (Δ ${spikeDelta >= 0 ? "+" : ""}${spikeDelta.toFixed(2)}s) · peak ${rmsToDbfs(
+          nearestSpike.strength,
+        ).toFixed(1)} dBFS`,
+      );
+      const subPeaks = nearestSpike.subPeakTimesSec;
+      const spreadSec = subPeaks.length > 1 ? subPeaks[subPeaks.length - 1] - subPeaks[0] : 0;
+      lines.push(
+        `echo sub-peaks ${subPeaks.length} · spread ${spreadSec.toFixed(2)}s · signature #${nearestSpike.signatureId} (${nearestSpike.signatureKey || "–"})`,
+      );
+    }
+    if (previousSpike || nextSpike) {
+      const spacing: string[] = [];
+      if (previousSpike) spacing.push(`prev ${(timeSec - previousSpike.timeSec).toFixed(2)}s ago`);
+      if (nextSpike) spacing.push(`next in ${(nextSpike.timeSec - timeSec).toFixed(2)}s`);
+      if (previousSpike && nextSpike) spacing.push(`period ${(nextSpike.timeSec - previousSpike.timeSec).toFixed(2)}s`);
+      lines.push(`shot spacing: ${spacing.join(" · ")}`);
+    }
+    setAudioHover({ xPct: frac * 100, lines });
+  };
   // Optional secondary detector: bright yellow-green splatter (shoot-n-see
   // targets). Contrast/change detection is always the primary driver; this adds
   // the color detector on top for reactive targets.
@@ -9093,6 +9216,8 @@ export default function Home() {
         : Number.isFinite(videoEl.duration) && videoEl.duration > 0
           ? videoEl.duration
           : 0;
+      // For the detection-trail sound-track hover inspector.
+      scanDurationSecRef.current = Number.isFinite(durationSec) ? durationSec : 0;
       if (!isStreamScan && durationSec <= 0) {
         templateGray.delete();
         if (trackingHist) trackingHist.delete();
@@ -9284,6 +9409,10 @@ export default function Home() {
       const templateBaselineCanvas = document.createElement("canvas");
       const templateBaselineContext = templateBaselineCanvas.getContext("2d");
       let templateBaselinePatch: Uint8ClampedArray | null = null;
+      // Shots logged before a mid-scan re-baseline: their holes are part of the
+      // NEW background, so presence sampling must stop judging them (they'd all
+      // read "absent" and get wrongly flagged transient).
+      const presenceFrozenIds = new Set<string>();
       // Splatter-pass cache: the HSV top-hat is by far the most expensive stage,
       // and splatter marks are permanent — recomputing every other frame is
       // plenty, and halves the heaviest per-frame cost.
@@ -9812,6 +9941,44 @@ export default function Home() {
             frameGray.cols,
             frameGray.rows,
           );
+
+          // Live re-baseline (streaming): re-anchor the "known image" to the
+          // CURRENT view — the target as it looks right now becomes both the
+          // tracking template and the clean background for subtraction. Logged
+          // shots are kept; their presence sampling freezes since their holes
+          // are now part of the background. Takes effect from the next frame.
+          if (rebaselineRequestedRef.current && drawRect.width > 4 && drawRect.height > 4) {
+            rebaselineRequestedRef.current = false;
+            activeTemplateCanvas.width = Math.max(1, Math.round(drawRect.width));
+            activeTemplateCanvas.height = Math.max(1, Math.round(drawRect.height));
+            const rebaseContext = activeTemplateCanvas.getContext("2d");
+            if (rebaseContext) {
+              rebaseContext.drawImage(
+                canvasEl,
+                drawRect.x,
+                drawRect.y,
+                drawRect.width,
+                drawRect.height,
+                0,
+                0,
+                activeTemplateCanvas.width,
+                activeTemplateCanvas.height,
+              );
+              const rebasedMat = cv.imread(activeTemplateCanvas);
+              const rebasedGray = new cv.Mat();
+              cv.cvtColor(rebasedMat, rebasedGray, cv.COLOR_RGBA2GRAY);
+              rebasedMat.delete();
+              templateGray.delete();
+              templateGray = rebasedGray;
+              syncTemplateBaselinePatch();
+              for (const shot of shotMarkersRef.current) presenceFrozenIds.add(shot.id);
+              // Pending (unconfirmed) tracks referenced the old background — drop
+              // them; committed dedup points persist so nothing double-counts.
+              contourShotTracksRef.current = contourShotTracksRef.current.filter((track) => track.committed);
+              setScanStatus("Baseline reset — the current view is the new clean background.");
+            }
+          }
+
           const estimatedDistanceInches = estimateDistanceInchesFromDetection(
             targetWidthInches,
             targetHeightInches,
@@ -10391,6 +10558,9 @@ export default function Home() {
                   // the target moves (a full-frame coordinate would drift off it).
                   if (patchWidth > 0 && patchHeight > 0) {
                     for (const loggedShot of shotMarkersRef.current) {
+                      // Logged before a re-baseline → part of the background now;
+                      // keep the record it had, don't judge it against the new one.
+                      if (presenceFrozenIds.has(loggedShot.id)) continue;
                       const px = Math.round(loggedShot.centerPatchX);
                       const py = Math.round(loggedShot.centerPatchY);
                       if (px < 0 || py < 0 || px >= patchWidth || py >= patchHeight) continue;
@@ -11921,8 +12091,11 @@ export default function Home() {
                 ) : (
                   <div className="space-y-2 rounded-md border border-gray-700 bg-black p-3">
                     <p className="text-xs uppercase tracking-wide text-gray-300">Device Camera Stream</p>
-                    <p className="text-[11px] text-gray-400">
-                      Open this app on your phone and use the rear camera for best results.
+                    <p className="text-[11px] leading-relaxed text-gray-400">
+                      Open this app on your phone, point the rear camera at the target area, and prop the phone steady.
+                      You&apos;ll capture one clean frame as the known reference image; during the live scan every frame
+                      is matched against it to find the target, then background-subtracted and blob-filtered to spot
+                      new hits in real time. The screen stays awake while scanning.
                     </p>
                     <div className="flex flex-wrap items-center gap-2">
                       <button
@@ -12717,6 +12890,18 @@ export default function Home() {
                 />
                 <span>🎧 Audio-gated</span>
               </label>
+              {captureMode === "stream" && isScanning ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    rebaselineRequestedRef.current = true;
+                  }}
+                  title="Treat the current camera view as the new clean background (keeps all logged shots). Use after moving the camera or when lighting has drifted."
+                  className="flex w-full items-center justify-center gap-1.5 rounded-md border border-gray-600 px-3 py-2.5 text-sm text-gray-200 transition hover:bg-neutral-800 sm:w-auto"
+                >
+                  📷 New baseline
+                </button>
+              ) : null}
             </div>
             {/* Why Start is disabled — so a still-loading button isn't mistaken for broken. */}
             {!isScanning && (!opencvReady || (captureMode === "upload" && !howlerReady)) ? (
@@ -12817,11 +13002,29 @@ export default function Home() {
                     </figure>
                   </div>
                   <figure>
-                    <canvas ref={trailAudioCanvasRef} className="w-full rounded border border-gray-800 bg-black" />
+                    <div className="relative">
+                      <canvas
+                        ref={trailAudioCanvasRef}
+                        onMouseMove={handleAudioTrailHover}
+                        onMouseLeave={() => setAudioHover(null)}
+                        className="w-full cursor-crosshair rounded border border-gray-800 bg-black"
+                      />
+                      {audioHover ? (
+                        <div
+                          className="pointer-events-none absolute top-1 z-10 w-max max-w-[340px] -translate-x-1/2 rounded-md border border-gray-700 bg-black/95 px-2 py-1.5 font-mono text-[10px] leading-relaxed text-gray-200 shadow-lg"
+                          style={{ left: `${Math.min(72, Math.max(28, audioHover.xPct))}%` }}
+                        >
+                          {audioHover.lines.map((line, index) => (
+                            <div key={index}>{line}</div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
                     <figcaption className="mt-1 text-[11px] leading-tight text-gray-400">
                       <span className="font-semibold text-gray-200">Sound</span> — gray curve = loudness, amber line =
                       spike tolerance, red ● = detected bangs, blue bands = the 0.5s scan windows, white line =
-                      playhead{trailInfo && !trailInfo.inWindow ? " · skipping dead time…" : ""}
+                      playhead. Hover for every data point at that instant.
+                      {trailInfo && !trailInfo.inWindow ? " · skipping dead time…" : ""}
                     </figcaption>
                   </figure>
                   {trailInfo ? (

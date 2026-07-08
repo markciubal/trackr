@@ -12,6 +12,10 @@ export type NavSection = {
   activePrefix?: string;
   // When true, only render for signed-in users (the header passes auth state in).
   requiresAuth?: boolean;
+  // External link: rendered as a plain <a> opening in a new tab, never "active".
+  external?: boolean;
+  // Optional small inline icon rendered before the label (see FeatureNav).
+  icon?: "pistol";
 };
 
 export const NAV_SECTIONS: NavSection[] = [
@@ -19,6 +23,12 @@ export const NAV_SECTIONS: NavSection[] = [
   { label: "Library", href: "/shots", requiresAuth: true },
   { label: "Targets", href: "/targets/new", activePrefix: "/targets" },
   { label: "Drill", href: "/drill" },
+  {
+    label: "Donate",
+    href: "https://www.paypal.com/donate/?hosted_button_id=Q9JCGNQF924WW",
+    external: true,
+    icon: "pistol",
+  },
   // The brand ("Trackr") on the left links to the home/landing page. Account lives
   // in the auth chip on the right; add new app sections here and they appear in the
   // header everywhere. Set requiresAuth for signed-in-only ones.
