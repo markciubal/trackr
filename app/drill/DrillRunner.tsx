@@ -66,6 +66,10 @@ export function DrillRunner() {
   const [phase, setPhase] = useState<Phase>("setup");
   const [feedback, setFeedback] = useState<ZoneFeedback>({});
   const [scenarioTargets, setScenarioTargets] = useState<TargetInfo[]>([]);
+  // When zones came from a scanned/saved target, the layout is LOCKED: no
+  // shuffling, zone-count, or attribute changes — the on-screen drill must keep
+  // matching the physical print. Unlocking detaches from the target.
+  const [lockedSource, setLockedSource] = useState<string | null>(null);
   // How far the announcer has gotten (timed mode): hits past this index wait
   // for their callout, and the banner hides not-yet-called steps.
   const [announcedIndex, setAnnouncedIndex] = useState(-1);
@@ -96,26 +100,28 @@ export function DrillRunner() {
     const rawPv = Number(params.get("pv"));
     const paletteVersion = Number.isFinite(rawPv) && rawPv > 0 ? rawPv : undefined;
 
-    const apply = (linked: ScenarioZone[], seedValue: number | null) => {
+    const apply = (linked: ScenarioZone[], seedValue: number | null, sourceLabel: string) => {
       if (!linked.length) return;
       setZones(linked);
       setZoneCount(linked.length);
       setLength(linked.length);
       setAttrs(attributesFromZones(linked));
       setSeed(seedValue);
+      // Scanned/linked target: lock the layout so it keeps matching the print.
+      setLockedSource(sourceLabel);
     };
 
     // 1) Saved locally → exact zones (works fully offline).
     const stored = id ? getTarget(id) : null;
     if (stored?.zones?.length) {
-      apply(stored.zones, stored.drillSeed ?? null);
+      apply(stored.zones, stored.drillSeed ?? null, stored.name || id || "saved target");
       return;
     }
     // 2) Recipe carried inline (self-contained QR or the landing-page link).
     const recipe = decodeRecipe(rawZ);
     const inline = recipe ? zonesFromRecipe(recipe, paletteVersion) : decodeZones(rawZ, paletteVersion);
     if (inline?.length) {
-      apply(inline, recipe?.seed ?? null);
+      apply(inline, recipe?.seed ?? null, "scanned target");
       return;
     }
     // 3) Id-only → resolve from the catalog, then cache the whole target.
@@ -130,7 +136,7 @@ export function DrillRunner() {
           ? zonesFromRecipe(fetched, data.drillPaletteVersion ?? undefined)
           : null;
         if (!zones?.length) return;
-        apply(zones, fetched?.seed ?? null);
+        apply(zones, fetched?.seed ?? null, data.name ?? "scanned target");
         saveTarget(
           createTargetInfo({
             id,
@@ -163,6 +169,8 @@ export function DrillRunner() {
   const score = useMemo(() => (drill ? scoreDrill(drill) : null), [drill]);
 
   const regenerate = (count = zoneCount, attributes = attrs) => {
+    // Layout is locked to a scanned/saved target — no regeneration.
+    if (lockedSource) return;
     const nextSeed = generateSeed();
     setSeed(nextSeed);
     const next = generateScenarioZones(count, attributes, nextSeed);
@@ -185,6 +193,7 @@ export function DrillRunner() {
   // Toggle a zone attribute (shapes / colors / numbers / patterns) and rebuild.
   // At least one must stay on or zones can't be called out.
   const toggleAttr = (attr: ScenarioAttribute) => {
+    if (lockedSource) return;
     const has = attrs.includes(attr);
     if (has && attrs.length === 1) return;
     const next = has ? attrs.filter((a) => a !== attr) : [...attrs, attr];
@@ -348,9 +357,17 @@ export function DrillRunner() {
     setLength((current) => Math.min(current, target.zones?.length ?? current));
     setAttrs(attributesFromZones(target.zones));
     setSeed(target.drillSeed ?? null);
+    // Loaded targets are (potentially printed) fixed layouts — lock them too.
+    setLockedSource(target.name || target.id);
     setDrill(null);
     setPhase("setup");
     setFeedback({});
+  };
+
+  // Detach from the scanned/saved target: keep the current zones but allow
+  // editing again (any change from here diverges from the print, deliberately).
+  const unlockLayout = () => {
+    setLockedSource(null);
   };
 
   const saveScenario = () => {
@@ -452,19 +469,38 @@ export function DrillRunner() {
           <h1 className="text-xl font-semibold">Scenario drill</h1>
 
           <div className="space-y-3 rounded-lg border border-gray-800 p-3">
+            {lockedSource ? (
+              <div className="flex items-start justify-between gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2 py-1.5">
+                <p className="text-[11px] leading-relaxed text-amber-100">
+                  Layout locked to <span className="font-semibold">{lockedSource}</span> so it keeps matching the
+                  printed target — zones, attributes, and shuffle are disabled.
+                </p>
+                <button
+                  type="button"
+                  onClick={unlockLayout}
+                  className="shrink-0 text-[11px] font-medium text-amber-200 underline hover:text-amber-100"
+                >
+                  Unlock
+                </button>
+              </div>
+            ) : null}
             <label className="block">
-              <span className="text-xs text-gray-400">Zones: {zoneCount}</span>
+              <span className="text-xs text-gray-400">
+                Zones: {zoneCount}
+                {lockedSource ? " (from target)" : ""}
+              </span>
               <input
                 type="range"
                 min={2}
                 max={MAX_SCENARIO_ZONES}
                 value={zoneCount}
+                disabled={Boolean(lockedSource)}
                 onChange={(event) => {
                   const value = Number(event.target.value);
                   setZoneCount(value);
                   regenerate(value);
                 }}
-                className="mt-1 w-full"
+                className="mt-1 w-full disabled:opacity-40"
               />
             </label>
 
@@ -494,7 +530,8 @@ export function DrillRunner() {
                       type="button"
                       onClick={() => toggleAttr(option.id)}
                       aria-pressed={on}
-                      className={`rounded-md border px-2 py-1.5 text-xs transition ${
+                      disabled={Boolean(lockedSource)}
+                      className={`rounded-md border px-2 py-1.5 text-xs transition disabled:cursor-not-allowed disabled:opacity-40 ${
                         on
                           ? "border-sky-400/50 bg-sky-500/15 text-sky-100"
                           : "border-gray-700 text-gray-400 hover:bg-neutral-900"
@@ -571,7 +608,9 @@ export function DrillRunner() {
               <button
                 type="button"
                 onClick={() => regenerate()}
-                className="rounded-md border border-gray-600 px-3 py-2 text-sm text-gray-200 transition hover:bg-neutral-800"
+                disabled={Boolean(lockedSource)}
+                title={lockedSource ? "Locked to the scanned target — Unlock above to edit the layout" : undefined}
+                className="rounded-md border border-gray-600 px-3 py-2 text-sm text-gray-200 transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 Shuffle
               </button>
