@@ -1,19 +1,25 @@
 // "Smart target" QR payload.
 //
-// The QR encodes the shortest possible URL: {base}/t/{id} — UPPERCASED, e.g.
-// HTTPS://TRKR.GG/T/ABC1234. Uppercase + only the symbols `:/.` keeps the string
-// inside the QR "alphanumeric" charset (5.5 bits/char vs 8 in byte mode), so a
-// 25-char URL fits a version-1 (21×21) QR. Fewer, bigger modules ⇒ it scans from
-// much farther away. The id is all the QR carries; everything else (calibration
-// w/h/u/q, drill layout) is resolved by id from the Supabase catalog or local
-// store. Scanning with a phone camera just opens the /t/{id} product page (a
-// middleware redirect maps the uppercase /T/ path to the lowercase route).
+// QRs are SELF-CONTAINED: everything a scan needs rides inside the URL itself —
+// no account, no catalog lookup, no saved id resolution.
 //
-// LEGACY: older prints encode a lowercase URL with an inline query string
-//   {base}/t/{id}?w=&h=&u=&q=&s=&z=&pv=&v=
-// carrying self-describing calibration + drill recipe. decodeTargetPayload still
-// parses that form (detected by the presence of query params) so prints already
-// in the wild keep working forever.
+//   • Drill targets:    {base}/drill?z=&pv=&w=&h=&u=&q=&v=
+//     Scanning goes STRAIGHT to the scenario drill; the tiny {count, attrs,
+//     seed} recipe in `z` regenerates the exact printed zones on any device,
+//     and w/h/u/q carry the physical size so the QR still calibrates the
+//     scanner. No id at all.
+//   • Other targets:    {base}/t/{id}?w=&h=&u=&q=&s=&v=
+//     Calibration is inline; the id is only a human-readable label for the
+//     local "My targets" list, never something that must resolve anywhere.
+//
+// The query string forces the QR into byte mode (bigger than the old id-only
+// alphanumeric form), which is a deliberate trade: a denser code that works
+// with zero infrastructure beats a tiny one that needs a catalog.
+//
+// LEGACY: earlier prints encoded an id-only uppercase URL (HTTPS://…/T/{ID},
+// resolved from the catalog/local store) or the same /t/{id}?w=… inline form.
+// decodeTargetPayload still parses all of them so prints in the wild keep
+// working forever.
 
 import {
   decodeRecipe,
@@ -66,22 +72,57 @@ export function hasInlineCalibration(payload: TargetPayload): boolean {
   );
 }
 
-// Build the printed QR string: an id-only URL, uppercased so the whole thing
-// stays in the QR alphanumeric charset (version-1 21×21 QR ⇒ scans from a
-// distance). Calibration + drill layout are resolved by id, not baked in. The id
-// is already uppercase Crockford base32, so toUpperCase only normalizes the
-// scheme/host/path and never corrupts it.
-export function encodeTargetPayload(payload: TargetPayload, baseUrl: string): string {
+// Build the printed QR string for a DRILL target: a direct /drill URL carrying
+// the zone recipe + physical size inline. Fully self-contained — scanning it
+// opens the exact drill on any device with no account or lookup.
+export function encodeDrillPayload(
+  args: {
+    recipe: string; // encodeRecipe() output
+    paletteVersion: number;
+    unit: LinearUnit;
+    widthValue: number;
+    heightValue: number;
+    qrSizeValue: number;
+  },
+  baseUrl: string,
+): string {
   const base = (baseUrl || "").replace(/\/+$/, "");
-  return `${base}${TARGET_PATH_PREFIX}${payload.id}`.toUpperCase();
+  const params = new URLSearchParams({
+    z: args.recipe,
+    pv: String(args.paletteVersion),
+    w: String(args.widthValue),
+    h: String(args.heightValue),
+    u: args.unit,
+    q: String(args.qrSizeValue),
+    v: String(TARGET_PAYLOAD_VERSION),
+  });
+  return `${base}/drill?${params.toString()}`;
 }
 
-// Parse a scanned string. Handles all three forms:
-//   • new id-only:   HTTPS://TRKR.GG/T/ABC1234       (no query string)
-//   • legacy query:  https://trkr.gg/t/ABC1234?w=&h=&u=&q=&s=&z=&pv=&v=
-//   • bare no scheme: TRKR.GG/T/ABC1234              (some camera apps strip it)
-// Returns null if it isn't a recognizable target payload. id-only payloads carry
-// no inline calibration — the app resolves those from the catalog / local store.
+// Build the printed QR string for a non-drill target: /t/{id} with calibration
+// inline, so the info page and the scanner both work without any stored record.
+export function encodeTargetPayload(
+  payload: TargetPayload & { widthValue: number; heightValue: number; qrSizeValue: number },
+  baseUrl: string,
+): string {
+  const base = (baseUrl || "").replace(/\/+$/, "");
+  const params = new URLSearchParams({
+    w: String(payload.widthValue),
+    h: String(payload.heightValue),
+    u: payload.unit,
+    q: String(payload.qrSizeValue),
+    v: String(payload.version),
+  });
+  if (payload.scoringId) params.set("s", payload.scoringId);
+  return `${base}${TARGET_PATH_PREFIX}${payload.id}?${params.toString()}`;
+}
+
+// Parse a scanned string. Handles every form we've ever printed:
+//   • drill direct:  https://trkr.gg/drill?z=&pv=&w=&h=&u=&q=&v=  (no id at all)
+//   • inline query:  https://trkr.gg/t/ABC1234?w=&h=&u=&q=&s=&v=
+//   • legacy id-only: HTTPS://TRKR.GG/T/ABC1234  (resolved from catalog/local store)
+//   • bare no scheme: TRKR.GG/T/ABC1234          (some camera apps strip it)
+// Returns null if it isn't a recognizable target payload.
 export function decodeTargetPayload(text: string): TargetPayload | null {
   if (!text) return null;
   const trimmed = text.trim();
@@ -96,6 +137,29 @@ export function decodeTargetPayload(text: string): TargetPayload | null {
       return null;
     }
   }
+
+  // Direct drill form: no id — the recipe IS the identity. Synthesize a stable
+  // local label from it so target lists/stores still have a key.
+  if (/\/drill\/?$/i.test(url.pathname)) {
+    const p = url.searchParams;
+    const rawZ = p.get("z");
+    const paletteVersion = numberOrUndefined(p.get("pv")) ?? 1;
+    const zones = zonesFromParam(rawZ, paletteVersion);
+    if (!rawZ || !zones?.length) return null;
+    return {
+      id: `DRILL-${rawZ.toUpperCase()}`,
+      unit: normalizeUnit(p.get("u")),
+      widthValue: numberOrUndefined(p.get("w")),
+      heightValue: numberOrUndefined(p.get("h")),
+      qrSizeValue: numberOrUndefined(p.get("q")),
+      scoringId: "drill",
+      drill: decodeRecipe(rawZ) ?? undefined,
+      zones,
+      paletteVersion,
+      version: numberOrUndefined(p.get("v")) ?? TARGET_PAYLOAD_VERSION,
+    };
+  }
+
   // Case-insensitive, un-anchored: matches both /t/ and /T/, stops at ?/#.
   const match = url.pathname.match(/\/t\/([^/?#]+)/i);
   if (!match) return null;

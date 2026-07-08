@@ -92,6 +92,9 @@ export function DrillRunner() {
     const params = new URLSearchParams(window.location.search);
     const id = params.get("id");
     const rawZ = params.get("z");
+    // Palette version for inline recipes (self-contained QRs carry it as ?pv=).
+    const rawPv = Number(params.get("pv"));
+    const paletteVersion = Number.isFinite(rawPv) && rawPv > 0 ? rawPv : undefined;
 
     const apply = (linked: ScenarioZone[], seedValue: number | null) => {
       if (!linked.length) return;
@@ -108,9 +111,9 @@ export function DrillRunner() {
       apply(stored.zones, stored.drillSeed ?? null);
       return;
     }
-    // 2) Recipe carried inline (legacy QR or the landing-page link).
+    // 2) Recipe carried inline (self-contained QR or the landing-page link).
     const recipe = decodeRecipe(rawZ);
-    const inline = recipe ? zonesFromRecipe(recipe) : decodeZones(rawZ);
+    const inline = recipe ? zonesFromRecipe(recipe, paletteVersion) : decodeZones(rawZ, paletteVersion);
     if (inline?.length) {
       apply(inline, recipe?.seed ?? null);
       return;

@@ -7,6 +7,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   type LinearUnit,
   TARGET_PAYLOAD_VERSION,
+  encodeDrillPayload,
   encodeTargetPayload,
   fromInches,
   generateTargetId,
@@ -26,11 +27,9 @@ import {
   SCENARIO_ATTRIBUTE_OPTIONS,
   SCENARIO_PALETTE_VERSION,
   attributesFromZones,
-  decodeRecipe,
   encodeRecipe,
   generateScenarioZones,
   generateSeed,
-  zonesFromRecipe,
   type ScenarioAttribute,
   type ScenarioZone,
 } from "@/app/lib/targets/scenario";
@@ -38,40 +37,7 @@ import { ScenarioBoard } from "@/app/components/scenario/ScenarioBoard";
 
 const UNITS: LinearUnit[] = ["in", "cm", "mm"];
 
-// A target row from GET /api/targets (the signed-in user's saved targets).
-type AccountTargetRow = {
-  id: string;
-  name: string | null;
-  unit: LinearUnit;
-  widthValue: number;
-  heightValue: number;
-  qrSizeValue: number;
-  scoringId: string | null;
-  drillRecipe: string | null;
-  drillPaletteVersion: number | null;
-  createdAt: number;
-};
-
-// Rebuild a local TargetInfo from an account row so it loads/renders the same as
-// a device-saved one — including drill zones reconstructed from the saved recipe.
-function accountRowToTargetInfo(row: AccountTargetRow): TargetInfo {
-  const recipe = row.drillRecipe ? decodeRecipe(row.drillRecipe) : null;
-  const zones = recipe ? zonesFromRecipe(recipe, row.drillPaletteVersion ?? undefined) : undefined;
-  return createTargetInfo({
-    id: row.id,
-    name: row.name ?? "Target",
-    unit: row.unit,
-    widthValue: row.widthValue,
-    heightValue: row.heightValue,
-    qrSizeValue: row.qrSizeValue,
-    scoringId: (row.scoringId as ScoringId | null) ?? "none",
-    zones,
-    drillSeed: recipe?.seed,
-    createdAt: row.createdAt || undefined,
-  });
-}
-
-export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl: string }) {
+export function TargetDesigner({ baseUrl }: { baseUrl: string }) {
   const [presetId, setPresetId] = useState(TARGET_PRESETS[0].id);
   const [name, setName] = useState(TARGET_PRESETS[0].name);
   const [unit, setUnit] = useState<LinearUnit>(TARGET_PRESETS[0].unit);
@@ -83,15 +49,10 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
   // renders; the few spots that render it during SSR get suppressHydrationWarning.
   const [targetId, setTargetId] = useState<string>(() => generateTargetId());
   const [qrSvg, setQrSvg] = useState("");
-  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  const [saveError, setSaveError] = useState<string | null>(null);
   // Locally-saved targets (keyed by their random id), loaded client-side.
+  // Saving is purely a device-local convenience — the QR itself carries
+  // everything a scan needs, so no account is ever required.
   const [savedTargets, setSavedTargets] = useState<TargetInfo[]>([]);
-  // Targets saved to this account (fetched when signed in), so a given id loads
-  // back on any device. Merged with the local ones for display.
-  const [accountTargets, setAccountTargets] = useState<TargetInfo[]>([]);
-  // Human-readable account sync status, so list/sync failures are visible.
-  const [accountStatus, setAccountStatus] = useState<string | null>(null);
   const [localSaved, setLocalSaved] = useState(false);
   // Scenario ("drill") mode: scoring "drill" carries shape/color/number/pattern
   // zones, and they ride along inside the QR payload (z param).
@@ -131,110 +92,54 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
     setSavedTargets(listTargets());
   }, []);
 
-  // When signed in: load the account's saved targets, then push up any local
-  // targets the account doesn't have yet. The push is what rescues designs saved
-  // before sign-in (or before account-sync existed) — they only lived in this
-  // browser's localStorage, so this is the first time they reach the account.
-  // Status is surfaced so failures aren't silent.
-  useEffect(() => {
-    if (!canSave) return;
-    let cancelled = false;
-    (async () => {
-      let account: TargetInfo[];
-      try {
-        const res = await fetch("/api/targets");
-        if (!res.ok) {
-          if (!cancelled) setAccountStatus(`Couldn't load account targets (HTTP ${res.status}).`);
-          return;
-        }
-        const data = (await res.json()) as { targets?: AccountTargetRow[] };
-        account = (data.targets ?? []).map(accountRowToTargetInfo);
-      } catch {
-        if (!cancelled) setAccountStatus("Couldn't reach your account (offline?).");
-        return;
-      }
-      if (cancelled) return;
-      setAccountTargets(account);
-      setAccountStatus(`${account.length} in your account.`);
-
-      const accountIds = new Set(account.map((t) => t.id));
-      const toSync = listTargets().filter((t) => !accountIds.has(t.id));
-      if (!toSync.length) return;
-
-      const synced: TargetInfo[] = [];
-      let firstError: string | null = null;
-      for (const t of toSync) {
-        if (cancelled) return;
-        const drillRecipe =
-          t.zones?.length && typeof t.drillSeed === "number"
-            ? encodeRecipe({ count: t.zones.length, attributes: attributesFromZones(t.zones), seed: t.drillSeed })
-            : null;
-        try {
-          const res = await fetch("/api/targets", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              id: t.id,
-              name: t.name,
-              unit: t.unit,
-              widthValue: t.widthValue,
-              heightValue: t.heightValue,
-              qrSizeValue: t.qrSizeValue,
-              scoringId: t.scoringId,
-              drillRecipe,
-              drillPaletteVersion: drillRecipe ? SCENARIO_PALETTE_VERSION : null,
-            }),
-          });
-          const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
-          if (data.ok) synced.push(t);
-          else if (!firstError) firstError = data.error ?? `HTTP ${res.status}`;
-        } catch {
-          if (!firstError) firstError = "network error";
-        }
-      }
-      if (cancelled) return;
-      if (synced.length) {
-        setAccountTargets((prev) => {
-          const byId = new Map(prev.map((t) => [t.id, t] as const));
-          for (const t of synced) byId.set(t.id, t);
-          return [...byId.values()];
-        });
-      }
-      setAccountStatus(
-        `${account.length + synced.length} in your account` +
-          (synced.length ? ` · synced ${synced.length} from this device` : "") +
-          (firstError ? ` · ${toSync.length - synced.length} failed (${firstError})` : ""),
-      );
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [canSave]);
-
-  // Account + local targets, deduped by id (local wins — it reflects the latest
-  // edit on this device), newest first.
-  const allTargets = useMemo(() => {
-    const byId = new Map<string, TargetInfo>();
-    for (const target of accountTargets) byId.set(target.id, target);
-    for (const target of savedTargets) byId.set(target.id, target);
-    return [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
-  }, [accountTargets, savedTargets]);
-
-  // The QR encodes only the target id (HTTPS://<domain>/T/{ID}) — scoring, size,
-  // and drill layout are resolved by that id from the catalog/local store, not
-  // baked in. So the QR image depends solely on the id + base domain; changing
-  // other fields intentionally leaves it unchanged (apply them by saving).
-  const payloadUrl = useMemo(
-    () => (targetId ? encodeTargetPayload({ id: targetId, unit, version: TARGET_PAYLOAD_VERSION }, baseUrl) : ""),
-    [targetId, unit, baseUrl],
+  // Local targets, newest first.
+  const allTargets = useMemo(
+    () => [...savedTargets].sort((a, b) => b.createdAt - a.createdAt),
+    [savedTargets],
   );
+
+  // The QR is fully self-contained and LIVE: it always encodes the current
+  // design. Drill targets encode a direct /drill URL carrying the zone recipe +
+  // physical size; other targets encode /t/{id} with the calibration inline.
+  // Nothing needs to be saved anywhere for a print to work.
+  const payloadUrl = useMemo(() => {
+    if (isScenario) {
+      if (scenarioSeed === null || scenarioZones.length === 0) return "";
+      const recipe = encodeRecipe({
+        count: scenarioZones.length,
+        attributes: scenarioAttrs,
+        seed: scenarioSeed,
+      });
+      return encodeDrillPayload(
+        { recipe, paletteVersion: SCENARIO_PALETTE_VERSION, unit, widthValue, heightValue, qrSizeValue },
+        baseUrl,
+      );
+    }
+    if (!targetId) return "";
+    return encodeTargetPayload(
+      { id: targetId, unit, widthValue, heightValue, qrSizeValue, scoringId, version: TARGET_PAYLOAD_VERSION },
+      baseUrl,
+    );
+  }, [
+    isScenario,
+    scenarioSeed,
+    scenarioZones,
+    scenarioAttrs,
+    unit,
+    widthValue,
+    heightValue,
+    qrSizeValue,
+    scoringId,
+    targetId,
+    baseUrl,
+  ]);
 
   useEffect(() => {
     if (!payloadUrl) return;
     let cancelled = false;
-    // ECC "L": the payload is a tiny id-only URL, so the lowest error-correction
-    // level keeps the QR at version 1 (21×21) — the biggest modules, best read
-    // from a distance. Clean prints don't need M's extra damage tolerance.
+    // ECC "L": the URL now carries the full payload (byte mode), so the lowest
+    // error-correction level keeps the module count down — bigger modules scan
+    // from farther away, and clean prints don't need M's damage tolerance.
     QRCode.toString(payloadUrl, { type: "svg", margin: 0, errorCorrectionLevel: "L" })
       .then((svg) => {
         if (!cancelled) setQrSvg(svg);
@@ -273,7 +178,6 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
     setHeightValue(preset.heightValue);
     setQrSizeValue(preset.qrSizeValue);
     changeScoring(preset.scoringId);
-    setSaveState("idle");
   };
 
   const currentTargetInfo = () =>
@@ -306,7 +210,6 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
     } else {
       changeScoring(target.scoringId);
     }
-    setSaveState("idle");
     setLocalSaved(false);
   };
 
@@ -325,75 +228,34 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
     regenerateZones(scenarioCount, next);
   };
 
-  // Save under the current id and jump straight into the live drill.
+  // Jump straight into the live drill, carrying the recipe inline — the same
+  // self-contained form the printed QR uses (also saved locally for convenience).
   const testDrill = () => {
     saveTarget(currentTargetInfo());
     setSavedTargets(listTargets());
-    router.push(`/drill?id=${encodeURIComponent(targetId)}`);
+    if (scenarioSeed !== null && scenarioZones.length > 0) {
+      const recipe = encodeRecipe({
+        count: scenarioZones.length,
+        attributes: scenarioAttrs,
+        seed: scenarioSeed,
+      });
+      router.push(`/drill?z=${encodeURIComponent(recipe)}&pv=${SCENARIO_PALETTE_VERSION}`);
+    } else {
+      router.push(`/drill?id=${encodeURIComponent(targetId)}`);
+    }
   };
 
   const deleteTarget = (id: string) => {
     removeTarget(id);
     setSavedTargets(listTargets());
-    if (canSave) {
-      // Also remove it from the account so it doesn't reappear on next load.
-      setAccountTargets((prev) => prev.filter((t) => t.id !== id));
-      fetch(`/api/targets?id=${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
-    }
   };
 
-  // Save the target under its id. Always persists to this device (so it works
-  // offline and the OpenCV detector can recognize it); when signed in, also
-  // saves the id→value to the account so it loads back on any device.
-  const save = async () => {
-    const info = currentTargetInfo();
-    saveTarget(info);
+  // Save the target to this device (localStorage) — a convenience for reloading
+  // designs later. Prints never depend on it: the QR is self-contained.
+  const save = () => {
+    saveTarget(currentTargetInfo());
     setSavedTargets(listTargets());
     setLocalSaved(true);
-    setSaveError(null);
-
-    if (!canSave) {
-      setSaveState("idle");
-      return;
-    }
-
-    setSaveState("saving");
-    try {
-      // Drill targets carry their layout only by id now, so the recipe must be
-      // persisted to the account for any device that scans the print to rebuild
-      // the exact zones (see scenario.ts encodeRecipe / zonesFromParam).
-      const drillRecipe =
-        scoringId === "drill" && scenarioSeed !== null && scenarioZones.length > 0
-          ? encodeRecipe({ count: scenarioZones.length, attributes: scenarioAttrs, seed: scenarioSeed })
-          : null;
-      const res = await fetch("/api/targets", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          id: targetId,
-          name,
-          unit,
-          widthValue,
-          heightValue,
-          qrSizeValue,
-          scoringId,
-          drillRecipe,
-          drillPaletteVersion: drillRecipe ? SCENARIO_PALETTE_VERSION : null,
-        }),
-      });
-      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
-      if (data.ok) {
-        setSaveState("saved");
-        // Reflect the just-saved target in the account list immediately.
-        setAccountTargets((prev) => [info, ...prev.filter((t) => t.id !== info.id)]);
-      } else {
-        setSaveState("error");
-        setSaveError(data.error ?? "Saved on this device, but couldn't save to your account.");
-      }
-    } catch {
-      setSaveState("error");
-      setSaveError("Saved on this device, but couldn't reach your account.");
-    }
   };
 
   // Physical → on-screen preview scale (true size is preserved for printing).
@@ -666,37 +528,22 @@ export function TargetDesigner({ canSave, baseUrl }: { canSave: boolean; baseUrl
             <button
               type="button"
               onClick={save}
-              disabled={saveState === "saving"}
-              className="rounded-md border border-emerald-400/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100 transition hover:bg-emerald-500/20 disabled:opacity-50"
+              className="rounded-md border border-emerald-400/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100 transition hover:bg-emerald-500/20"
             >
-              {saveState === "saving"
-                ? "Saving…"
-                : localSaved
-                  ? canSave
-                    ? "Saved to account ✓"
-                    : "Saved ✓"
-                  : canSave
-                    ? "Save to account"
-                    : "Save target"}
+              {localSaved ? "Saved ✓" : "Save to this device"}
             </button>
           </div>
-          {!localSaved ? (
-            <p className="rounded-md border border-amber-400/30 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-100">
-              The QR encodes only the target ID, so it doesn&apos;t change when you edit. Scoring, size, and drill changes
-              reach a scan only after you <span className="font-semibold">Save</span>.
-            </p>
-          ) : null}
-          {saveError ? <p className="text-xs text-rose-300">{saveError}</p> : null}
+          <p className="rounded-md border border-gray-800 bg-neutral-950 px-2 py-1.5 text-[11px] text-gray-400">
+            The QR is self-contained and updates live as you edit — scanning a print opens the exact drill or
+            calibration on any device. No account, no upload; saving only keeps a copy in this browser.
+          </p>
           <p className="break-all font-mono text-[10px] text-gray-600" suppressHydrationWarning>
             {payloadUrl}
           </p>
 
-          {allTargets.length > 0 || (canSave && accountStatus) ? (
+          {allTargets.length > 0 ? (
             <div className="border-t border-gray-800 pt-3">
               <p className="text-xs font-semibold text-gray-300">My targets ({allTargets.length})</p>
-              {canSave && accountStatus ? (
-                <p className="text-[10px] text-gray-500">{accountStatus}</p>
-              ) : null}
               <ul className="mt-2 space-y-1">
                 {allTargets.map((target) => (
                   <li

@@ -1,14 +1,14 @@
-import { isSupabaseConfigured } from "@/app/lib/supabase/config";
-import { getCurrentUser } from "@/app/lib/supabase/server";
 import { TargetDesigner } from "./TargetDesigner";
 
 export const metadata = { title: "Design a target · Trackr" };
 
-export default async function NewTargetPage() {
-  const user = isSupabaseConfigured() ? await getCurrentUser() : null;
+// No account anywhere in this flow: the printed QR is fully self-contained
+// (drill recipe + calibration ride inside the URL), so the designer needs no
+// user context at all.
+export default function NewTargetPage() {
   const baseUrl =
     process.env.NEXT_PUBLIC_TARGET_BASE_URL ||
     process.env.NEXT_PUBLIC_SITE_URL ||
     "https://trackr-c8dc72cd850c.herokuapp.com";
-  return <TargetDesigner canSave={Boolean(user)} baseUrl={baseUrl} />;
+  return <TargetDesigner baseUrl={baseUrl} />;
 }
