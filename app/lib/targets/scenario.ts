@@ -103,6 +103,23 @@ const COLOR_REGISTRY: Record<Exclude<ZoneColorName, "black">, ZoneColor> = {
 
 const NEUTRAL_ZONE_COLOR: ZoneColor = { name: "black", hex: "#262626", spoken: "Black" };
 
+// Color-blind-friendly hues for the same names. Tuned from the Okabe–Ito / IBM
+// color-safe palettes for maximum separation under common color-vision
+// deficiency, while staying close enough to each name to remain recognizable.
+// The names (and therefore the spoken callouts + the QR wire format) are
+// unchanged — only the rendered hex differs when the option is on.
+const COLOR_REGISTRY_CB: Record<Exclude<ZoneColorName, "black">, ZoneColor> = {
+  red: { name: "red", hex: "#d55e00", spoken: "Red" }, // vermillion
+  orange: { name: "orange", hex: "#e69f00", spoken: "Orange" },
+  yellow: { name: "yellow", hex: "#f0e442", spoken: "Yellow" },
+  green: { name: "green", hex: "#009e73", spoken: "Green" }, // bluish green
+  blue: { name: "blue", hex: "#0072b2", spoken: "Blue" },
+  purple: { name: "purple", hex: "#785ef0", spoken: "Purple" },
+  pink: { name: "pink", hex: "#cc79a7", spoken: "Pink" }, // reddish purple
+  cyan: { name: "cyan", hex: "#56b4e9", spoken: "Cyan" }, // sky blue
+  brown: { name: "brown", hex: "#7f4d1c", spoken: "Brown" },
+};
+
 // Current-version palettes, exported for the designer UI + ScenarioBoard. These
 // follow whatever SCENARIO_PALETTE_VERSION points at; the frozen per-version
 // copies above are what the codecs actually use.
@@ -147,11 +164,55 @@ export type DrillStep = {
   spoken: string; // read aloud
 };
 
-export type CalloutMode = "sequence" | "reactive";
+export type CalloutMode = "sequence" | "reactive" | "timed";
 
-export function colorMeta(name: ZoneColorName): ZoneColor {
+// ---- Timed callouts ----
+//
+// "Timed" mode calls zones at unpredictable moments spread across a drill
+// window that itself varies run to run. Given an approximate length, the
+// actual span is jittered ±25%, then each gap between callouts gets a random
+// weight — so neither the total time nor the rhythm is predictable, but a
+// minimum gap keeps speech from overlapping and gives each call a fair
+// reaction window.
+export const TIMED_MIN_GAP_MS = 1800;
+export const TIMED_SPAN_JITTER = 0.25;
+export const TIMED_LEAD_IN_MIN_MS = 800;
+export const TIMED_LEAD_IN_MAX_MS = 2500;
+export const TIMED_END_GRACE_MS = 4000;
+
+export type TimedSchedule = {
+  calloutAtMs: number[]; // one entry per step, ms from drill start
+  endAtMs: number; // when the final step times out and the drill ends
+  spanMs: number; // the actual (jittered) span this run
+};
+
+export function generateTimedSchedule(
+  stepCount: number,
+  approxSpanSec: number,
+  rng: () => number = Math.random,
+): TimedSchedule {
+  const count = Math.max(1, Math.floor(stepCount));
+  const jitter = 1 - TIMED_SPAN_JITTER + rng() * TIMED_SPAN_JITTER * 2;
+  const spanMs = Math.max(count * TIMED_MIN_GAP_MS, approxSpanSec * 1000 * jitter);
+  const leadInMs = TIMED_LEAD_IN_MIN_MS + rng() * (TIMED_LEAD_IN_MAX_MS - TIMED_LEAD_IN_MIN_MS);
+  // Random gap weights (floored away from zero so no two calls collide), then
+  // normalized over whatever span remains after the guaranteed minimum gaps.
+  const weights = Array.from({ length: count }, () => 0.35 + rng());
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  const spreadMs = Math.max(0, spanMs - leadInMs - TIMED_MIN_GAP_MS * (count - 1));
+  const calloutAtMs: number[] = [];
+  let t = leadInMs;
+  weights.forEach((weight, i) => {
+    calloutAtMs.push(Math.round(t));
+    if (i < count - 1) t += TIMED_MIN_GAP_MS + (spreadMs * weight) / totalWeight;
+  });
+  return { calloutAtMs, endAtMs: Math.round(t + TIMED_END_GRACE_MS), spanMs: Math.round(spanMs) };
+}
+
+export function colorMeta(name: ZoneColorName, colorBlind = false): ZoneColor {
   if (name === "black") return NEUTRAL_ZONE_COLOR;
-  return COLOR_REGISTRY[name] ?? COLOR_REGISTRY.red;
+  const registry = colorBlind ? COLOR_REGISTRY_CB : COLOR_REGISTRY;
+  return registry[name] ?? registry.red;
 }
 
 export function shapeSpoken(shape: ZoneShape): string {
@@ -227,16 +288,28 @@ function distinctNumbers(count: number, rng: () => number, min = 1, max = 99): n
 // The deterministic grid layout for n zones. Kept separate from generation so
 // a zone set decoded from a QR (which only carries attributes, not positions)
 // reconstructs the exact same geometry.
+//
+// Rows fill top→bottom; a partial last row is RIGHT-aligned so any empty cells
+// fall on the bottom-left — i.e. the bottom-left space is the last to be filled.
 export function scenarioZoneLayout(n: number): { cx: number; cy: number; radius: number }[] {
   const cols = Math.ceil(Math.sqrt(n));
+  const rows = Math.ceil(n / cols);
   const cellW = 1 / cols;
-  const cellH = 1 / Math.ceil(n / cols);
+  const cellH = 1 / rows;
   const radius = Math.min(cellW, cellH) * 0.36;
-  return Array.from({ length: n }, (_, i) => ({
-    cx: ((i % cols) + 0.5) * cellW,
-    cy: (Math.floor(i / cols) + 0.5) * cellH,
-    radius,
-  }));
+  // Shift the final row right by the number of cells it's missing, so gaps sit
+  // on the bottom-left rather than the bottom-right.
+  const lastRowCount = n - (rows - 1) * cols;
+  const lastRowOffset = cols - lastRowCount;
+  return Array.from({ length: n }, (_, i) => {
+    const row = Math.floor(i / cols);
+    const col = (i % cols) + (row === rows - 1 ? lastRowOffset : 0);
+    return {
+      cx: (col + 0.5) * cellW,
+      cy: (row + 0.5) * cellH,
+      radius,
+    };
+  });
 }
 
 // Build a fresh set of zones laid out on a grid. Each *enabled* attribute gets

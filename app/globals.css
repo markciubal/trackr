@@ -23,10 +23,79 @@ body {
   font-family: var(--font-space-grotesk), "Trebuchet MS", "Segoe UI", sans-serif;
 }
 
+/* Dual-handle range slider: two <input type="range"> stacked on a single track.
+   The inputs ignore pointer events except on their thumbs, so both handles can be
+   dragged independently on one shared track. */
+.range-dual {
+  pointer-events: none;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  margin: 0;
+}
+.range-dual::-webkit-slider-runnable-track {
+  background: transparent;
+  height: 100%;
+}
+.range-dual::-moz-range-track {
+  background: transparent;
+  height: 100%;
+}
+.range-dual::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  pointer-events: auto;
+  height: 16px;
+  width: 16px;
+  border-radius: 9999px;
+  background: #ffffff;
+  border: 2px solid #38bdf8; /* sky-400 = end handle */
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+}
+.range-dual::-moz-range-thumb {
+  pointer-events: auto;
+  height: 16px;
+  width: 16px;
+  border-radius: 9999px;
+  background: #ffffff;
+  border: 2px solid #38bdf8;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+}
+.range-dual-start::-webkit-slider-thumb {
+  border-color: #fbbf24; /* amber-400 = start handle */
+}
+.range-dual-start::-moz-range-thumb {
+  border-color: #fbbf24;
+}
+
 /* Full-viewport "screens" progress one section at a time via vertical scroll-snap. */
 html {
   scroll-snap-type: y proximity;
   scroll-behavior: smooth;
+}
+
+/* Step transition: fade + gentle rise as a wizard step becomes the active one.
+   Re-plays each time because the class is added when the step is shown (it carries
+   "hidden" otherwise). */
+@keyframes stepIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.994);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.animate-stepIn {
+  animation: stepIn 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-stepIn {
+    animation: none;
+  }
 }
 
 /* Printable target sheet: print only the sheet, at true physical size. */

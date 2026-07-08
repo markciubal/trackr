@@ -19,6 +19,7 @@ import {
   generateCallSequence,
   generateScenarioZones,
   generateSeed,
+  generateTimedSchedule,
   registerHit,
   scoreDrill,
   startDrill,
@@ -58,10 +59,25 @@ export function DrillRunner() {
   const [attrs, setAttrs] = useState<ScenarioAttribute[]>(DEFAULT_SCENARIO_ATTRIBUTES);
   const [mode, setMode] = useState<CalloutMode>("sequence");
   const [length, setLength] = useState(6);
+  // Timed mode: approximate drill length in seconds. The real span is jittered
+  // ±25% per run and the callout moments inside it are random.
+  const [timespanSec, setTimespanSec] = useState(30);
   const [drill, setDrill] = useState<DrillState | null>(null);
   const [phase, setPhase] = useState<Phase>("setup");
   const [feedback, setFeedback] = useState<ZoneFeedback>({});
   const [scenarioTargets, setScenarioTargets] = useState<TargetInfo[]>([]);
+  // How far the announcer has gotten (timed mode): hits past this index wait
+  // for their callout, and the banner hides not-yet-called steps.
+  const [announcedIndex, setAnnouncedIndex] = useState(-1);
+  const announcedIndexRef = useRef(-1);
+  const drillRef = useRef<DrillState | null>(null);
+  // The active timed run. Setting this arms the callout timers (see the effect
+  // below); clearing it cancels them.
+  const [timedRun, setTimedRun] = useState<{
+    steps: DrillStep[];
+    calloutAtMs: number[];
+    endAtMs: number;
+  } | null>(null);
   const stepStartRef = useRef<number>(0);
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -149,9 +165,18 @@ export function DrillRunner() {
     const next = generateScenarioZones(count, attributes, nextSeed);
     setZones(next);
     setLength((current) => Math.min(current, next.length));
+    setTimedRun(null);
+    drillRef.current = null;
     setDrill(null);
     setPhase("setup");
     setFeedback({});
+  };
+
+  // Timed mode allows repeats, so its sequence can outrun the zone count; the
+  // other modes cap the length at one call per zone.
+  const chooseMode = (next: CalloutMode) => {
+    setMode(next);
+    if (next !== "timed") setLength((current) => Math.min(current, zones.length));
   };
 
   // Toggle a zone attribute (shapes / colors / numbers / patterns) and rebuild.
@@ -164,11 +189,75 @@ export function DrillRunner() {
     regenerate(zoneCount, next);
   };
 
+  // Timed-callout engine. Arms one timer per callout plus a final timeout.
+  // Living in an effect keeps every timer cancelable (restart, load, unmount →
+  // cleanup) and is where timer-driven work belongs. Each callout first scores
+  // any still-unanswered earlier call as a miss, then announces its step.
+  useEffect(() => {
+    if (!timedRun) return;
+    const { steps, calloutAtMs, endAtMs } = timedRun;
+
+    const advanceMisses = (uptoIndex: number): DrillState | null => {
+      let state = drillRef.current;
+      if (!state || state.status !== "running") return null;
+      while (state.index < uptoIndex && state.status === "running") {
+        state = registerHit(state, null, Math.max(0, Date.now() - stepStartRef.current));
+      }
+      drillRef.current = state;
+      setDrill(state);
+      return state;
+    };
+
+    const fireCallout = (index: number) => {
+      const state = advanceMisses(index);
+      if (!state) return;
+      if (state.status !== "running") {
+        setPhase("done");
+        setTimedRun(null);
+        speak("Done");
+        return;
+      }
+      announcedIndexRef.current = index;
+      setAnnouncedIndex(index);
+      const step = steps[index];
+      if (step) {
+        speak(step.spoken, {
+          onEnd: () => {
+            stepStartRef.current = Date.now();
+          },
+        });
+        // Fallback in case speech is unavailable (onEnd still fires synchronously).
+        stepStartRef.current = Date.now();
+      }
+    };
+
+    const finish = () => {
+      const state = advanceMisses(Number.MAX_SAFE_INTEGER);
+      if (!state) return;
+      setPhase("done");
+      setTimedRun(null);
+      speak("Done");
+    };
+
+    const timers: number[] = [];
+    for (let index = 0; index < calloutAtMs.length; index += 1) {
+      timers.push(window.setTimeout(() => fireCallout(index), calloutAtMs[index]));
+    }
+    timers.push(window.setTimeout(finish, endAtMs));
+    return () => {
+      for (const timer of timers) window.clearTimeout(timer);
+    };
+  }, [timedRun]);
+
   const start = () => {
     cancelSpeech();
+    setTimedRun(null);
     setFeedback({});
-    const steps = generateCallSequence(zones, length, false);
+    announcedIndexRef.current = -1;
+    setAnnouncedIndex(-1);
+    const steps = generateCallSequence(zones, length, mode === "timed");
     const state = startDrill(steps);
+    drillRef.current = state;
     setDrill(state);
 
     if (mode === "sequence") {
@@ -186,6 +275,19 @@ export function DrillRunner() {
             }),
         },
       );
+    } else if (mode === "timed") {
+      // Timed: callouts land at random moments across a randomized window —
+      // neither the rhythm nor the total length repeats run to run. A call the
+      // shooter hasn't answered scores as a miss when the next one fires.
+      // Arming timedRun starts the timers (see the timed-callout effect).
+      setPhase("playing");
+      const schedule = generateTimedSchedule(steps.length, timespanSec);
+      speak("Standby", {
+        onEnd: () => {
+          stepStartRef.current = Date.now();
+        },
+      });
+      setTimedRun({ steps, calloutAtMs: schedule.calloutAtMs, endAtMs: schedule.endAtMs });
     } else {
       // Reactive: call them out one at a time as the shooter advances.
       setPhase("playing");
@@ -212,15 +314,20 @@ export function DrillRunner() {
 
   const handleHit = (zoneId: string) => {
     if (phase !== "playing" || !drill) return;
+    // Timed mode: the shooter can't answer a call that hasn't happened yet —
+    // after answering the current call, further hits wait for the next one.
+    if (mode === "timed" && drill.index > announcedIndexRef.current) return;
     const expected = currentStep(drill);
     if (!expected) return;
     const reactionMs = Math.max(0, Date.now() - stepStartRef.current);
     flash(zoneId, zoneId === expected.zoneId ? "correct" : "wrong");
 
     const nextState = registerHit(drill, zoneId, reactionMs);
+    drillRef.current = nextState;
     setDrill(nextState);
 
     if (nextState.status === "done") {
+      setTimedRun(null);
       setPhase("done");
       speak("Done");
       return;
@@ -231,6 +338,8 @@ export function DrillRunner() {
   const loadScenario = (target: TargetInfo) => {
     if (!target.zones?.length) return;
     cancelSpeech();
+    setTimedRun(null);
+    drillRef.current = null;
     setZones(target.zones);
     setZoneCount(target.zones.length);
     setLength((current) => Math.min(current, target.zones?.length ?? current));
@@ -278,6 +387,10 @@ export function DrillRunner() {
               <p className="text-sm text-gray-400">Press Start. The app calls a sequence — shoot the zones in that order.</p>
             ) : phase === "announcing" ? (
               <p className="text-lg font-semibold text-amber-200">Listen…</p>
+            ) : phase === "playing" && mode === "timed" && drill && drill.index > announcedIndex ? (
+              // Timed mode between calls: the next step exists but hasn't been
+              // announced yet — don't reveal it.
+              <p className="text-lg font-semibold text-amber-200">Stand by…</p>
             ) : phase === "playing" && step ? (
               <div className="flex w-full items-center justify-between">
                 <div>
@@ -353,11 +466,14 @@ export function DrillRunner() {
             </label>
 
             <label className="block">
-              <span className="text-xs text-gray-400">Sequence length: {length}</span>
+              <span className="text-xs text-gray-400">
+                Sequence length: {length}
+                {mode === "timed" && length > zones.length ? " (zones repeat)" : ""}
+              </span>
               <input
                 type="range"
                 min={1}
-                max={zones.length}
+                max={mode === "timed" ? Math.max(zones.length, 20) : zones.length}
                 value={length}
                 onChange={(event) => setLength(Number(event.target.value))}
                 className="mt-1 w-full"
@@ -396,7 +512,7 @@ export function DrillRunner() {
               <div className="mt-1 grid grid-cols-2 gap-2">
                 <button
                   type="button"
-                  onClick={() => setMode("sequence")}
+                  onClick={() => chooseMode("sequence")}
                   className={`rounded-md border px-2 py-1.5 text-xs ${
                     mode === "sequence" ? "border-sky-400/50 bg-sky-500/15 text-sky-100" : "border-gray-700 text-gray-300"
                   }`}
@@ -405,14 +521,39 @@ export function DrillRunner() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setMode("reactive")}
+                  onClick={() => chooseMode("reactive")}
                   className={`rounded-md border px-2 py-1.5 text-xs ${
                     mode === "reactive" ? "border-sky-400/50 bg-sky-500/15 text-sky-100" : "border-gray-700 text-gray-300"
                   }`}
                 >
                   One at a time
                 </button>
+                <button
+                  type="button"
+                  onClick={() => chooseMode("timed")}
+                  className={`col-span-2 rounded-md border px-2 py-1.5 text-xs ${
+                    mode === "timed" ? "border-sky-400/50 bg-sky-500/15 text-sky-100" : "border-gray-700 text-gray-300"
+                  }`}
+                >
+                  Random timing — calls at surprise moments
+                </button>
               </div>
+              {mode === "timed" ? (
+                <label className="mt-2 block">
+                  <span className="text-xs text-gray-400">
+                    Drill window: ~{timespanSec}s (the actual length and call moments vary every run)
+                  </span>
+                  <input
+                    type="range"
+                    min={10}
+                    max={120}
+                    step={5}
+                    value={timespanSec}
+                    onChange={(event) => setTimespanSec(Number(event.target.value))}
+                    className="mt-1 w-full"
+                  />
+                </label>
+              ) : null}
             </div>
 
             <div className="flex flex-wrap gap-2 pt-1">

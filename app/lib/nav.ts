@@ -15,11 +15,13 @@ export type NavSection = {
 };
 
 export const NAV_SECTIONS: NavSection[] = [
-  { label: "Scan", href: "/" },
+  { label: "Scan", href: "/scan" },
+  { label: "Library", href: "/shots", requiresAuth: true },
   { label: "Targets", href: "/targets/new", activePrefix: "/targets" },
   { label: "Drill", href: "/drill" },
-  // Account lives in the auth chip on the right; add new app sections here and
-  // they appear in the header everywhere. Set requiresAuth for signed-in-only ones.
+  // The brand ("Trackr") on the left links to the home/landing page. Account lives
+  // in the auth chip on the right; add new app sections here and they appear in the
+  // header everywhere. Set requiresAuth for signed-in-only ones.
 ];
 
 // Whether a section should be highlighted for the current path. Root ("/") only

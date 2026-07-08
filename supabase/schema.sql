@@ -101,3 +101,75 @@ create policy "targets_update_own" on public.targets
 drop policy if exists "targets_delete_own" on public.targets;
 create policy "targets_delete_own" on public.targets
   for delete using (auth.uid() = owner_id);
+
+-- 6) Admin flag: hand-set in the Supabase dashboard (update profiles set is_admin
+--    = true where email = '...'). Gates the shot-classifier admin panel.
+alter table public.profiles add column if not exists is_admin boolean not null default false;
+
+-- 7) Shot-classifier models. Admins label patches in the admin panel, train a
+--    small JSON model in the browser, and publish a row here. The single
+--    published row is world-readable — that's how the trained classifier is
+--    "pushed out" to every scanner (it loads the latest on startup).
+create table if not exists public.classifier_models (
+  id uuid primary key default gen_random_uuid(),
+  version int not null,                       -- monotonically increasing
+  kind text not null,                         -- model format tag (e.g. logreg-radial-v1)
+  payload jsonb not null,                     -- serialized ModelJSON
+  notes text,
+  is_published boolean not null default false,
+  created_by uuid references auth.users (id) on delete set null,
+  created_at timestamptz not null default now()
+);
+create index if not exists classifier_models_published_idx
+  on public.classifier_models (is_published, version desc);
+
+alter table public.classifier_models enable row level security;
+
+-- Anyone (including anonymous scanners) may read published models. Admins may
+-- also read their own unpublished drafts.
+drop policy if exists "classifier_models_select_published" on public.classifier_models;
+create policy "classifier_models_select_published" on public.classifier_models
+  for select using (
+    is_published = true
+    or exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_admin)
+  );
+
+-- Only admins may insert/update/delete. Re-checked server-side before publish.
+drop policy if exists "classifier_models_admin_write" on public.classifier_models;
+create policy "classifier_models_admin_write" on public.classifier_models
+  for all
+  using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_admin))
+  with check (exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_admin));
+
+-- 8) Bullet annotations: a signed-in user saves a scanned session (the target
+--    calibration + every detected/edited shot) to their account from the Save
+--    step. These accumulate a labeled dataset of real shots-on-target for
+--    training detectors/classifiers later — hence admins can read them all.
+create table if not exists public.bullet_annotations (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  name text,
+  target jsonb,                               -- { widthInches, heightInches, pixelsPerInch, roi, ... }
+  shots jsonb not null,                       -- array of { n, x, y, dpx, din, t, method, group, conf }
+  shot_count int not null default 0,
+  created_at timestamptz not null default now()
+);
+create index if not exists bullet_annotations_user_id_idx on public.bullet_annotations (user_id, created_at desc);
+
+alter table public.bullet_annotations enable row level security;
+
+-- Owners manage their own rows; admins may read everyone's (training corpus).
+drop policy if exists "bullet_annotations_select_own_or_admin" on public.bullet_annotations;
+create policy "bullet_annotations_select_own_or_admin" on public.bullet_annotations
+  for select using (
+    auth.uid() = user_id
+    or exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_admin)
+  );
+
+drop policy if exists "bullet_annotations_insert_own" on public.bullet_annotations;
+create policy "bullet_annotations_insert_own" on public.bullet_annotations
+  for insert with check (auth.uid() = user_id);
+
+drop policy if exists "bullet_annotations_delete_own" on public.bullet_annotations;
+create policy "bullet_annotations_delete_own" on public.bullet_annotations
+  for delete using (auth.uid() = user_id);

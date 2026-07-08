@@ -1,6 +1,7 @@
 "use client";
 
 import { useId } from "react";
+import { useColorBlindMode } from "@/app/lib/accessibility";
 import { colorMeta, zonePattern, type ScenarioZone, type ZonePattern } from "@/app/lib/targets/scenario";
 
 // Visual feedback per zone after a hit is registered.
@@ -146,6 +147,7 @@ export function ScenarioBoard({
   // Pattern defs need document-unique ids; the board can appear more than once
   // (designer preview + drill page). Sanitized because useId's ":" breaks url(#…).
   const patternPrefix = useId().replace(/[^a-zA-Z0-9_-]/g, "");
+  const [colorBlind] = useColorBlindMode();
 
   const handleClick = (event: React.MouseEvent<SVGSVGElement>) => {
     if (!interactive) return;
@@ -185,13 +187,13 @@ export function ScenarioBoard({
               key={zone.id}
               id={`${patternPrefix}-${zone.id}`}
               pattern={pattern}
-              baseHex={colorMeta(zone.color).hex}
+              baseHex={colorMeta(zone.color, colorBlind).hex}
             />
           );
         })}
       </defs>
       {zones.map((zone) => {
-        const meta = colorMeta(zone.color);
+        const meta = colorMeta(zone.color, colorBlind);
         const pattern = zonePattern(zone);
         const state = feedback[zone.id];
         const stroke = state === "correct" ? "#22c55e" : state === "wrong" ? "#f43f5e" : "#0a0a0a";

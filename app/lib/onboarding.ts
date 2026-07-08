@@ -34,19 +34,19 @@ export const ONBOARDING_TIPS: OnboardingTip[] = [
     id: "calibrate",
     step: 2,
     title: "3 · Calibrate",
-    body: "Enter the target's real width/height, or draw a line of known length, so pixels convert to inches.",
+    body: "Pick your caliber and how you'll set the target's real size; enter the measurements on the next step so pixels convert to inches.",
   },
   {
     id: "scan",
-    step: 3,
-    title: "4 · Scan",
-    body: "Press Start Scan — Trackr detects impacts from motion + audio, then jumps you to Analysis.",
+    step: 4,
+    title: "5 · Scan",
+    body: "Press Start Scan to detect impacts. They appear on the target as they're found.",
   },
   {
-    id: "analysis",
-    step: 4,
-    title: "5 · Analysis",
-    body: "Shots are grouped on the map. Slide the confidence filter up to hide low-confidence noise.",
+    id: "review",
+    step: 6,
+    title: "7 · Map & Review",
+    body: "Edit groups and scrub the reveal on the Map step; see group stats and the full shot table on Review.",
   },
 ];
 

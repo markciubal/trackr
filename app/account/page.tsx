@@ -2,6 +2,7 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { signOut } from "@/app/auth/actions";
 import { getEntitlement } from "@/app/lib/entitlements";
+import { isCurrentUserAdmin } from "@/app/lib/admin";
 import { isSupabaseConfigured } from "@/app/lib/supabase/config";
 import { isStripeConfigured } from "@/app/lib/stripe";
 import { BillingButtons } from "./BillingButtons";
@@ -28,6 +29,8 @@ export default async function AccountPage() {
 
   const entitlement = await getEntitlement();
   if (!entitlement.userId) redirect("/login");
+
+  const admin = await isCurrentUserAdmin();
 
   return (
     <main className="flex min-h-screen items-start justify-center bg-black px-4 py-12 text-white">
@@ -64,6 +67,22 @@ export default async function AccountPage() {
             <BillingButtons isPro={entitlement.isPro} stripeConfigured={isStripeConfigured()} />
           </div>
         </div>
+
+        <Link
+          href="/shots"
+          className="block rounded-xl border border-sky-500/30 bg-sky-500/10 p-4 text-sm font-semibold text-sky-200 transition hover:bg-sky-500/20"
+        >
+          Shot library — browse &amp; compare saved shots →
+        </Link>
+
+        {admin ? (
+          <Link
+            href="/admin"
+            className="block rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm font-semibold text-amber-200 transition hover:bg-amber-500/20"
+          >
+            Shot classifier admin →
+          </Link>
+        ) : null}
 
         {!entitlement.isPro ? (
           <div className="rounded-xl border border-gray-800 bg-neutral-950/60 p-4 text-xs text-gray-400">
