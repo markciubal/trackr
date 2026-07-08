@@ -10,6 +10,7 @@ import { cropGrayWindow, getHoleClassifier, setHoleClassifier } from "@/app/lib/
 import { buildClassifierFromModel, isModelJSON } from "@/app/lib/training/jsonModel";
 import { pixelsPerInchFromQr, toInches, type LinearUnit as TargetLinearUnit } from "@/app/lib/targets/payload";
 import { getTarget } from "@/app/lib/targets/store";
+import { useScreenWakeLock } from "@/app/lib/useScreenWakeLock";
 
 type CvMat = {
   rows: number;
@@ -5156,41 +5157,8 @@ export default function Home() {
   // template and the clean background for subtraction. Logged shots stay.
   const rebaselineRequestedRef = useRef(false);
   // Keep the phone screen awake while a live camera scan runs — mobile screens
-  // sleeping mid-scan kill the stream. Best-effort (API optional, may be
-  // denied); re-acquired when the tab becomes visible again.
-  const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
-  useEffect(() => {
-    if (!(isScanning && captureMode === "stream")) return;
-    const nav = navigator as Navigator & {
-      wakeLock?: { request: (type: "screen") => Promise<{ release: () => Promise<void> }> };
-    };
-    if (!nav.wakeLock) return;
-    let cancelled = false;
-    const acquire = async () => {
-      try {
-        const sentinel = await nav.wakeLock!.request("screen");
-        if (cancelled) {
-          void sentinel.release().catch(() => undefined);
-          return;
-        }
-        wakeLockRef.current = sentinel;
-      } catch {
-        // Permission/battery policy — the scan still runs, screen may sleep.
-      }
-    };
-    void acquire();
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") void acquire();
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      cancelled = true;
-      document.removeEventListener("visibilitychange", onVisibility);
-      const sentinel = wakeLockRef.current;
-      wakeLockRef.current = null;
-      if (sentinel) void sentinel.release().catch(() => undefined);
-    };
-  }, [isScanning, captureMode]);
+  // sleeping mid-scan kill the stream.
+  useScreenWakeLock(isScanning && captureMode === "stream");
   // Audio-gated scanning: skip playback straight to the 0.5s windows around
   // detected gunshot spikes. Turn off to scan every frame — the fallback when
   // the clip's audio doesn't line up with the visible impacts.

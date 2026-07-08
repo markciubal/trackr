@@ -44,6 +44,7 @@ import {
   saveTarget,
   type TargetInfo,
 } from "@/app/lib/targets/store";
+import { useScreenWakeLock } from "@/app/lib/useScreenWakeLock";
 
 type Phase = "setup" | "announcing" | "playing" | "done";
 
@@ -134,6 +135,11 @@ export function DrillRunner() {
   const timedElapsedMsRef = useRef(0);
   const stepStartRef = useRef<number>(0);
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Keep the phone awake while a scenario runs — a locked screen would silence
+  // the callouts (and stop timed-mode timers on some devices). Paused runs stay
+  // awake too so a mid-drill breather doesn't lock the phone.
+  useScreenWakeLock(phase === "announcing" || phase === "playing");
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
