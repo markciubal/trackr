@@ -57,11 +57,14 @@ export function TargetDesigner({ baseUrl }: { baseUrl: string }) {
   // Scenario ("drill") mode: scoring "drill" carries shape/color/number/pattern
   // zones, and they ride along inside the QR payload (z param).
   const [scenarioCount, setScenarioCount] = useState(6);
-  const [scenarioZones, setScenarioZones] = useState<ScenarioZone[]>([]);
   // Seed the zones were generated from. When set, the QR carries just the tiny
   // {count, attrs, seed} recipe; null (e.g. zones loaded from an old save)
-  // falls back to encoding the full zone list.
-  const [scenarioSeed, setScenarioSeed] = useState<number | null>(null);
+  // falls back to encoding the full zone list. Drill is the default scoring, so
+  // a zone set is seeded up front (the live QR needs one immediately).
+  const [scenarioSeed, setScenarioSeed] = useState<number | null>(() => generateSeed());
+  const [scenarioZones, setScenarioZones] = useState<ScenarioZone[]>(() =>
+    generateScenarioZones(6, DEFAULT_SCENARIO_ATTRIBUTES, scenarioSeed ?? undefined),
+  );
   // Which attributes identify zones — e.g. B&W printers turn colors off and
   // lean on patterns/numbers instead.
   const [scenarioAttrs, setScenarioAttrs] = useState<ScenarioAttribute[]>(DEFAULT_SCENARIO_ATTRIBUTES);
@@ -616,6 +619,7 @@ export function TargetDesigner({ baseUrl }: { baseUrl: string }) {
                     zones={scenarioZones}
                     interactive={false}
                     bare
+                    aspectRatio={widthValue > 0 && heightValue > 0 ? widthValue / heightValue : 1}
                     className="absolute inset-0 h-full w-full"
                   />
                 </>

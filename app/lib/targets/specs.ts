@@ -14,7 +14,9 @@ export type ScoringId =
   | "drill"; // scenario zones (shapes/colors/numbers/patterns), carried in the QR
 
 // Single source of truth for the scoring/artwork dropdown in the designer.
+// Drill is the flagship mode — first in the list and the default selection.
 export const SCORING_OPTIONS: { id: ScoringId; label: string }[] = [
+  { id: "drill", label: "Drill (zones: shapes · colors · patterns)" },
   { id: "none", label: "Plain + crosshair" },
   { id: "bullseye-5", label: "Bullseye (rings)" },
   { id: "grid-1in", label: "1-inch grid" },
@@ -25,7 +27,6 @@ export const SCORING_OPTIONS: { id: ScoringId; label: string }[] = [
   { id: "usmc-d", label: "USMC \"D\" target (threat silhouette)" },
   { id: "usmc-b-mod", label: "USMC \"B\" modified (60\" ring + bottle)" },
   { id: "dots-2in", label: "2-inch dot drill" },
-  { id: "drill", label: "Drill (zones: shapes · colors · patterns)" },
 ];
 
 export type TargetSpec = {
@@ -41,7 +42,18 @@ export type TargetSpec = {
 
 // Starter catalog. Paper sizes are exact; the bullseye/grid are generic
 // (expand or replace with official specs as you build the product catalog).
+// The drill target leads: it's the default the designer opens with.
 export const TARGET_PRESETS: TargetSpec[] = [
+  {
+    id: "drill-letter",
+    name: "Drill target — 8.5 × 11 in",
+    widthValue: 8.5,
+    heightValue: 11,
+    unit: "in",
+    qrSizeValue: 1.5,
+    scoringId: "drill",
+    description: "Scenario zones (shapes/colors/numbers/patterns) on standard printer paper; the QR carries the layout.",
+  },
   {
     id: "us-letter",
     name: "US Letter — 8.5 × 11 in",
@@ -151,16 +163,6 @@ export const TARGET_PRESETS: TargetSpec[] = [
     qrSizeValue: 1.5,
     scoringId: "dots-2in",
     description: "Numbered 2-inch dots for dot-torture-style drills.",
-  },
-  {
-    id: "drill-18",
-    name: "Drill target — 18 × 18 in",
-    widthValue: 18,
-    heightValue: 18,
-    unit: "in",
-    qrSizeValue: 2,
-    scoringId: "drill",
-    description: "Scenario zones (shapes/colors/numbers/patterns); the QR carries the layout.",
   },
 ];
 

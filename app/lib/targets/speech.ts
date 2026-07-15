@@ -80,6 +80,13 @@ export function cancelSpeech(): void {
   if (canSpeak()) window.speechSynthesis.cancel();
 }
 
+// True while an utterance is speaking or queued. Detection code uses this to
+// ignore the microphone picking up our OWN voice prompts — the speakers'
+// audio is a spike like any other to the mic.
+export function isSpeaking(): boolean {
+  return canSpeak() && (window.speechSynthesis.speaking || window.speechSynthesis.pending);
+}
+
 export function speak(text: string, opts: { rate?: number; onEnd?: () => void } = {}): void {
   if (!canSpeak() || !text) {
     opts.onEnd?.();

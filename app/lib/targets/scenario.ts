@@ -58,7 +58,7 @@ export type ZonePattern =
 // version's arrays — doing so silently rewrites every target already printed.
 // To evolve the palette: add a PALETTE_V2 literal, register it in
 // SCENARIO_PALETTES, bump SCENARIO_PALETTE_VERSION, and leave v1 untouched.
-export const SCENARIO_PALETTE_VERSION = 1;
+export const SCENARIO_PALETTE_VERSION = 2;
 
 export type ScenarioPalette = {
   shapes: ZoneShape[];
@@ -73,7 +73,16 @@ const PALETTE_V1: ScenarioPalette = {
   patterns: ["solid", "striped", "banded", "dotted", "ringed", "checkered", "hatched", "zigzag", "grid"],
 };
 
-const SCENARIO_PALETTES: Record<number, ScenarioPalette> = { 1: PALETTE_V1 };
+// v2 — locked. Same attribute arrays as v1; the version bump exists because the
+// ZONE LAYOUT changed (portrait spread, see scenarioZoneLayout) and printed QRs
+// regenerate positions from {count, version} on scan.
+const PALETTE_V2: ScenarioPalette = {
+  shapes: ["circle", "square", "triangle", "diamond", "star", "pentagon", "hexagon", "cross", "octagon"],
+  colorNames: ["red", "orange", "yellow", "green", "blue", "purple", "pink", "cyan", "brown"],
+  patterns: ["solid", "striped", "banded", "dotted", "ringed", "checkered", "hatched", "zigzag", "grid"],
+};
+
+const SCENARIO_PALETTES: Record<number, ScenarioPalette> = { 1: PALETTE_V1, 2: PALETTE_V2 };
 
 // The palette a given version's zones were generated from. Unknown/newer
 // versions fall back to the latest this build knows (best effort).
@@ -285,28 +294,72 @@ function distinctNumbers(count: number, rng: () => number, min = 1, max = 99): n
   return [...pool];
 }
 
-// The deterministic grid layout for n zones. Kept separate from generation so
-// a zone set decoded from a QR (which only carries attributes, not positions)
-// reconstructs the exact same geometry.
+// The deterministic layout for n zones. Kept separate from generation so a
+// zone set decoded from a QR (which only carries attributes, not positions)
+// reconstructs the exact same geometry — which is why it is VERSIONED: the
+// printed paper in the wild has its zones where the layout of its era put
+// them, so each version's math is frozen.
 //
 // Rows fill top→bottom; a partial last row is RIGHT-aligned so any empty cells
 // fall on the bottom-left — i.e. the bottom-left space is the last to be filled.
-export function scenarioZoneLayout(n: number): { cx: number; cy: number; radius: number }[] {
-  const cols = Math.ceil(Math.sqrt(n));
-  const rows = Math.ceil(n / cols);
-  const cellW = 1 / cols;
-  const cellH = 1 / rows;
-  const radius = Math.min(cellW, cellH) * 0.36;
-  // Shift the final row right by the number of cells it's missing, so gaps sit
-  // on the bottom-left rather than the bottom-right.
+//
+// The sheet aspect the portrait layout is designed for (US Letter, w/h).
+export const SCENARIO_SHEET_ASPECT = 8.5 / 11;
+
+export function scenarioZoneLayout(
+  n: number,
+  version: number = SCENARIO_PALETTE_VERSION,
+): { cx: number; cy: number; radius: number }[] {
+  if (version <= 1) {
+    // v1 — square-ish grid, cells span the full unit square. Frozen.
+    const cols = Math.ceil(Math.sqrt(n));
+    const rows = Math.ceil(n / cols);
+    const cellW = 1 / cols;
+    const cellH = 1 / rows;
+    const radius = Math.min(cellW, cellH) * 0.36;
+    const lastRowCount = n - (rows - 1) * cols;
+    const lastRowOffset = cols - lastRowCount;
+    return Array.from({ length: n }, (_, i) => {
+      const row = Math.floor(i / cols);
+      const col = (i % cols) + (row === rows - 1 ? lastRowOffset : 0);
+      return {
+        cx: (col + 0.5) * cellW,
+        cy: (row + 0.5) * cellH,
+        radius,
+      };
+    });
+  }
+  // v2 — portrait spread designed for an 8.5×11 sheet: MORE ROWS than columns,
+  // and the rows are pinned to the TOP, MIDDLE(s), and BOTTOM of the page with
+  // minimal margins. Shapes grow to the largest size that fits both the
+  // columns and the row spacing (including the small caption strip under each
+  // shape). cx/cy stay normalized 0..1; radius is normalized to the sheet
+  // WIDTH (renderers keep shapes round by using the same physical scale on
+  // both axes). Frozen.
+  const rows = Math.ceil(Math.sqrt(n));
+  const cols = Math.ceil(n / rows);
+  const A = SCENARIO_SHEET_ASPECT; // converts width-unit lengths into height fractions
+  const marginX = 0.03;
+  const edgePad = 0.015; // minimal top/bottom page margin (fraction of height)
+  const captionPad = 0.035 * A; // caption strip below a shape, in height fractions
+  const cellW = (1 - marginX * 2) / cols;
+  // Largest radius where consecutive rows (shape + caption) can't overlap even
+  // with the first row hugging the top and the last hugging the bottom.
+  const maxRadiusForRows = (1 - edgePad * 2 - rows * captionPad) / (2 * A * rows);
+  const radius = Math.min(cellW * 0.42, maxRadiusForRows);
+  const rowY = (row: number): number => {
+    const first = edgePad + radius * A;
+    const last = 1 - edgePad - captionPad - radius * A;
+    return rows <= 1 ? 0.5 : first + ((last - first) * row) / (rows - 1);
+  };
   const lastRowCount = n - (rows - 1) * cols;
   const lastRowOffset = cols - lastRowCount;
   return Array.from({ length: n }, (_, i) => {
     const row = Math.floor(i / cols);
     const col = (i % cols) + (row === rows - 1 ? lastRowOffset : 0);
     return {
-      cx: (col + 0.5) * cellW,
-      cy: (row + 0.5) * cellH,
+      cx: marginX + (col + 0.5) * cellW,
+      cy: rowY(row),
       radius,
     };
   });
@@ -343,7 +396,7 @@ export function generateScenarioZones(
     ? shuffle(palette.patterns, rng).slice(0, n)
     : Array<ZonePattern>(n).fill("solid");
 
-  return scenarioZoneLayout(n).map((cell, i) => ({
+  return scenarioZoneLayout(n, version).map((cell, i) => ({
     id: `z${i + 1}`,
     shape: shapes[i],
     color: colors[i],
@@ -439,7 +492,7 @@ export function decodeZones(
   const palette = paletteForVersion(version);
   const n = raw.length / 5;
   if (n < 2 || n > maxZonesForPalette(palette)) return null;
-  const layout = scenarioZoneLayout(n);
+  const layout = scenarioZoneLayout(n, version);
   const zones: ScenarioZone[] = [];
   for (let i = 0; i < n; i += 1) {
     const chunk = raw.slice(i * 5, i * 5 + 5);

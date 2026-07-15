@@ -23,6 +23,7 @@ import {
   randomZoneStep,
   registerHit,
   scoreDrill,
+  SCENARIO_SHEET_ASPECT,
   startDrill,
   zonesFromRecipe,
 } from "@/app/lib/targets/scenario";
@@ -83,6 +84,9 @@ export function DrillRunner() {
   // shuffling, zone-count, or attribute changes — the on-screen drill must keep
   // matching the physical print. Unlocking detaches from the target.
   const [lockedSource, setLockedSource] = useState<string | null>(null);
+  // Sheet aspect (w/h) the board renders at, so it mirrors the printed paper.
+  // Defaults to US Letter; scanned/saved targets bring their own dimensions.
+  const [boardAspect, setBoardAspect] = useState(SCENARIO_SHEET_ASPECT);
   // Voice settings popover: which system voice reads the callouts + rate/pitch/
   // volume. Persisted (localStorage) and applied to every utterance.
   const [showVoiceSettings, setShowVoiceSettings] = useState(false);
@@ -152,11 +156,17 @@ export function DrillRunner() {
     const params = new URLSearchParams(window.location.search);
     const id = params.get("id");
     const rawZ = params.get("z");
-    // Palette version for inline recipes (self-contained QRs carry it as ?pv=).
+    // Palette/layout version for inline recipes (self-contained QRs carry it as
+    // ?pv=). Absent ⇒ v1: links without it predate versioned layouts.
     const rawPv = Number(params.get("pv"));
-    const paletteVersion = Number.isFinite(rawPv) && rawPv > 0 ? rawPv : undefined;
+    const paletteVersion = Number.isFinite(rawPv) && rawPv > 0 ? rawPv : 1;
 
-    const apply = (linked: ScenarioZone[], seedValue: number | null, sourceLabel: string) => {
+    const apply = (
+      linked: ScenarioZone[],
+      seedValue: number | null,
+      sourceLabel: string,
+      sheetAspect?: number | null,
+    ) => {
       if (!linked.length) return;
       setZones(linked);
       setZoneCount(linked.length);
@@ -165,19 +175,30 @@ export function DrillRunner() {
       setSeed(seedValue);
       // Scanned/linked target: lock the layout so it keeps matching the print.
       setLockedSource(sourceLabel);
+      if (sheetAspect && Number.isFinite(sheetAspect) && sheetAspect > 0) setBoardAspect(sheetAspect);
     };
+
+    // Physical sheet size can ride along in the QR URL (?w=&h=).
+    const rawW = Number(params.get("w"));
+    const rawH = Number(params.get("h"));
+    const urlAspect = rawW > 0 && rawH > 0 ? rawW / rawH : null;
 
     // 1) Saved locally → exact zones (works fully offline).
     const stored = id ? getTarget(id) : null;
     if (stored?.zones?.length) {
-      apply(stored.zones, stored.drillSeed ?? null, stored.name || id || "saved target");
+      apply(
+        stored.zones,
+        stored.drillSeed ?? null,
+        stored.name || id || "saved target",
+        stored.widthValue > 0 && stored.heightValue > 0 ? stored.widthValue / stored.heightValue : urlAspect,
+      );
       return;
     }
     // 2) Recipe carried inline (self-contained QR or the landing-page link).
     const recipe = decodeRecipe(rawZ);
     const inline = recipe ? zonesFromRecipe(recipe, paletteVersion) : decodeZones(rawZ, paletteVersion);
     if (inline?.length) {
-      apply(inline, recipe?.seed ?? null, "scanned target");
+      apply(inline, recipe?.seed ?? null, "scanned target", urlAspect);
       return;
     }
     // 3) Id-only → resolve from the catalog, then cache the whole target.
@@ -189,10 +210,15 @@ export function DrillRunner() {
         if (cancelled || !data?.drillRecipe) return;
         const fetched = decodeRecipe(data.drillRecipe);
         const zones = fetched
-          ? zonesFromRecipe(fetched, data.drillPaletteVersion ?? undefined)
+          ? zonesFromRecipe(fetched, data.drillPaletteVersion ?? 1)
           : null;
         if (!zones?.length) return;
-        apply(zones, fetched?.seed ?? null, data.name ?? "scanned target");
+        apply(
+          zones,
+          fetched?.seed ?? null,
+          data.name ?? "scanned target",
+          data.widthValue > 0 && data.heightValue > 0 ? data.widthValue / data.heightValue : urlAspect,
+        );
         saveTarget(
           createTargetInfo({
             id,
@@ -230,6 +256,7 @@ export function DrillRunner() {
     const nextSeed = generateSeed();
     setSeed(nextSeed);
     const next = generateScenarioZones(count, attributes, nextSeed);
+    setBoardAspect(SCENARIO_SHEET_ASPECT);
     setZones(next);
     setLength((current) => Math.min(current, next.length));
     setTimedRun(null);
@@ -472,6 +499,9 @@ export function DrillRunner() {
     setSeed(target.drillSeed ?? null);
     // Loaded targets are (potentially printed) fixed layouts — lock them too.
     setLockedSource(target.name || target.id);
+    if (target.widthValue > 0 && target.heightValue > 0) {
+      setBoardAspect(target.widthValue / target.heightValue);
+    }
     setDrill(null);
     setPhase("setup");
     setFeedback({});
@@ -499,8 +529,8 @@ export function DrillRunner() {
     const info = createTargetInfo({
       name: `Scenario ${zones.length}-zone`,
       unit: "in",
-      widthValue: 18,
-      heightValue: 18,
+      widthValue: 8.5,
+      heightValue: 11,
       qrSizeValue: 1.5,
       scoringId: "drill",
       zones,
@@ -585,6 +615,8 @@ export function DrillRunner() {
             interactive={phase === "playing"}
             onHitZone={handleHit}
             onZonePress={handleZonePress}
+            paper
+            aspectRatio={boardAspect}
           />
           <p className="text-[11px] text-gray-500">
             Tap/click a zone to register a hit. (This same engine accepts live shot-detection impacts — that wiring is

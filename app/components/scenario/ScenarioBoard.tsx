@@ -134,16 +134,29 @@ function PatternDef({ id, pattern, baseHex }: { id: string; pattern: ZonePattern
   );
 }
 
-function ZoneShapeEl({ zone, fill, stroke }: { zone: ScenarioZone; fill: string; stroke: string }) {
+function ZoneShapeEl({
+  zone,
+  fill,
+  stroke,
+  strokeWidth = 0.6,
+  viewHeight = 100,
+}: {
+  zone: ScenarioZone;
+  fill: string;
+  stroke: string;
+  strokeWidth?: number;
+  viewHeight?: number;
+}) {
   const cx = zone.cx * 100;
-  const cy = zone.cy * 100;
+  const cy = zone.cy * viewHeight;
   const r = zone.radius * 100;
-  const common = { fill, stroke, strokeWidth: 0.6 } as const;
+  const common = { fill, stroke, strokeWidth } as const;
 
   if (zone.shape === "circle") return <circle cx={cx} cy={cy} r={r} {...common} />;
   if (zone.shape === "square") {
     const s = r * 1.6;
-    return <rect x={cx - s / 2} y={cy - s / 2} width={s} height={s} rx={r * 0.12} {...common} />;
+    // Sharp corners — a square should read unmistakably as a square.
+    return <rect x={cx - s / 2} y={cy - s / 2} width={s} height={s} {...common} />;
   }
   return <polygon points={polygonPoints(zone.shape, cx, cy, r)} {...common} />;
 }
@@ -156,6 +169,8 @@ export function ScenarioBoard({
   feedback = {},
   interactive = true,
   bare = false,
+  paper = false,
+  aspectRatio = 1,
   className,
 }: {
   zones: ScenarioZone[];
@@ -169,6 +184,12 @@ export function ScenarioBoard({
   interactive?: boolean;
   // bare = no card chrome/background; for overlaying onto a printable target.
   bare?: boolean;
+  // paper = keep the card chrome but render on a WHITE background, so the
+  // board looks exactly like the printed target.
+  paper?: boolean;
+  // Sheet aspect ratio (width / height). The viewBox follows it so a portrait
+  // layout fills the full sheet height while shapes stay round.
+  aspectRatio?: number;
   className?: string;
 }) {
   // Pattern defs need document-unique ids; the board can appear more than once
@@ -186,16 +207,22 @@ export function ScenarioBoard({
     return () => window.clearTimeout(timer);
   }, [inspectedId]);
 
+  // Sheet-shaped view space: x runs 0..100, y runs 0..viewHeight so a portrait
+  // sheet gets a taller canvas and shapes stay round (radius is in x-units).
+  const safeAspect = aspectRatio > 0 ? aspectRatio : 1;
+  const viewHeight = 100 / safeAspect;
+
   const handleClick = (event: React.MouseEvent<SVGSVGElement>) => {
     const svg = event.currentTarget;
     const rect = svg.getBoundingClientRect();
     const x = (event.clientX - rect.left) / rect.width;
     const y = (event.clientY - rect.top) / rect.height;
-    // Nearest zone whose radius contains the click.
+    // Nearest zone whose radius contains the click. Radii are normalized to the
+    // sheet WIDTH, so the y distance converts into width units via the aspect.
     let hit: string | null = null;
     let best = Infinity;
     for (const zone of zones) {
-      const d = Math.hypot(x - zone.cx, y - zone.cy);
+      const d = Math.hypot(x - zone.cx, (y - zone.cy) / safeAspect);
       if (d <= zone.radius && d < best) {
         best = d;
         hit = zone.id;
@@ -211,14 +238,18 @@ export function ScenarioBoard({
   const inspectedZone = inspectedId ? (zones.find((zone) => zone.id === inspectedId) ?? null) : null;
   // "Solid" is only worth naming when patterns actually distinguish zones here.
   const patternsInPlay = attributesFromZones(zones).includes("pattern");
+  // White-surface rendering (print overlay, or paper mode on the drill page):
+  // captions and the inspector banner switch to dark-on-light styling.
+  const onPaper = bare || paper;
 
   return (
     <svg
-      viewBox="0 0 100 100"
+      viewBox={`0 0 100 ${viewHeight}`}
       preserveAspectRatio="xMidYMid meet"
       onClick={handleClick}
+      style={bare ? undefined : { aspectRatio: String(safeAspect) }}
       className={`${
-        bare ? "" : "aspect-square w-full rounded-lg border border-gray-700 bg-neutral-950"
+        bare ? "" : `w-full rounded-lg border border-gray-700 ${paper ? "bg-white" : "bg-neutral-950"}`
       } ${interactive ? "cursor-crosshair" : ""} ${className ?? ""}`}
     >
       <defs>
@@ -239,18 +270,30 @@ export function ScenarioBoard({
         const meta = colorMeta(zone.color, colorBlind);
         const pattern = zonePattern(zone);
         const state = feedback[zone.id];
-        const stroke = state === "correct" ? "#22c55e" : state === "wrong" ? "#f43f5e" : "#0a0a0a";
+        // No color and no pattern on this zone (shapes/numbers-only targets):
+        // draw it as an OUTLINE — white object, black border, black number —
+        // instead of a dark filled blob. Cleaner, and prints crisply on B&W.
+        const outlineStyle = zone.color === "black" && pattern === "solid";
+        const stroke =
+          state === "correct" ? "#22c55e" : state === "wrong" ? "#f43f5e" : outlineStyle ? "#111827" : "#0a0a0a";
         const cx = zone.cx * 100;
-        const cy = zone.cy * 100;
+        const cy = zone.cy * viewHeight;
         const fontSize = zone.radius * 100 * 0.9;
-        // Yellow needs a dark number for contrast; everything else gets white.
-        const textColor = zone.color === "yellow" ? "#111827" : "#ffffff";
-        const fill = pattern === "solid" ? meta.hex : `url(#${patternPrefix}-${zone.id})`;
+        // Outline zones get black text on white; yellow needs a dark number for
+        // contrast; everything else gets white.
+        const textColor = outlineStyle || zone.color === "yellow" ? "#111827" : "#ffffff";
+        const fill = outlineStyle ? "#ffffff" : pattern === "solid" ? meta.hex : `url(#${patternPrefix}-${zone.id})`;
         const r = zone.radius * 100;
         const captionSize = Math.max(1.7, Math.min(2.4, r * 0.17));
         return (
           <g key={zone.id} opacity={state === "wrong" ? 0.55 : 1}>
-            <ZoneShapeEl zone={zone} fill={fill} stroke={stroke} />
+            <ZoneShapeEl
+              zone={zone}
+              fill={fill}
+              stroke={stroke}
+              strokeWidth={outlineStyle ? 1 : 0.6}
+              viewHeight={viewHeight}
+            />
             {zone.number > 0 ? (
               <text
                 x={cx}
@@ -258,9 +301,10 @@ export function ScenarioBoard({
                 fontSize={fontSize}
                 fontWeight={700}
                 fill={textColor}
-                // Patterned fills are busy — outline the number so it stays legible.
-                stroke={pattern === "solid" ? undefined : textColor === "#ffffff" ? "#111827" : "#ffffff"}
-                strokeWidth={pattern === "solid" ? undefined : fontSize * 0.1}
+                // Slight contrasting outline so the number shows through
+                // whatever shape/fill sits behind it (busy patterns included).
+                stroke={textColor === "#ffffff" ? "#111827" : "#ffffff"}
+                strokeWidth={fontSize * 0.08}
                 paintOrder="stroke"
                 textAnchor="middle"
                 dominantBaseline="central"
@@ -270,7 +314,8 @@ export function ScenarioBoard({
                 {zone.number}
               </text>
             ) : null}
-            {/* Very small trait caption under the symbol (shape · color · pattern). */}
+            {/* Very small trait caption under the symbol (shape · color · pattern),
+                with a slight outline so it reads over any shape behind it. */}
             <text
               x={cx}
               y={cy + r + 0.8}
@@ -278,7 +323,10 @@ export function ScenarioBoard({
               textAnchor="middle"
               dominantBaseline="hanging"
               pointerEvents="none"
-              fill={bare ? "#374151" : "#9ca3af"}
+              fill={onPaper ? "#374151" : "#9ca3af"}
+              stroke={onPaper ? "#ffffff" : "#0a0a0a"}
+              strokeWidth={captionSize * 0.16}
+              paintOrder="stroke"
               style={{ fontFamily: "var(--font-jetbrains-mono), monospace" }}
             >
               {zoneTraits(zone, false, patternsInPlay)}
@@ -295,8 +343,8 @@ export function ScenarioBoard({
             width={96}
             height={6.4}
             rx={1.2}
-            fill={bare ? "#ffffff" : "rgba(9, 9, 11, 0.88)"}
-            stroke={bare ? "#111827" : "#52525b"}
+            fill={onPaper ? "#ffffff" : "rgba(9, 9, 11, 0.88)"}
+            stroke={onPaper ? "#111827" : "#52525b"}
             strokeWidth={0.25}
           />
           <text
@@ -306,7 +354,7 @@ export function ScenarioBoard({
             dominantBaseline="central"
             fontSize={3.2}
             fontWeight={600}
-            fill={bare ? "#111827" : "#f9fafb"}
+            fill={onPaper ? "#111827" : "#f9fafb"}
             style={{ fontFamily: "var(--font-jetbrains-mono), monospace" }}
           >
             {zoneTraits(inspectedZone, true, patternsInPlay)}

@@ -23,6 +23,8 @@ export const NAV_SECTIONS: NavSection[] = [
   { label: "Library", href: "/shots", requiresAuth: true },
   { label: "Targets", href: "/targets/new", activePrefix: "/targets" },
   { label: "Drill", href: "/drill" },
+  { label: "Dry-fire", href: "/dryfire" },
+  { label: "Stats", href: "/stats" },
   {
     label: "Donate",
     href: "https://www.paypal.com/donate/?hosted_button_id=Q9JCGNQF924WW",

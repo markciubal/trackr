@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); printf %s \"$input\" | grep -q 'glock17-aim-flag\\.scad' || exit 0; cd \"${CLAUDE_PROJECT_DIR:-.}\" && \"/c/Program Files/OpenSCAD/openscad.com\" -o hardware/glock17-aim-flag-stem.stl -D 'render_part=\"stem\"' hardware/glock17-aim-flag.scad >/dev/null 2>&1 && \"/c/Program Files/OpenSCAD/openscad.com\" -o hardware/glock22-aim-flag-stem.stl -D 'render_part=\"stem\"' -D 'caliber=\"40\"' hardware/glock17-aim-flag.scad >/dev/null 2>&1 || true",
+            "async": true,
+            "timeout": 180,
+            "statusMessage": "Re-exporting 9mm + .40 stem STLs"
+          }
+        ]
+      }
+    ]
+  }
+}

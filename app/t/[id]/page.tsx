@@ -45,10 +45,12 @@ export default async function TargetLandingPage({
   // drill page so the device rebuilds the exact zones without another lookup.
   const legacyZ = Array.isArray(sp.z) ? sp.z[0] : sp.z;
   const drillRecipe = record?.drillRecipe ?? legacyZ ?? null;
-  const drillPaletteVersion = record?.drillPaletteVersion ?? undefined;
+  // Absent version ⇒ palette/layout v1: these are legacy prints from before
+  // versions rode along, and their paper has the v1 zone layout.
+  const drillPaletteVersion = record?.drillPaletteVersion ?? 1;
   const drillZones = zonesFromParam(drillRecipe, drillPaletteVersion);
   const drillHref = drillRecipe
-    ? `/drill?id=${encodeURIComponent(id)}&z=${encodeURIComponent(drillRecipe)}`
+    ? `/drill?id=${encodeURIComponent(id)}&z=${encodeURIComponent(drillRecipe)}&pv=${drillPaletteVersion}`
     : null;
 
   // Scanning a drill target should drop straight into the scenario player rather
