@@ -15,9 +15,9 @@ export type TriggerSensitivity = "low" | "normal" | "high";
 
 // k = required sigmas above ambient; floor = absolute minimum threshold.
 const TRIGGER_GATES: Record<TriggerSensitivity, { k: number; floor: number }> = {
-  low: { k: 5, floor: 0.04 }, // noisy rooms — only loud, sharp clicks
-  normal: { k: 3, floor: 0.018 },
-  high: { k: 2.2, floor: 0.008 }, // quiet rooms / distant mic (default)
+  low: { k: 4, floor: 0.03 }, // noisy rooms — only loud, sharp clicks
+  normal: { k: 2.2, floor: 0.011 },
+  high: { k: 1.5, floor: 0.0045 }, // quiet rooms / distant mic (default)
 };
 
 export type ClickTrigger = {
@@ -35,6 +35,11 @@ export type ClickTrigger = {
   // set, a candidate transient must spectrally match your striker (and beat
   // the rack fingerprint, if provided) to fire. null disables matching.
   setFingerprints: (click: number[] | null, rack: number[] | null) => void;
+  // PRIMARY gate: the calibrated striker-click DURATION (ms the transient
+  // stays loud). A click's duration is consistent shot-to-shot, so it's the
+  // most reliable discriminator — a candidate much longer than this is a
+  // scrape/voice/rack, not a click. 0 = fall back to a generic short cap.
+  setClickDuration: (ms: number) => void;
   // Latest level / threshold (0..~1), for a small UI meter. peakHold decays
   // over ~1 s so a 2 ms click stays visible to a slow UI poll; ambient is
   // the rolling quiet-room level the threshold is derived from. suppressed
@@ -72,6 +77,58 @@ export function fingerprintSimilarity(a: number[], b: number[]): number {
   return dot; // inputs are unit-normalized
 }
 
+// AUDITION a stored fingerprint: we don't keep raw recordings, but the
+// 16-band spectrum IS the sound's identity — resynthesize it as band-shaped
+// noise bursts with a percussive envelope. A click plays as one short snap;
+// a slide as two bursts (pull-back … slam). Close enough to "hear what the
+// calibration captured" and judge whether it still matches reality.
+export function playFingerprintSample(
+  fp: number[],
+  opts: { durMs?: number; peak?: number; bursts?: number } = {},
+): void {
+  if (typeof window === "undefined" || fp.length === 0) return;
+  const durMs = opts.durMs ?? 90;
+  const bursts = Math.max(1, opts.bursts ?? 1);
+  const gapMs = 160;
+  const ctx = new AudioContext();
+  const nyq = ctx.sampleRate / 2;
+  const n = fp.length;
+  const level = Math.min(0.9, 0.25 + (opts.peak ?? 0.1) * 2);
+  for (let burst = 0; burst < bursts; burst += 1) {
+    const t0 = ctx.currentTime + 0.03 + (burst * gapMs) / 1000;
+    const len = Math.max(1, Math.round(ctx.sampleRate * (durMs / 1000)));
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < len; i += 1) data[i] = Math.random() * 2 - 1;
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(level, t0);
+    env.gain.exponentialRampToValueAtTime(0.001, t0 + durMs / 1000);
+    env.connect(ctx.destination);
+    // Parallel bandpass bank matching the fingerprint's log-spaced bands
+    // (bins 3..2048 of a 4096-point FFT at capture time).
+    for (let b = 0; b < n; b += 1) {
+      const e0 = (3 * Math.pow(2048 / 3, b / n)) / 2048;
+      const e1 = (3 * Math.pow(2048 / 3, (b + 1) / n)) / 2048;
+      const f0 = Math.sqrt(e0 * e1) * nyq;
+      if (f0 < 40 || f0 > nyq * 0.95) continue;
+      const bp = ctx.createBiquadFilter();
+      bp.type = "bandpass";
+      bp.frequency.value = f0;
+      bp.Q.value = 2;
+      const g = ctx.createGain();
+      g.gain.value = fp[b];
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(env);
+    }
+    src.start(t0);
+    src.stop(t0 + durMs / 1000 + 0.02);
+  }
+  window.setTimeout(() => void ctx.close().catch(() => undefined), bursts * gapMs + durMs + 300);
+}
+
 // Mean of several fingerprints, renormalized — averages calibration clicks.
 export function meanFingerprint(fps: number[][]): number[] | null {
   if (fps.length === 0) return null;
@@ -97,7 +154,7 @@ const RETRIGGER_FACTOR = 0.5; // follow-up transient above this × candidate pea
 const NOISY_QUIET_MS = 250; // silence needed to leave the suppressed state
 
 export function createClickTrigger(
-  onClick: (atMs: number, peak: number, fingerprint: number[] | null) => void,
+  onClick: (atMs: number, peak: number, fingerprint: number[] | null, durationMs: number) => void,
   sensitivity: TriggerSensitivity = "high",
 ): ClickTrigger {
   let audioContext: AudioContext | null = null;
@@ -119,16 +176,24 @@ export function createClickTrigger(
   let lastFp: number[] | null = null;
   let lastFpAtMs = 0;
   let lastSim: number | null = null;
-  const SIM_MIN = 0.65; // candidate must match the calibrated click this well
+  // DURATION gate (primary). clickDurMs = calibrated striker duration.
+  let clickDurMs = 0;
+  const GENERIC_MAX_DUR = 190; // pre-calibration cap on a "click" transient
   // Discrimination state.
   const recent: number[] = []; // last few poll peaks (pre-quiet check)
-  let candidate: { atMs: number; peak: number; fp: number[] | null } | null = null;
+  let candidate: { atMs: number; peak: number; fp: number[] | null; lastLoudMs: number } | null = null;
   let noisyUntilQuietMs = 0; // > now while suppressed by a noisy action
   let suppressedSinceMs = 0; // when the current suppression began
   let rejectedAtMs = 0;
-  // Capture mode (calibration): raw sequential spikes, no classification.
+  // Capture mode (calibration): sequential spikes reported at run END so the
+  // event's DURATION can be measured (pull-back vs slam durations for a rack,
+  // the striker duration for a click).
   let captureMode = false;
   let lastSpikeMs = 0;
+  let capStart = 0; // start of the current capture-mode loud run (0 = none)
+  let capLastLoud = 0;
+  let capPeak = 0;
+  let capFp: number[] | null = null;
   let level = {
     rms: 0,
     threshold: 1,
@@ -213,11 +278,27 @@ export function createClickTrigger(
     // and the gate sits above a real rack for seconds afterward.
     const speakingNow = isSpeaking();
     if (captureMode) {
-      // Raw sequential capture: any isolated above-noise spike is an event.
-      // 600 ms of spacing keeps one rack (several impacts) as ONE spike.
-      if (!speakingNow && peak > Math.max(emaMean * 4, 0.004) && now - lastSpikeMs > 600) {
-        lastSpikeMs = now;
-        onClick(now, peak, fingerprintNow());
+      // Sequential capture, reported at run END so DURATION is measured.
+      // A loud run starts on the first above-noise poll and ends after
+      // ~90 ms of quiet; its length is the event's duration. Each rack
+      // impact (pull-back, slam) is its own run → its own duration.
+      const capLoud = !speakingNow && peak > Math.max(emaMean * 4, 0.004);
+      if (capLoud) {
+        if (capStart === 0) {
+          capStart = now;
+          capPeak = peak;
+          capFp = fingerprintNow();
+        } else {
+          capPeak = Math.max(capPeak, peak);
+        }
+        capLastLoud = now;
+      } else if (capStart > 0 && now - capLastLoud > 90) {
+        const durMs = capLastLoud - capStart + POLL_MS;
+        if (now - lastSpikeMs > 220) {
+          lastSpikeMs = now;
+          onClick(capStart, capPeak, capFp, durMs);
+        }
+        capStart = 0;
       }
     } else if (suppressed) {
       // Waiting out a noisy action (rack): need sustained calm to re-arm.
@@ -237,49 +318,53 @@ export function createClickTrigger(
         noisyUntilQuietMs = now + NOISY_QUIET_MS;
       }
     } else if (candidate) {
-      // Confirmation window: any follow-up transient means this was the
-      // first impact of a compound action, not an isolated click.
-      if (peak > Math.max(threshold, candidate.peak * RETRIGGER_FACTOR)) {
+      // Extend the candidate's loud run while it keeps ringing.
+      const stillLoud = peak > threshold * 0.6;
+      if (stillLoud) {
+        candidate.lastLoudMs = now;
+        candidate.peak = Math.max(candidate.peak, peak);
+      }
+      const durMs = candidate.lastLoudMs - candidate.atMs + POLL_MS;
+      // DURATION is the PRIMARY gate: a striker click is a short, consistent
+      // snap. A candidate that stays loud past the calibrated click length
+      // (×2 + margin) is a scrape / voice / rack, not a click — reject on
+      // duration alone. A distinct SECOND loud burst is the compound signal
+      // of a rack.
+      const maxDur = clickDurMs > 0 ? clickDurMs * 2 + 70 : GENERIC_MAX_DUR;
+      const secondBurst =
+        peak > Math.max(threshold, candidate.peak * RETRIGGER_FACTOR) && now - candidate.lastLoudMs > POLL_MS * 1.5;
+      if (durMs > maxDur || secondBurst) {
         candidate = null;
         rejectedAtMs = now;
         noisyUntilQuietMs = now + NOISY_QUIET_MS;
-      } else if (now - candidate.atMs >= CONFIRM_MS) {
-        // FINGERPRINT GATE: with a calibrated click template, the candidate
-        // must sound like YOUR striker or it's rejected (a knuckle rap, a
-        // dropped pen). CAUTION on the rack comparison: the click and the
-        // rack are the SAME gun's metal — their templates typically score
-        // 0.9+ against each other, so "closer to rack than click" is a coin
-        // flip for a genuine dry-fire. Reject as rack only when the
-        // transient is BOTH decisively rack-matching in absolute terms AND
-        // clearly beats the click match; a striker-quality match fires.
-        let simOk = true;
+      } else if (now - candidate.atMs >= CONFIRM_MS && !stillLoud) {
+        // Clean short transient, confirmed quiet. FINGERPRINT is now only a
+        // SECONDARY veto: reject only when the sound is decisively rack-like
+        // (both the click and rack are the same gun's metal, so their
+        // templates score 0.9+ against each other — never trust a close
+        // call). Duration already did the primary work.
         let rackLike = false;
         if (clickFp && candidate.fp) {
           const sim = fingerprintSimilarity(candidate.fp, clickFp);
           lastSim = sim;
           const rackSim = rackFp ? fingerprintSimilarity(candidate.fp, rackFp) : -1;
-          rackLike = rackSim > 0.92 && rackSim > sim + 0.02;
-          simOk = sim >= SIM_MIN && !rackLike;
+          rackLike = rackSim > 0.94 && rackSim > sim + 0.05;
         }
         const atMs = candidate.atMs; // original click time — aim sampling uses it
         const clickPeak = candidate.peak;
         const clickFingerprint = candidate.fp;
         candidate = null;
-        if (simOk) {
+        if (!rackLike) {
           lastFireMs = now; // refractory belongs to real fires only
-          onClick(atMs, clickPeak, clickFingerprint);
+          onClick(atMs, clickPeak, clickFingerprint, durMs);
         } else {
           rejectedAtMs = now;
-          // A transient that sounds like YOUR RACK is the start of a slide
-          // pull — enter the hold state until the room settles, so the UI's
-          // "HOLDING (noisy)" is true for characterized racks too, and the
-          // rack's later impacts can't sneak through as candidates.
-          if (rackLike) noisyUntilQuietMs = now + NOISY_QUIET_MS;
+          noisyUntilQuietMs = now + NOISY_QUIET_MS;
         }
       }
     } else if (armed && loud) {
       if (preQuiet) {
-        candidate = { atMs: now, peak, fp: fingerprintNow() };
+        candidate = { atMs: now, peak, fp: fingerprintNow(), lastLoudMs: now };
       } else {
         // Loud without preceding quiet — mid-rumble; suppress.
         rejectedAtMs = now;
@@ -364,11 +449,15 @@ export function createClickTrigger(
       noisyUntilQuietMs = 0;
       suppressedSinceMs = 0;
       lastSpikeMs = 0;
+      capStart = 0;
     },
     setFingerprints: (click: number[] | null, rack: number[] | null) => {
       clickFp = click;
       rackFp = rack;
       lastSim = null;
+    },
+    setClickDuration: (ms: number) => {
+      clickDurMs = ms > 0 ? ms : 0;
     },
     getLevel: () => level,
   };

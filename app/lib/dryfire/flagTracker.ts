@@ -41,6 +41,13 @@ export type FlagObservation = {
   residual: number; // affine fit RMS as a fraction of cellPx (quality gate)
   features: number[]; // [1, bx, by, a11, a12, a21, a22], normalized by normPx
   quadColors?: TrackedColors; // color mode: sampled quadrant appearance
+  // Mean RGB read from the card's WHITE quadrant (off the dot) — a built-in
+  // gray card: its chroma IS the current illuminant at the card. null when
+  // the reading was implausible (glare, occlusion, mis-sample).
+  whiteRGB?: [number, number, number] | null;
+  // Number of patches synthesized by the rigid-coherence hold (0 = every
+  // patch genuinely seen). The caller caps consecutive soft frames.
+  softPatches?: number;
 };
 
 // Everything the detector saw, stage by stage — for the on-screen diagnostics
@@ -135,6 +142,66 @@ type Blob = {
 // Neutral squareness for synthetic/legacy blobs — neither reward nor damn.
 function sqOf(b: Blob): number {
   return b.squareness ?? 0.7;
+}
+
+// Build a tracker seed pose from three HUMAN-IDENTIFIED patch centers
+// (guided taps on a frozen frame): yellow ("red" slot), cyan ("green"),
+// magenta ("blue"), in processing-frame coordinates.
+export function seedFromThreePoints(
+  yellowPt: Point,
+  cyanPt: Point,
+  magentaPt: Point,
+): { affine: [number, number, number, number]; center: Point; cellPx: number } {
+  const tpl = templateFor("cmy");
+  const A = affineFrom3Pts(tpl.p1, tpl.p2, tpl.p3, yellowPt, cyanPt, magentaPt);
+  const cellPx = (Math.hypot(A.a11, A.a21) + Math.hypot(A.a12, A.a22)) / 2;
+  return { affine: [A.a11, A.a12, A.a21, A.a22], center: { x: A.bx, y: A.by }, cellPx };
+}
+
+// "Is this spot a BRIGHT, NEUTRAL (white) patch?" — sampled with stride 2,
+// scored +1 for clean white … −1 for strongly colored. The card's fourth
+// quadrant is its most unusual feature: backgrounds that fake three color
+// squares almost never also present a white square completing the layout.
+// Used as a SCORING bonus in both acquisition paths, never a gate.
+function whiteQuadScore(
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number,
+  cx: number,
+  cy: number,
+  half: number,
+): number {
+  const x0 = Math.max(0, Math.round(cx - half));
+  const x1 = Math.min(width - 1, Math.round(cx + half));
+  const y0 = Math.max(0, Math.round(cy - half));
+  const y1 = Math.min(height - 1, Math.round(cy + half));
+  let cnt = 0;
+  let good = 0;
+  let colored = 0;
+  for (let y = y0; y <= y1; y += 2)
+    for (let x = x0; x <= x1; x += 2) {
+      const o = (y * width + x) * 4;
+      const r = rgba[o];
+      const g = rgba[o + 1];
+      const b = rgba[o + 2];
+      const sum = r + g + b;
+      cnt += 1;
+      if (sum < 40) continue;
+      const dN = Math.hypot(r / sum - 1 / 3, g / sum - 1 / 3);
+      if (sum > 330 && dN < 0.08) good += 1;
+      else if (dN > 0.14) colored += 1;
+    }
+  return cnt > 0 ? (good - colored) / cnt : 0;
+}
+
+// HARD acquisition gate: a candidate patch big enough to judge must be
+// reasonably quad-shaped. Shirts, foliage, and skin make amorphous blobs
+// (squareness < ~0.4); a printed patch — even blurred or keystoned —
+// stays well above. Small blobs are exempt (shape is noise at that size),
+// and TRACKING never uses this (a held lock stays geometry-relaxed).
+const SQUARENESS_GATE = 0.45;
+function isSquareEnough(b: Blob): boolean {
+  return b.area < 60 || (b.squareness ?? 0.7) >= SQUARENESS_GATE;
 }
 
 function otsuThreshold(gray: Uint8Array): number {
@@ -1270,8 +1337,122 @@ export function prescanCMY(rgba: Uint8ClampedArray, width: number, height: numbe
 // millisecond): per-channel histogram top-K strength scales, then the
 // centroid of each channel's strong samples. If all three centroids sit
 // near one another, that spot is almost certainly the card. Used to steer
-// a missing track's search region back onto the card instead of
-// dead-reckoning into empty space.
+// ---- Ink quadtree -----------------------------------------------------------
+// Minimize the screen area the EXPENSIVE full-resolution analysis touches.
+// A coarse ink-activity grid feeds an integral image; a quadtree then
+// recursively PRUNES empty quadrants in O(1) each (never descending into
+// screen with no colored ink), so we quickly isolate the small region(s)
+// that actually contain C/Y/M. The costly per-pixel classification and
+// flood-fill run only inside those boxes — not the whole frame.
+export type InkRegion = { x: number; y: number; w: number; h: number; strength: number };
+
+export function inkQuadtree(rgba: Uint8ClampedArray, width: number, height: number): InkRegion[] {
+  const CELL = 10; // px per grid cell (coarse activity map)
+  const gw = Math.max(1, Math.floor(width / CELL));
+  const gh = Math.max(1, Math.floor(height / CELL));
+  // Per-cell ink activity = max(cyan, yellow, magenta) opponent strength at
+  // the cell's center sample. Cheap: one pixel per cell.
+  const act = new Float32Array(gw * gh);
+  for (let gy = 0; gy < gh; gy += 1) {
+    const py = Math.min(height - 1, gy * CELL + (CELL >> 1));
+    const base = py * width;
+    for (let gx = 0; gx < gw; gx += 1) {
+      const o = (base + Math.min(width - 1, gx * CELL + (CELL >> 1))) * 4;
+      const r = rgba[o];
+      const g = rgba[o + 1];
+      const b = rgba[o + 2];
+      const sum = r + g + b;
+      if (sum < 60 || sum > 720) continue;
+      const s = Math.max((Math.min(g, b) - r) / sum, (Math.min(r, g) - b) / sum, (Math.min(r, b) - g) / sum);
+      if (s > 0.07) act[gy * gw + gx] = s;
+    }
+  }
+  // Integral image of the grid → any quadrant's total activity in O(1).
+  const IW = gw + 1;
+  const II = new Float32Array(IW * (gh + 1));
+  for (let y = 0; y < gh; y += 1) {
+    let row = 0;
+    const oCur = (y + 1) * IW;
+    const oPrev = y * IW;
+    for (let x = 0; x < gw; x += 1) {
+      row += act[y * gw + x];
+      II[oCur + x + 1] = II[oPrev + x + 1] + row;
+    }
+  }
+  const sumOf = (x: number, y: number, w: number, h: number): number =>
+    II[(y + h) * IW + x + w] - II[y * IW + x + w] - II[(y + h) * IW + x] + II[y * IW + x];
+
+  // Quadtree: descend, pruning quadrants below the ink floor. Active leaves'
+  // cells are marked; empty screen is never visited past its parent's O(1)
+  // rejection.
+  const mark = new Uint8Array(gw * gh);
+  const LEAF = 8; // stop subdividing at this grid size
+  const PRUNE = 0.8; // a quadrant totaling less ink than this is "empty"
+  const rec = (x: number, y: number, w: number, h: number): void => {
+    if (sumOf(x, y, w, h) < PRUNE) return; // ← the area-skipping prune
+    if (w <= LEAF && h <= LEAF) {
+      for (let yy = y; yy < y + h; yy += 1)
+        for (let xx = x; xx < x + w; xx += 1) if (act[yy * gw + xx] > 0) mark[yy * gw + xx] = 1;
+      return;
+    }
+    const hw = Math.max(1, w >> 1);
+    const hh = Math.max(1, h >> 1);
+    rec(x, y, hw, hh);
+    if (w - hw > 0) rec(x + hw, y, w - hw, hh);
+    if (h - hh > 0) rec(x, y + hh, hw, h - hh);
+    if (w - hw > 0 && h - hh > 0) rec(x + hw, y + hh, w - hw, h - hh);
+  };
+  rec(0, 0, gw, gh);
+
+  // Connected components (8-neighbour) over marked cells → disjoint ink
+  // regions, so a distant distractor is its own box rather than inflating
+  // the card's. Strongest first.
+  const visited = new Uint8Array(gw * gh);
+  const stack = new Int32Array(gw * gh);
+  const regions: InkRegion[] = [];
+  for (let start = 0; start < gw * gh; start += 1) {
+    if (!mark[start] || visited[start]) continue;
+    let top = 0;
+    stack[top++] = start;
+    visited[start] = 1;
+    let minX = gw;
+    let minY = gh;
+    let maxX = 0;
+    let maxY = 0;
+    let strength = 0;
+    while (top > 0) {
+      const idx = stack[--top];
+      const cx = idx % gw;
+      const cy = (idx / gw) | 0;
+      strength += act[idx];
+      if (cx < minX) minX = cx;
+      if (cx > maxX) maxX = cx;
+      if (cy < minY) minY = cy;
+      if (cy > maxY) maxY = cy;
+      for (let dy = -1; dy <= 1; dy += 1)
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const nx = cx + dx;
+          const ny = cy + dy;
+          if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+          const ni = ny * gw + nx;
+          if (mark[ni] && !visited[ni]) {
+            visited[ni] = 1;
+            stack[top++] = ni;
+          }
+        }
+    }
+    regions.push({
+      x: minX * CELL,
+      y: minY * CELL,
+      w: (maxX - minX + 1) * CELL,
+      h: (maxY - minY + 1) * CELL,
+      strength,
+    });
+  }
+  regions.sort((a, b) => b.strength - a.strength);
+  return regions;
+}
+
 export function cymBeacon(rgba: Uint8ClampedArray, width: number, height: number): Point | null {
   const STRIDE = 8;
   const HB = 64;
@@ -1461,6 +1642,7 @@ export function analyzeColorFlagLoose(
   const minArea = Math.max(6, Math.round(n * 0.8e-5));
   const cands = masks.map((mask) =>
     maskBlobs(mask, width, height, minArea)
+      .filter(isSquareEnough) // fabric/foliage look-alikes die HERE
       .sort((a, b) => b.area - a.area)
       .slice(0, LOOSE_TOP_BLOBS),
   );
@@ -1518,7 +1700,16 @@ export function analyzeColorFlagLoose(
           y: affine.by + affine.a21 * tpl.dot[0] + affine.a22 * tpl.dot[1],
         };
         const sqAvg = (sqOf(pY) + sqOf(pC) + sqOf(pM)) / 3;
-        let score = aMax / aMin - Math.min(1, fill) * 2 - Math.log2(Math.max(4, quadPx)) - sqAvg * 1.2;
+        // WHITE-QUADRANT bonus: a bright neutral square where the fourth
+        // quadrant belongs is strong confirmation; ink there is a penalty.
+        // (Sampled 30% outward of its center so the black dot can't bias it.)
+        const wpt = {
+          x: affine.bx + affine.a11 * tpl.dot[0] * 1.3 + affine.a12 * tpl.dot[1] * 1.3,
+          y: affine.by + affine.a21 * tpl.dot[0] * 1.3 + affine.a22 * tpl.dot[1] * 1.3,
+        };
+        const whiteBonus = whiteQuadScore(rgba, width, height, wpt.x, wpt.y, Math.max(2, quadPx * 0.25));
+        let score =
+          aMax / aMin - Math.min(1, fill) * 2 - Math.log2(Math.max(4, quadPx)) - sqAvg * 1.2 - whiteBonus * 1.5;
         // Shared keystone: three patches on ONE plane rotate together — the
         // top edges of their corner quads must point the same way.
         if (pY.corners && pC.corners && pM.corners && aMin >= 60) {
@@ -1637,6 +1828,13 @@ export function analyzeColorFlag(
   refColors: TrackedColors | null = null,
   refBrightTol = 0.5,
   fg: ForegroundGrid | null = null,
+  // User-adjustable COLOR WINDOW: acceptance radius (chroma units) around
+  // the locked reference colors. Tighter = fewer look-alikes admitted.
+  refWindow = 0.09,
+  // Live illuminant gains from the white quadrant (see FlagTrackPrior).
+  refGain: [number, number, number] | null = null,
+  // Accumulated observed shades per ink (see ShadePools).
+  refShades?: ShadePools,
 ): { observation: FlagObservation | null; debug: FlagDebug } {
   const n = width * height;
   const redMask = new Uint8Array(n);
@@ -1653,16 +1851,28 @@ export function analyzeColorFlag(
   // Wide by design: the card's inks are far from anything else in a normal
   // scene, so err toward pickup — the layout/chirality gates downstream do
   // the discriminating, not the per-pixel color gate.
-  const REF_THR = 0.13;
-  // Illuminant-locus LUT over the reference colors (2700–6500 K synthetic
-  // sweep, neutral competition baked in) + per-ink loci for the confidence
-  // computation of classified pixels.
-  const refLUT = refColors ? buildInkLUT(refColors, REF_THR) : null;
-  const refLoci = refColors
-    ? [buildChromaLocus(refColors.red), buildChromaLocus(refColors.green), buildChromaLocus(refColors.blue)]
+  const REF_THR = refWindow;
+  // Illuminant correction first (white-quadrant gains), then the locus LUT
+  // (2700–6500 K synthetic sweep, neutral competition baked in) + per-ink
+  // loci for the confidence computation of classified pixels.
+  const refLit =
+    refColors && refGain
+      ? {
+          red: [refColors.red[0] * refGain[0], refColors.red[1] * refGain[1], refColors.red[2] * refGain[2]] as [number, number, number],
+          green: [refColors.green[0] * refGain[0], refColors.green[1] * refGain[1], refColors.green[2] * refGain[2]] as [number, number, number],
+          blue: [refColors.blue[0] * refGain[0], refColors.blue[1] * refGain[1], refColors.blue[2] * refGain[2]] as [number, number, number],
+        }
+      : refColors;
+  const refLUT = refLit ? buildInkLUT(refLit, REF_THR, refShades) : null;
+  const refLoci = refLit
+    ? [
+        buildChromaLocus(refLit.red).concat(refShades?.[0] ?? []),
+        buildChromaLocus(refLit.green).concat(refShades?.[1] ?? []),
+        buildChromaLocus(refLit.blue).concat(refShades?.[2] ?? []),
+      ]
     : null;
-  const refSums = refColors
-    ? [refColors.red, refColors.green, refColors.blue].map((c) => Math.max(1, c[0] + c[1] + c[2]))
+  const refSums = refLit
+    ? [refLit.red, refLit.green, refLit.blue].map((c) => Math.max(1, c[0] + c[1] + c[2]))
     : null;
   for (let i = 0; i < n; i += 1) {
     // Motion veto: pixels in cells that match the background can't be the
@@ -1729,9 +1939,38 @@ export function analyzeColorFlag(
   // pool of ALL blue blobs down to tiny — it's the smallest blue thing on the
   // card and must never be crowded out of a top-N list by background strays.
   const allBlues = maskBlobs(blueMask, width, height, 5, conf).sort((a, b) => b.area - a.area);
-  const reds = scoreAndPick(maskBlobs(redMask, width, height, 12, conf).sort((a, b) => b.area - a.area).slice(0, 8), 1, 4);
-  const greens = scoreAndPick(maskBlobs(greenMask, width, height, 12, conf).sort((a, b) => b.area - a.area).slice(0, 8), 2, 4);
-  const blues = scoreAndPick(allBlues.filter((b) => b.area >= 12).slice(0, 8), 3, 4);
+  // WINNER-TAKE-ALL when reference colors are locked: rank each channel's
+  // candidates by exact color closeness to the locked ink (illuminant-locus
+  // distance) and keep ONLY the closest — a dynamic threshold set by the
+  // best blob itself. Window-squeakers are discarded before the layout
+  // search ever sees them.
+  const topByColor = (list: Scored[], locus: ChromaLocus | null): Scored[] => {
+    if (!locus || list.length <= 1) return list;
+    let best: Scored | null = null;
+    let bestD = Infinity;
+    for (const b of list) {
+      const [r, g, bl] = sampleMeanRGB(rgba, width, height, b.x, b.y, 3);
+      const s = Math.max(1, r + g + bl);
+      const d = locusDist2(r / s, g / s, locus);
+      if (d < bestD) {
+        bestD = d;
+        best = b;
+      }
+    }
+    return best ? [best] : list;
+  };
+  const reds = topByColor(
+    scoreAndPick(maskBlobs(redMask, width, height, 12, conf).sort((a, b) => b.area - a.area).slice(0, 8), 1, 4),
+    refLoci ? refLoci[0] : null,
+  );
+  const greens = topByColor(
+    scoreAndPick(maskBlobs(greenMask, width, height, 12, conf).sort((a, b) => b.area - a.area).slice(0, 8), 2, 4),
+    refLoci ? refLoci[1] : null,
+  );
+  const blues = topByColor(
+    scoreAndPick(allBlues.filter((b) => b.area >= 12).slice(0, 8), 3, 4),
+    refLoci ? refLoci[2] : null,
+  );
   // Dot candidates: RGB card → small blue blobs; CMY card → small BLACK
   // blobs (the dot prints black there).
   const dotPool =
@@ -1827,11 +2066,15 @@ export function analyzeColorFlag(
     for (const green of greens)
       for (const blue of blues) {
         gates.triples += 1;
-        // Quadrants must be similar sizes.
+        // HARD squareness gate: printed quads only — an amorphous fabric
+        // or foliage blob can't enter a lock no matter how good its color.
+        if (!isSquareEnough(red) || !isSquareEnough(green) || !isSquareEnough(blue)) continue;
+        // Quadrants must be similar sizes. (Winner-take-all already keeps
+        // murals and specks out, so this only rejects the absurd.)
         const areas = [red.area, green.area, blue.area];
         const maxA = Math.max(...areas);
         const minA = Math.min(...areas);
-        if (maxA > minA * 3.2) continue;
+        if (maxA > minA * 4.5) continue;
         gates.sizeOk += 1;
         const affine = affineFrom3Pts(tpl.p1, tpl.p2, tpl.p3, red, green, blue);
         const quadPx = (Math.hypot(affine.a11, affine.a21) + Math.hypot(affine.a12, affine.a22)) / 2;
@@ -1861,11 +2104,19 @@ export function analyzeColorFlag(
           Math.max(0, 0.22 - green.strength) * 3 +
           Math.max(0, 0.22 - blue.strength) * 3;
         const squarePenalty = (1 - (sqOf(red) + sqOf(green) + sqOf(blue)) / 3) * 0.8;
-        const score = areaScore + purityPenalty + squarePenalty;
         const predictedDot = {
           x: affine.a11 * tpl.dot[0] + affine.a12 * tpl.dot[1] + affine.bx,
           y: affine.a21 * tpl.dot[0] + affine.a22 * tpl.dot[1] + affine.by,
         };
+        // WHITE-QUADRANT bonus (scoring only, never a gate): bright neutral
+        // where the fourth quadrant belongs confirms the card; ink there
+        // penalizes. Sampled 30% outward so the black dot can't bias it.
+        const wq = {
+          x: affine.a11 * tpl.dot[0] * 1.3 + affine.a12 * tpl.dot[1] * 1.3 + affine.bx,
+          y: affine.a21 * tpl.dot[0] * 1.3 + affine.a22 * tpl.dot[1] * 1.3 + affine.by,
+        };
+        const whiteBonus = whiteQuadScore(rgba, width, height, wq.x, wq.y, Math.max(2, quadPx * 0.25));
+        const score = areaScore + purityPenalty + squarePenalty - whiteBonus * 0.9;
         const triple: Triple = { red, green, blue, affine, quadPx, det, score, chiralityOk, predictedDot };
         if (!bestGeom || score < bestGeom.score) bestGeom = triple;
         // The dot: a SMALL blue blob near the white quadrant's center. Pool is
@@ -1915,12 +2166,22 @@ export function analyzeColorFlag(
   } | null = bestDot ? { ...bestDot, dotless: false } : null;
   if (!chosen && bestGeom) {
     const t = bestGeom;
-    // HIGH-CONFIDENCE colors need no dot at all: three strong, correctly
-    // swept, size-consistent patches ARE the card — the dot is only an
-    // upgrade (a 4th correspondence → homography), never a requirement.
-    const highConf =
-      Math.min(t.red.strength, t.green.strength, t.blue.strength) >= 0.2 && t.score <= 0.6 && t.quadPx >= 6;
-    if (highConf) {
+    // REFERENCE MODE ACCEPTS OUTRIGHT: when the match ran against the
+    // human-committed / locked reference colors, identity was already
+    // settled upstream — winner-take-all against illuminant-corrected loci
+    // in a tight window, squareness, white-quadrant scoring. Demanding the
+    // dot or a generic purity number on top was the single most
+    // restrictive filter in the pipeline, vetoing frames that visibly
+    // matched. The dot stays as a pure bonus (homography upgrade).
+    if (refColors) {
+      chosen = { triple: t, dot: t.predictedDot, dotErr: t.quadPx * 0.6, dotless: true };
+    } else if (
+      // GENERIC path (no reference): HIGH-CONFIDENCE colors need no dot —
+      // three strong, size-consistent patches ARE the card.
+      Math.min(t.red.strength, t.green.strength, t.blue.strength) >= 0.2 &&
+      t.score <= 0.6 &&
+      t.quadPx >= 6
+    ) {
       chosen = { triple: t, dot: t.predictedDot, dotErr: t.quadPx * 0.6, dotless: true };
     } else {
       // Medium confidence: the original tighter dotless gates.
@@ -2067,6 +2328,15 @@ export type FlagTrackPrior = {
   // drifts, so a rigid acceptance radius would refuse the real card even
   // when it's back in view.
   misses?: number;
+  // User-adjustable COLOR WINDOW (chroma units) around the learned colors.
+  chromaWindow?: number;
+  // Live illuminant gains (mean-normalized, from the white quadrant): the
+  // committed identity colors are multiplied by these before classification,
+  // so lighting is tracked as its own variable while identity stays frozen.
+  illumGain?: [number, number, number];
+  // Accumulated observed shades per ink (see ShadePools) — extra accepted
+  // chroma points on top of the synthetic locus.
+  shades?: ShadePools;
 };
 
 function chroma(c: readonly [number, number, number]): [number, number] {
@@ -2133,6 +2403,12 @@ export function locusDist2(cr: number, cg: number, locus: ChromaLocus): number {
   return bestD;
 }
 
+// ACCUMULATED SHADES: chroma points of each ink actually OBSERVED during
+// valid locks (the card sweeping through poses/lighting during the 9-dot
+// calibration and training). Appended to the synthetic illuminant locus,
+// so classification accepts every shade the ink has genuinely shown.
+export type ShadePools = [[number, number][], [number, number][], [number, number][]]; // red, green, blue slots
+
 // Per-frame classification LUT over quantized chroma space: 64×64 cells,
 // each holding 0 (none) or 1..3 (ink index). Baked once per call (~270k
 // flops), then the pixel loop is a single array lookup — the locus test
@@ -2141,8 +2417,13 @@ const LUT_N = 64;
 export function buildInkLUT(
   colors: { red: readonly [number, number, number]; green: readonly [number, number, number]; blue: readonly [number, number, number] },
   thr: number,
+  shades?: ShadePools,
 ): Uint8Array {
-  const loci = [buildChromaLocus(colors.red), buildChromaLocus(colors.green), buildChromaLocus(colors.blue)];
+  const loci = [
+    buildChromaLocus(colors.red).concat(shades?.[0] ?? []),
+    buildChromaLocus(colors.green).concat(shades?.[1] ?? []),
+    buildChromaLocus(colors.blue).concat(shades?.[2] ?? []),
+  ];
   const lut = new Uint8Array(LUT_N * LUT_N);
   const thr2 = thr * thr;
   for (let iy = 0; iy < LUT_N; iy += 1) {
@@ -2189,18 +2470,36 @@ export function trackColorFlag(
   // acceptance gates grow with the miss count (capped at 3×) to grab the
   // card back instead of demanding it reappear exactly on-prediction.
   const seek = 1 + Math.min(2, 0.2 * (prior.misses ?? 0));
-  const learned = [chroma(prior.colors.red), chroma(prior.colors.green), chroma(prior.colors.blue)];
   // Generous from the first locked frame — the seed was verified by full
   // acquisition, so the job here is to HOLD ON; a matured lock opens even
   // further so lighting shifts (a shadow crossing, exposure hunting) still
   // read as "the same filament".
-  const chromaThr = 0.13 + 0.09 * relax;
+  // Base color window from the user's slider (tight by default); maturity
+  // opens it substantially — a held lock earns trust, and the continuous
+  // color learning keeps the center honest while the window loosens.
+  const chromaThr = (prior.chromaWindow ?? 0.09) * (1 + 0.8 * relax);
   const sumLo = 40 - 20 * relax; // dimmer pixels admitted once trusted
   const sumHi = 730 + 25 * relax; // and nearly-blown highlights too
   // ILLUMINANT-LOCUS classification (2700–6500 K synthetic sweep) with
   // neutral competition, baked into a per-call LUT — per pixel it's one
   // table lookup.
-  const lut = buildInkLUT(prior.colors, chromaThr);
+  // Illuminant gains from the white quadrant: expected ink colors follow
+  // the LIGHT while the identity colors stay frozen.
+  const ig = prior.illumGain ?? [1, 1, 1];
+  const lit = (c: readonly [number, number, number]): [number, number, number] => [
+    c[0] * ig[0],
+    c[1] * ig[1],
+    c[2] * ig[2],
+  ];
+  const litColors = { red: lit(prior.colors.red), green: lit(prior.colors.green), blue: lit(prior.colors.blue) };
+  const lut = buildInkLUT(litColors, chromaThr, prior.shades);
+  // Exact per-ink loci for the winner-take-all color ranking of blobs —
+  // accumulated shades included.
+  const loci = [
+    buildChromaLocus(litColors.red).concat(prior.shades?.[0] ?? []),
+    buildChromaLocus(litColors.green).concat(prior.shades?.[1] ?? []),
+    buildChromaLocus(litColors.blue).concat(prior.shades?.[2] ?? []),
+  ];
   const masks = [new Uint8Array(n), new Uint8Array(n), new Uint8Array(n)];
   for (let i = 0; i < n; i += 1) {
     const o = i * 4;
@@ -2229,7 +2528,7 @@ export function trackColorFlag(
 
   const picks: (Blob | null)[] = [null, null, null];
   const counts = [0, 0, 0];
-  const pickRadius = prior.cellPx * (2.6 + 2.6 * relax) * seek; // near where it should be, wider while re-seeking
+  const pickRadius = prior.cellPx * (2.6 + 3.4 * relax) * seek; // near where it should be, wider while re-seeking
   for (let k = 0; k < 3; k += 1) {
     const blobs = maskBlobs(masks[k], width, height, minArea);
     counts[k] = blobs.length;
@@ -2239,15 +2538,13 @@ export function trackColorFlag(
     for (const blob of blobs) {
       const dist = Math.hypot(blob.x - predicted.x, blob.y - predicted.y);
       if (dist > pickRadius) continue;
-      // Among in-radius candidates, prefer the one whose color is best
-      // explained as "the learned quadrant under changed lighting" — not
-      // merely the nearest blob. A look-alike at the right spot with the
-      // wrong chromaticity loses to the true quadrant slightly off-spot.
+      // WINNER-TAKE-ALL by color: among in-radius candidates, the blob
+      // CLOSEST in color to the locked ink IS the patch — the best blob
+      // sets the dynamic threshold and the rest are discarded. Position
+      // only breaks near-ties.
       const [sr, sg, sb] = sampleMeanRGB(rgba, width, height, blob.x, blob.y, 2);
       const ssum = Math.max(1, sr + sg + sb);
-      const dcr = sr / ssum - learned[k][0];
-      const dcg = sg / ssum - learned[k][1];
-      const score = dist + Math.sqrt(dcr * dcr + dcg * dcg) * prior.cellPx * 12;
+      const score = locusDist2(sr / ssum, sg / ssum, loci[k]) + (dist / Math.max(1, pickRadius)) * 1e-4;
       if (score < bestScore) {
         bestScore = score;
         best = blob;
@@ -2272,12 +2569,66 @@ export function trackColorFlag(
     colorCounts: { red: counts[0], green: counts[1], blue: counts[2] },
     colorGates: null,
   };
-  // THREE-COLOR RULE: all three quadrants must be genuinely found — no
-  // synthetic fill-ins. A missed frame is a miss; the self-rescue and
-  // beacon layers handle brief occlusions without hallucinating geometry.
+  // THREE-COLOR RULE with a RIGID-COHERENCE exception for matured locks:
+  // two patches that demonstrably moved TOGETHER — same translation (i.e.
+  // same velocity), same rotation, same scale as the established lock, and
+  // the right colors (the picks are winner-take-all color matches) — are
+  // the one solid card with a patch momentarily blanked. The third patch is
+  // synthesized from the rigid motion. The caller caps consecutive soft
+  // frames so pure 2-patch coasting can't dig in.
   const synthetic = [false, false, false];
   const foundCount = (picks[0] ? 1 : 0) + (picks[1] ? 1 : 0) + (picks[2] ? 1 : 0);
-  if (foundCount < 3) return { observation: null, debug };
+  let softPatches = 0;
+  if (foundCount < 3) {
+    let coherent = false;
+    if (foundCount === 2 && relax >= 1) {
+      const foundIdx: number[] = [];
+      for (let k = 0; k < 3; k += 1) if (picks[k]) foundIdx.push(k);
+      const [i, j] = foundIdx;
+      const A = picks[i] as Blob;
+      const B = picks[j] as Blob;
+      const pi = predictQuad(templates[i][0], templates[i][1]);
+      const pj = predictQuad(templates[j][0], templates[j][1]);
+      // Same-velocity test: the two patches' displacements from prediction
+      // must agree — rigid translation, not two unrelated blobs.
+      const sameShift = Math.hypot(A.x - pi.x - (B.x - pj.x), A.y - pi.y - (B.y - pj.y)) <= prior.cellPx * 0.6;
+      if (sameShift) {
+        // Similarity implied by the two points → angle/scale coherence with
+        // the established lock.
+        const dtx = templates[j][0] - templates[i][0];
+        const dty = templates[j][1] - templates[i][1];
+        const den = dtx * dtx + dty * dty;
+        const dpx = B.x - A.x;
+        const dpy = B.y - A.y;
+        const sa = (dpx * dtx + dpy * dty) / den;
+        const sb = (dpy * dtx - dpx * dty) / den;
+        const newScale = Math.hypot(sa, sb);
+        const priorAngle = Math.atan2(a21, a11);
+        const newAngle = Math.atan2(sb, sa);
+        let dAng = Math.abs(newAngle - priorAngle) % (Math.PI * 2);
+        if (dAng > Math.PI) dAng = Math.PI * 2 - dAng;
+        const coScale = newScale / Math.max(1e-3, prior.cellPx);
+        if (dAng < 0.21 && coScale > 0.75 && coScale < 1.3) {
+          const k = 3 - i - j;
+          const bx2 = A.x - (sa * templates[i][0] - sb * templates[i][1]);
+          const by2 = A.y - (sb * templates[i][0] + sa * templates[i][1]);
+          picks[k] = {
+            x: bx2 + sa * templates[k][0] - sb * templates[k][1],
+            y: by2 + sb * templates[k][0] + sa * templates[k][1],
+            area: 1,
+            w: 1,
+            h: 1,
+            x0: 0,
+            y0: 0,
+          };
+          synthetic[k] = true;
+          softPatches = 1;
+          coherent = true;
+        }
+      }
+    }
+    if (!coherent) return { observation: null, debug };
+  }
   if (!picks[0] || !picks[1] || !picks[2]) return { observation: null, debug };
 
   const affine = affineFrom3Pts(tpl.p1, tpl.p2, tpl.p3, picks[0], picks[1], picks[2]);
@@ -2289,9 +2640,9 @@ export function trackColorFlag(
   // (1.6×/frame snowballs to frame-sized "quadrants" in under a second).
   debug.failStage = "bad-color-layout";
   const scaleRatio = quadPx / Math.max(1e-3, prior.cellPx);
-  if (scaleRatio < 0.55 - 0.35 * relax || scaleRatio > 1.4 + 0.25 * relax) return { observation: null, debug };
+  if (scaleRatio < 0.5 - 0.35 * relax || scaleRatio > 1.5 + 0.3 * relax) return { observation: null, debug };
   const centerErr = Math.hypot(affine.bx - localPredCenter.x, affine.by - localPredCenter.y);
-  if (centerErr > prior.cellPx * (2.6 + 2.6 * relax) * seek) return { observation: null, debug };
+  if (centerErr > prior.cellPx * (2.6 + 3.4 * relax) * seek) return { observation: null, debug };
   // NO chirality gate (by request) — a mirrored-looking fit is accepted;
   // the scale/center gates above carry the sanity checking.
 
@@ -2359,13 +2710,33 @@ export function trackColorFlag(
       if (h) features = featuresFromHomography(h, offsetX, offsetY, normPx);
     }
   }
+  // ILLUMINANT SAMPLE: the white quadrant is a built-in gray card. Sample
+  // off-center (the black dot lives at the quadrant center — go 35% further
+  // out along the quadrant diagonal), and reject implausible readings:
+  // too dark (occluded), blown (specular glare), or so strongly colored it
+  // was probably an ink mis-sample.
+  let whiteRGB: [number, number, number] | null = null;
+  {
+    const wpt = predictQuad(tpl.dot[0] * 1.35, tpl.dot[1] * 1.35);
+    const [wr, wg, wb] = sampleMeanRGB(rgba, width, height, wpt.x, wpt.y, 2);
+    const wsum = wr + wg + wb;
+    if (wsum > 150 && wsum < 740) {
+      const wcr = wr / wsum;
+      const wcg = wg / wsum;
+      if (Math.hypot(wcr - 1 / 3, wcg - 1 / 3) < 0.15) whiteRGB = [wr, wg, wb];
+    }
+  }
   const observation: FlagObservation = {
     tiles: picks.map((b) => shift({ x: (b as Blob).x, y: (b as Blob).y })),
     dot: shift(dotLocal),
     center: { x: affine.bx + offsetX, y: affine.by + offsetY },
     cellPx: quadPx,
-    residual: centerErr / Math.max(1e-3, quadPx),
+    // Soft (coherence-held) frames report a raised residual so the feature
+    // filter trusts them less than fully-seen frames.
+    residual: centerErr / Math.max(1e-3, quadPx) + softPatches * 0.12,
     features,
+    whiteRGB,
+    softPatches,
     // Prediction-filled slots report the PRIOR learned color instead of a
     // sample — the predicted spot is exactly where the glare/shadow that hid
     // the patch sits, and blending that in would tint the learned palette.
@@ -2932,14 +3303,23 @@ export function trackShapeFlag(
   const relax = Math.min(1, Math.max(0, prior.relax ?? 0));
   const seek = 1 + Math.min(2, 0.2 * (prior.misses ?? 0)); // re-seek widening (see color tracker)
   const learned = [chroma(prior.colors.red), chroma(prior.colors.green), chroma(prior.colors.blue)];
-  const chromaThr = 0.13 + 0.09 * relax;
+  const chromaThr = (prior.chromaWindow ?? 0.09) * (1 + 0.8 * relax);
   const sumLo = 40 - 20 * relax;
   const sumHi = 730 + 25 * relax;
   // ONE mask: near ANY of the three learned patch colors — they're all the
   // same red print, just sampled under slightly different shading, so
   // splitting them into per-color masks would fragment each patch.
   // Illuminant-locus LUT (see the color tracker) — any ink class → mark.
-  const lutS = buildInkLUT(prior.colors, chromaThr);
+  const igS = prior.illumGain ?? [1, 1, 1];
+  const litS = (c: readonly [number, number, number]): [number, number, number] => [
+    c[0] * igS[0],
+    c[1] * igS[1],
+    c[2] * igS[2],
+  ];
+  const lutS = buildInkLUT(
+    { red: litS(prior.colors.red), green: litS(prior.colors.green), blue: litS(prior.colors.blue) },
+    chromaThr,
+  );
   const mask = new Uint8Array(n);
   for (let i = 0; i < n; i += 1) {
     const o = i * 4;
@@ -2964,7 +3344,7 @@ export function trackShapeFlag(
 
   // Greedy slot assignment: nearest blob to each predicted patch position,
   // scored by distance + learned-color mismatch; a blob can serve one slot.
-  const pickRadius = prior.cellPx * (2.6 + 2.6 * relax) * seek;
+  const pickRadius = prior.cellPx * (2.6 + 3.4 * relax) * seek;
   const picks: (Blob | null)[] = [null, null, null];
   const counts = [0, 0, 0];
   const used = new Set<Blob>();
@@ -3018,9 +3398,9 @@ export function trackShapeFlag(
   const quadPx = (Math.hypot(affine.a11, affine.a21) + Math.hypot(affine.a12, affine.a22)) / 2;
   debug.failStage = "bad-shape-layout";
   const scaleRatio = quadPx / Math.max(1e-3, prior.cellPx);
-  if (scaleRatio < 0.55 - 0.35 * relax || scaleRatio > 1.4 + 0.25 * relax) return { observation: null, debug };
+  if (scaleRatio < 0.5 - 0.35 * relax || scaleRatio > 1.5 + 0.3 * relax) return { observation: null, debug };
   const centerErr = Math.hypot(affine.bx - localPredCenter.x, affine.by - localPredCenter.y);
-  if (centerErr > prior.cellPx * (2.6 + 2.6 * relax) * seek) return { observation: null, debug };
+  if (centerErr > prior.cellPx * (2.6 + 3.4 * relax) * seek) return { observation: null, debug };
   // NO chirality gate (by request) — see the color tracker.
 
   debug.failStage = "ok";

@@ -582,8 +582,20 @@ export function TargetDesigner({ baseUrl }: { baseUrl: string }) {
           ) : null}
         </section>
 
-        {/* Printable preview (true size on print) */}
+        {/* Printable preview (true size on print). The dynamic @page rule
+            makes the PAPER exactly the sheet's physical size — the sheet
+            fills page 1 completely and nothing can exist beyond it, which
+            is what kills the trailing blank page. */}
+        <style>{`@media print { @page { size: ${widthValue}${unit} ${heightValue}${unit}; margin: 0; } }`}</style>
         <section className="ts-print-area overflow-auto">
+          {/* Repeats at the top of EVERY printed page (print-fixed elements
+              render on each page) — full identification even on tiled
+              multi-page prints. Hidden on screen. */}
+          <div className="ts-print-header hidden">
+            {name} · {widthValue}×{heightValue}
+            {unit} · scoring: {scoringId} · QR {qrSizeValue}
+            {unit} · Trackr target — print at 100% scale
+          </div>
           <div
             style={{ width: sheetPxWidth * previewScale, height: sheetPxHeight * previewScale }}
             className="rounded-md border border-gray-800"

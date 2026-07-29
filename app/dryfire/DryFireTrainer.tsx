@@ -20,6 +20,45 @@ import {
   startDrill,
 } from "@/app/lib/targets/scenario";
 import { cancelSpeech, isSpeaking, speak, speakSequence } from "@/app/lib/targets/speech";
+
+// ---- Sectioned voice prompts ------------------------------------------------
+// Every spoken line belongs to a section the user can toggle off. Muted
+// sections still fire their onEnd callbacks immediately -- the calibration
+// flow is driven by those, so muting changes the sound, never the behavior.
+export type VoiceSection = "safety" | "guidance" | "feedback" | "drill";
+export const VOICE_SECTION_INFO: { key: VoiceSection; label: string; examples: string }[] = [
+  {
+    key: "safety",
+    label: "Safety brief",
+    examples: '"Please ensure your weapon is unloaded..." / the four rules / "Know your target and what lies beyond."',
+  },
+  {
+    key: "guidance",
+    label: "Calibration guidance",
+    examples: '"Rack the slide now." / "Dry fire once." / "Tap the cyan patch..." / photo 3-2-1 / lock doctor',
+  },
+  {
+    key: "feedback",
+    label: "Confirmations & status",
+    examples: '"Trigger calibrated." / "Colors captured." / "Zeroed to your group." / "Range 10 meters." / "Target is hot."',
+  },
+  {
+    key: "drill",
+    label: "Range commands & drill calls",
+    examples: '"Check chamber. Survey target. Engage." / "Shoot blue!" / "Done. 8 of 10."',
+  },
+];
+// Module-level gate so the frame loop and handlers read it without plumbing;
+// the component syncs its state into it.
+let voiceGate: Record<VoiceSection, boolean> = { safety: true, guidance: true, feedback: true, drill: true };
+function say(section: VoiceSection, text: string, opts?: { rate?: number; onEnd?: () => void }): void {
+  if (voiceGate[section]) speak(text, opts);
+  else opts?.onEnd?.();
+}
+function saySeq(section: VoiceSection, parts: string[], opts?: { rate?: number; onEnd?: () => void }): void {
+  if (voiceGate[section]) speakSequence(parts, opts);
+  else opts?.onEnd?.();
+}
 import { useScreenWakeLock } from "@/app/lib/useScreenWakeLock";
 import {
   analyzeColorFlag,
@@ -40,11 +79,14 @@ import {
   type ForegroundGrid,
   type FlagPatternMode,
   type TrackedColors,
+  type ShadePools,
   analyzeColorFlagLoose,
   buildChromaLocus,
   cymBeacon,
+  inkQuadtree,
   locusDist2,
   prescanCMY,
+  seedFromThreePoints,
   trackColorFlag,
   trackShapeFlag,
 } from "@/app/lib/dryfire/flagTracker";
@@ -53,6 +95,7 @@ import {
   createClickTrigger,
   fingerprintSimilarity,
   meanFingerprint,
+  playFingerprintSample,
   type ClickTrigger,
   type TriggerSensitivity,
 } from "@/app/lib/dryfire/audioTrigger";
@@ -215,14 +258,101 @@ type ScenarioProfile = {
     rackOk: boolean | null;
     clickFp?: number[] | null;
     rackFp?: number[] | null;
+    // Individual per-event fingerprints — kept so "sample slide/click" can
+    // audition a random one instead of only the average.
+    clickFps?: number[][];
+    rackFps?: number[][];
+    // Calibrated durations (ms): the striker click, and the two rack impacts
+    // (pull-back, slam). Duration is the primary trigger discriminator.
+    clickDurMs?: number;
+    rackDurs?: number[];
   } | null;
   drillMode: CalloutMode;
   drillLen: number;
   timespanSec: number;
   protocol: RangeProtocol;
 };
+// ---- Lock doctor ------------------------------------------------------------
+// Six seconds of measurement → a concrete physical prescription. The point:
+// when the lock won't hold, the cause is almost always PHYSICS (card too
+// small at this distance, glare killing one ink, low fps) — measure it and
+// say so, instead of leaving the user to guess at settings.
+type LockDoctorData = {
+  until: number;
+  frames: number;
+  det: number;
+  cells: number[];
+  stages: Record<string, number>;
+  zeroRed: number; // frames with NO yellow blob (red slot)
+  zeroGreen: number; // … no cyan
+  zeroBlue: number; // … no magenta
+  procW: number;
+  procH: number;
+  fps: number;
+};
+
+function lockDoctorVerdict(d: LockDoctorData): string[] {
+  const lines: string[] = [];
+  const detRate = d.det / Math.max(1, d.frames);
+  const cellMed = d.cells.length > 0 ? [...d.cells].sort((a, b) => a - b)[Math.floor(d.cells.length / 2)] : 0;
+  if (detRate >= 0.7) lines.push(`✅ Lock is healthy — the card was detected on ${Math.round(detRate * 100)}% of frames.`);
+  else if (d.det === 0) lines.push("❌ The card was never detected. The findings below say why.");
+  else lines.push(`⚠ Inconsistent lock — detected on only ${Math.round(detRate * 100)}% of frames.`);
+  if (d.cells.length > 0) {
+    lines.push(`Card size on camera: ~${Math.round(cellMed)} px per quadrant (healthy is 18 px or more).`);
+    if (cellMed < 14) {
+      lines.push(
+        "→ The card is TOO SMALL at this distance — this is the #1 lock killer. Best fix: move the CAMERA closer " +
+          "to the muzzle. It does NOT need to sit at the screen — any position that sees the card works, because " +
+          "the 9-dot calibration learns whatever geometry the camera has. Halving the distance doubles the card. " +
+          "Alternative: print the card at 2× size.",
+      );
+    }
+  }
+  if (d.procW > 0 && d.procW < 1280) {
+    lines.push(`→ Camera feed is only ${d.procW}×${d.procH} — low resolution costs range. Pick a 1080p camera/mode.`);
+  }
+  if (d.fps > 0 && d.fps < 12) {
+    lines.push(`→ Processing only ${d.fps} fps — close other tabs/apps; a starved loop drops locks on motion.`);
+  }
+  const inkIssues: [number, string][] = [
+    [d.zeroGreen, "cyan"],
+    [d.zeroBlue, "magenta"],
+    [d.zeroRed, "yellow"],
+  ];
+  for (const [zero, name] of inkIssues) {
+    if (zero > d.frames * 0.4) {
+      lines.push(
+        `→ The ${name} patch was invisible in ${Math.round((zero / d.frames) * 100)}% of frames — usually glare ` +
+          "washing it out. Tilt the card slightly downward, kill lights behind you, or re-tap the colors.",
+      );
+    }
+  }
+  const missFrames = d.frames - d.det;
+  if (missFrames > d.frames * 0.3) {
+    const topStage = Object.entries(d.stages).sort((a, b) => b[1] - a[1])[0]?.[0];
+    if (topStage === "bad-color-layout") {
+      lines.push(
+        "→ Colors are visible but the square layout keeps being rejected — usually MOTION BLUR. Hold steadier " +
+          "during the test, and brighten the room (more light = shorter exposure = sharper patches).",
+      );
+    } else if (topStage === "missing-color" && !lines.some((l) => l.includes("patch was invisible"))) {
+      lines.push("→ Frames keep missing one ink — brighten the room; dim light desaturates the patches.");
+    }
+  }
+  if (lines.length === 1) lines.push("No physical problems found — if locks still drop, run this again at your actual shooting distance.");
+  return lines;
+}
+
 const PROFILES_KEY = "trackr.dryfire.profiles";
 const LAST_PROFILE_KEY = "trackr.dryfire.lastProfile";
+// Last completed slide & trigger calibration — offered as an OPT-IN "use
+// previous calibration" button, never auto-applied.
+const TRIGCAL_KEY = "trackr.dryfire.trigcal.v1";
+// Last committed color identity — offered as an opt-in "use previous color
+// calibration" button, never auto-applied.
+const COLORS_KEY = "trackr.dryfire.colors.v1";
+type TrigCalData = NonNullable<ScenarioProfile["trigCal"]>;
 function loadProfilesFromStorage(): ScenarioProfile[] {
   try {
     const raw = localStorage.getItem(PROFILES_KEY);
@@ -241,12 +371,13 @@ function persistProfiles(list: ScenarioProfile[]) {
 
 // User-mode guided setup: the shippable walkthrough. Pro mode is the full
 // diagnostic surface underneath.
-type WizardStep = "choose" | "safety" | "prep";
-const WIZARD_STEPS: WizardStep[] = ["choose", "safety", "prep"];
+type WizardStep = "choose" | "safety" | "prep" | "board";
+const WIZARD_STEPS: WizardStep[] = ["choose", "safety", "board"];
 const WIZARD_TITLES: Record<WizardStep, string> = {
   choose: "Choose & train",
   safety: "Safety first",
-  prep: "Point & hold",
+  prep: "Point & hold", // legacy full-page setup (Pro fallback)
+  board: "Calibrate",
 };
 
 // Start routines, spoken before the timer beep. "standard" is the house
@@ -352,6 +483,7 @@ type TrackState = {
   seedAtMs: number; // when acquisition handed the card to the tracker
   hits: number; // successful track frames since seed (lock maturity)
   seedCellPx: number; // scale anchor — the track can't drift far from what acquisition proved
+  softHits: number; // consecutive rigid-coherence (2-patch) frames — capped
 };
 
 // A lock this old with this many confirmations graduates to REGIONAL mode:
@@ -367,6 +499,11 @@ const PHOTO_ZONE_R = 0.234;
 // math as real distance — a 25 m target subtends 3/25 of the 3 m one.
 const RANGE_PRESETS = [3, 5, 7, 10, 15, 25];
 const BASE_RANGE_M = 3;
+// SMART DISTANCE: the card's physical size is known, so the lock's apparent
+// size gives the shooter's true distance by trigonometry — d = (quad size ×
+// focal length) / apparent px. Focal length is derived from an assumed
+// webcam field of view; ±10-15% accuracy, plenty for target scaling.
+const CARD_FOV_DEG = 65;
 
 const lerp3 = (a: [number, number, number], b: [number, number, number], t: number): [number, number, number] => [
   a[0] + t * (b[0] - a[0]),
@@ -435,10 +572,10 @@ function coachHintFor(debug: FlagDebug | null, mode: FlagPatternMode, palette: C
     }
     case "missing-color": {
       if (c) {
-        // List missing colors in card-reading order (CMY: cyan, yellow,
-        // magenta; RGB: red, green, blue).
+        // List missing colors in card-reading order (CMY: cyan, magenta,
+        // yellow; RGB: red, green, blue).
         const counts = [c.red, c.green, c.blue];
-        const order = palette === "cmy" ? [1, 0, 2] : [0, 1, 2];
+        const order = palette === "cmy" ? [1, 2, 0] : [0, 1, 2];
         const missing = order
           .map((i) => (counts[i] === 0 ? slotNames[i] : null))
           .filter(Boolean)
@@ -738,6 +875,8 @@ export function DryFireTrainer() {
     peaks: number[]; // click peaks (floor derivation)
     clickFps: number[][]; // one fingerprint per dry-fire
     rackFps: number[][]; // slide fingerprints — the reject template
+    clickDurs: number[]; // dry-fire durations (ms) — primary trigger gate
+    rackDurs: number[]; // slide impact durations (ms) — pull-back & slam
     armAt: number; // clicks: ignore spikes before this (TTS guard)
     remindAt: number; // gentle re-prompt when a step sits idle
     rackOk?: boolean | null;
@@ -745,13 +884,62 @@ export function DryFireTrainer() {
   const [slideWindowOpen, setSlideWindowOpen] = useState(false); // "RACK NOW" vs "wait"
   const [trigCalCount, setTrigCalCount] = useState<number | null>(null); // clicks so far, null = not calibrating
   const [trigCalRacking, setTrigCalRacking] = useState(false); // rack-verification phase
-  const [trigCalResult, setTrigCalResult] = useState<{
-    clickPeak: number;
-    floor: number;
-    rackOk: boolean | null; // true = rack correctly ignored; null = not verified
-    clickFp?: number[] | null; // your striker's spectral fingerprint
-    rackFp?: number[] | null; // your rack's spectral fingerprint
-  } | null>(null);
+  const [trigCalResult, setTrigCalResult] = useState<TrigCalData | null>(null);
+  // A previous session's calibration, loaded from storage but NEVER applied
+  // automatically — surfaced as a "use previous" button on the prep step.
+  const [savedTrigCal, setSavedTrigCal] = useState<{ savedAt: number; name?: string; result: TrigCalData } | null>(
+    null,
+  );
+  // Same for the color identity (committed via taps/photo in a past session).
+  const [savedColors, setSavedColors] = useState<{ savedAt: number; name?: string; colors: TrackedColors } | null>(
+    null,
+  );
+  // Rename a saved calibration (shown on its "Use Saved" button).
+  const renameSavedTrigCal = (name: string) => {
+    setSavedTrigCal((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev, name };
+      try {
+        localStorage.setItem(TRIGCAL_KEY, JSON.stringify(next));
+      } catch {
+        /* best effort */
+      }
+      return next;
+    });
+  };
+  const renameSavedColors = (name: string) => {
+    setSavedColors((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev, name };
+      try {
+        localStorage.setItem(COLORS_KEY, JSON.stringify(next));
+      } catch {
+        /* best effort */
+      }
+      return next;
+    });
+  };
+  // Which voice sections are audible (see VOICE_SECTION_INFO).
+  const [voicePrefs, setVoicePrefs] = useState<Record<VoiceSection, boolean>>({
+    safety: true,
+    guidance: true,
+    feedback: true,
+    drill: true,
+  });
+  useEffect(() => {
+    voiceGate = voicePrefs;
+  }, [voicePrefs]);
+  // Persist a committed color identity for next session's opt-in reuse
+  // (keeps the user's name for the slot).
+  const persistCommittedColors = (colors: TrackedColors) => {
+    const entry = { savedAt: Date.now(), name: savedColors?.name, colors };
+    try {
+      localStorage.setItem(COLORS_KEY, JSON.stringify(entry));
+    } catch {
+      /* best effort */
+    }
+    setSavedColors(entry);
+  };
   const [statusLine, setStatusLine] = useState("Print the flag, chamber the stem, and start the camera.");
   const [feedback, setFeedback] = useState<ZoneFeedback>({});
   const [shots, setShots] = useState<ShotRecord[]>([]);
@@ -784,15 +972,77 @@ export function DryFireTrainer() {
   }, [trainMode]);
   const [targetShots, setTargetShots] = useState<TargetShot[]>([]);
   const targetStats = useMemo(() => computeTargetStats(targetShots), [targetShots]);
-  // Simulated range (target mode): scales the bullseye like real distance.
+  // Dot-capture burst: red expanding rings where a calibration dot just
+  // completed — modern, minimal, gone in half a second.
+  const [calBurst, setCalBurst] = useState<{ x: number; y: number; id: number } | null>(null);
+  useEffect(() => {
+    if (!calBurst) return;
+    const t = window.setTimeout(() => setCalBurst(null), 600);
+    return () => window.clearTimeout(t);
+  }, [calBurst]);
+  // ZERO ADJUSTMENT — the sight-adjustment equivalent for the aim model: a
+  // constant screen-px offset subtracted from every prediction. Set from a
+  // shot group's mean point of impact ("zero to group"), cleared on
+  // recalibration.
+  const zeroOffsetRef = useRef({ x: 0, y: 0 });
+  const [zeroed, setZeroed] = useState(false);
+  // AIM-TARGETABLE CONTROLS: the on-board buttons can be operated by AIM —
+  // pointing over one highlights it, and firing the trigger there "clicks"
+  // it. Registry maps a button id → its live DOM element (for rects).
+  const aimBtnRegistry = useRef<Map<string, HTMLElement>>(new Map());
+  const [aimHoverBtn, setAimHoverBtn] = useState<string | null>(null);
+  const aimHoverBtnRef = useRef<string | null>(null);
+  const [firedBtn, setFiredBtn] = useState<string | null>(null);
+  const runAimBtnRef = useRef<(id: string) => void>(() => {});
+  useEffect(() => {
+    if (!firedBtn) return;
+    const t = window.setTimeout(() => setFiredBtn(null), 400);
+    return () => window.clearTimeout(t);
+  }, [firedBtn]);
+  // Viewport aspect + shorter-side px for the fullscreen board (the target
+  // fills 100vw×100vh; true-scale sizing needs absolute CSS pixels).
+  const [winAspect, setWinAspect] = useState(16 / 9);
+  const [winMinPx, setWinMinPx] = useState(900);
+  useEffect(() => {
+    const update = () => {
+      setWinAspect(window.innerWidth / Math.max(1, window.innerHeight));
+      setWinMinPx(Math.max(1, Math.min(window.innerWidth, window.innerHeight)));
+    };
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+  // SMART DISTANCE: trig estimate of the shooter's true distance from the
+  // card's known physical size + its apparent size in the lock.
+  const [smartDistance, setSmartDistance] = useState(false);
+  const [cardWidthMm, setCardWidthMm] = useState(60);
+  const cardWidthMmRef = useRef(60);
+  useEffect(() => {
+    cardWidthMmRef.current = cardWidthMm;
+  }, [cardWidthMm]);
+  const smartDistRef = useRef(0); // smoothed estimate, meters
+  const [smartDistM, setSmartDistM] = useState(0);
+  // TRUE-SCALE TARGET: the bullseye is a PHYSICAL object (default 12 in
+  // across, like a real 25-yard slow-fire face). At simulated distance S,
+  // viewed from your actual distance d, it must subtend the same angle a
+  // real target would: drawn size = physical size × (d / S), converted to
+  // CSS pixels via the CSS inch (96 px — accurate within a few % on
+  // typical monitors). Rings therefore keep their REAL proportions and
+  // positions at every range; zooming the range never re-shapes the target,
+  // only its angular size — exactly like walking a real target out.
   const [simRangeM, setSimRangeM] = useState(5);
-  const targetScale = Math.min(1, BASE_RANGE_M / simRangeM);
+  const [targetDiamIn, setTargetDiamIn] = useState(12);
+  const targetScale = (() => {
+    const dAct = smartDistance && smartDistM > 0 ? smartDistM : BASE_RANGE_M;
+    const drawnRadiusPx = ((targetDiamIn * 96) / 2) * (dAct / simRangeM);
+    return Math.max(0.03, Math.min(1, drawnRadiusPx / (0.45 * winMinPx)));
+  })();
   const stepRange = (dir: number) => {
     const i = RANGE_PRESETS.indexOf(simRangeM);
     const next = RANGE_PRESETS[Math.min(RANGE_PRESETS.length - 1, Math.max(0, (i < 0 ? 1 : i) + dir))];
     if (next !== simRangeM) {
       setSimRangeM(next);
-      speak(`Range ${next} meters.`);
+      say("feedback", `Range ${next} meters.`);
     }
   };
   const [showStatHelp, setShowStatHelp] = useState(false);
@@ -865,15 +1115,42 @@ export function DryFireTrainer() {
   // capture boundary. This ref just colors the ring's label green when the
   // card happens to sit inside it.
   const photoZoneOkRef = useRef(false);
-  // COLOR COMMIT: a lock held ≥15 s has proven its colors beyond doubt —
-  // they are frozen as THE card colors for the rest of this training
-  // instance (no more per-frame adaptation, reseeds reuse them), cleared
-  // when the instance ends or the user explicitly restarts/retakes.
+  // Lock doctor run state: the loop tallies into the ref while active.
+  const doctorRef = useRef<LockDoctorData | null>(null);
+  const [doctorState, setDoctorState] = useState<"idle" | "running" | "done">("idle");
+  const [doctorReport, setDoctorReport] = useState<string[]>([]);
+  // COLOR COMMIT: colors settled beyond doubt — identified by the HUMAN
+  // (guided taps / manual photo). Frozen as THE card colors for the rest of
+  // this training instance; lighting changes are tracked SEPARATELY by the
+  // white-quadrant illuminant gains below, so no re-learning is needed.
+  // Cleared when the instance ends or the user explicitly restarts/retakes.
   const colorsCommittedRef = useRef<TrackedColors | null>(null);
+  // ILLUMINANT TRACKING: the white quadrant is a live gray card. `base` is
+  // its chroma when the colors were committed; `gain` is the smoothed
+  // per-channel ratio of current white to base — applied to the committed
+  // colors before classification, so shadows/lamps are followed in real
+  // time while identity never drifts.
+  const illumRef = useRef<{ base: [number, number, number] | null; gain: [number, number, number] }>({
+    base: null,
+    gain: [1, 1, 1],
+  });
+  // ACCUMULATED SHADES: every valid lock frame (especially the 9-dot sweep)
+  // contributes the shades each ink ACTUALLY showed — a growing set of
+  // viable chroma points appended to the acceptance loci. Capped per ink;
+  // only meaningfully-distinct shades are added.
+  const shadePoolsRef = useRef<ShadePools>([[], [], []]);
   const refColorsRef = useRef<TrackedColors | null>(null);
   useEffect(() => {
     refColorsRef.current = refDraft.red && refDraft.green && refDraft.blue ? (refDraft as TrackedColors) : null;
   }, [refDraft]);
+  // COLOR WINDOW: acceptance radius (chroma units) around the locked C/Y/M
+  // colors. Tight default; the slider adjusts it and the lock freezes it.
+  const [colorWindow, setColorWindow] = useState(0.09);
+  const colorWindowRef = useRef(0.09);
+  useEffect(() => {
+    colorWindowRef.current = colorWindow;
+  }, [colorWindow]);
+  const [colorWindowLocked, setColorWindowLocked] = useState(false);
   const [refBrightTol, setRefBrightTol] = useState(0.7);
   const refBrightTolRef = useRef(0.7);
   useEffect(() => {
@@ -899,13 +1176,18 @@ export function DryFireTrainer() {
   // stored no-gun background frame.
   const captureProcImageRef = useRef<(() => ImageData | null) | null>(null);
   const bgFrameRef = useRef<ImageData | null>(null);
+  // Guided color taps: the recorded tap POINTS + colors (proc coords) — on
+  // the third tap they seed the tracker directly, no acquisition needed.
+  const helpTapsRef = useRef<{ x: number; y: number; rgb: [number, number, number] }[]>([]);
+  // Chain bridge: after the taps, continue into the 9-dot aim calibration.
+  const pendingDotsAfterTapsRef = useRef(false);
   // Tap order + slot mapping per palette.
   const helpOrder: { slot: "red" | "green" | "blue"; name: string }[] =
     colorPalette === "cmy"
       ? [
           { slot: "green", name: "CYAN" },
-          { slot: "red", name: "YELLOW" },
           { slot: "blue", name: "MAGENTA" },
+          { slot: "red", name: "YELLOW" },
         ]
       : [
           { slot: "red", name: "RED" },
@@ -943,6 +1225,28 @@ export function DryFireTrainer() {
   useEffect(() => {
     showGuideRef.current = showGuide;
   }, [showGuide]);
+  // Per-element preview overlay toggles: classification tint, C/M/Y tiles &
+  // dot markers, the marching card box, and the stage strip.
+  const [showTint, setShowTint] = useState(true);
+  const showTintRef = useRef(true);
+  useEffect(() => {
+    showTintRef.current = showTint;
+  }, [showTint]);
+  const [showTiles, setShowTiles] = useState(true);
+  const showTilesRef = useRef(true);
+  useEffect(() => {
+    showTilesRef.current = showTiles;
+  }, [showTiles]);
+  const [showAnts, setShowAnts] = useState(true);
+  const showAntsRef = useRef(true);
+  useEffect(() => {
+    showAntsRef.current = showAnts;
+  }, [showAnts]);
+  const [showStrip, setShowStrip] = useState(true);
+  const showStripRef = useRef(true);
+  useEffect(() => {
+    showStripRef.current = showStrip;
+  }, [showStrip]);
   const [diag, setDiag] = useState<DiagInfo | null>(null);
   const [coach, setCoach] = useState<string | null>(null);
   const diagRef = useRef<{ debug: FlagDebug; roi: { x: number; y: number; w: number; h: number } | null } | null>(null);
@@ -1004,6 +1308,10 @@ export function DryFireTrainer() {
   // watch the solution converge.
   const provisionalModelRef = useRef<AimModel | null>(null);
   const traceRef = useRef<{ x: number; y: number; atMs: number }[]>([]); // viewport px
+  // Display smoothing: a light EMA over the predicted aim so the reticle
+  // doesn't jitter from frame-to-frame detection/model noise (the "bounce")
+  // while still tracking the shooter's real hold movement.
+  const dispAimRef = useRef<{ x: number; y: number } | null>(null);
   const shotMarkersRef = useRef<{ nx: number; ny: number; correct: boolean | null; atMs: number }[]>([]);
   const drillRef = useRef<DrillState | null>(null);
   const beginDrillRef = useRef<() => void>(() => {});
@@ -1029,14 +1337,6 @@ export function DryFireTrainer() {
     return bestId;
   };
 
-  // Viewport aspect for the fullscreen board (the target fills 100vw×100vh).
-  const [winAspect, setWinAspect] = useState(16 / 9);
-  useEffect(() => {
-    const update = () => setWinAspect(window.innerWidth / Math.max(1, window.innerHeight));
-    update();
-    window.addEventListener("resize", update);
-    return () => window.removeEventListener("resize", update);
-  }, []);
 
   const startCamera = async () => {
     setCameraError(null);
@@ -1176,6 +1476,7 @@ export function DryFireTrainer() {
 
     let raf = 0;
     let lastFullScanMs = 0;
+    let lastWideTrackMs = 0; // throttle for full-frame miss searches
     // Background subtraction: per-camera-session model, stepped on the same
     // throttled cadence as full scans (that's when a full frame is in hand).
     const bgModel = createBackgroundModel();
@@ -1202,6 +1503,8 @@ export function DryFireTrainer() {
       if (!wrap || idx >= CAL_POINTS.length) return;
       const rect = wrap.getBoundingClientRect();
       const [nx, ny] = CAL_POINTS[idx];
+      // Fire the capture burst animation at the completed dot.
+      setCalBurst({ x: nx, y: ny, id: idx + 1 });
       // Average within ONE feature regime — homography frames (dot found)
       // and affine frames have systematically different linear terms, and a
       // mixed mean lands between them (an aim bias that wanders with the
@@ -1225,7 +1528,8 @@ export function DryFireTrainer() {
       // ridge — few points want more regularization).
       provisionalModelRef.current = fitAimModel(samplesRef.current, 1e-3, 3);
       if (next < CAL_POINTS.length) {
-        speak("Mark. Next dot.");
+        // Silent by request — the marker visibly jumping to the next dot is
+        // the cue; speech here was noise (and the mic had to ignore it).
       } else {
         // NOTE: the per-dot COLOR REFIT was removed by design — the 9-dot
         // calibration touches NOTHING about color. Point of aim comes from
@@ -1234,7 +1538,11 @@ export function DryFireTrainer() {
         // Remember which regime the model speaks — click sampling must match.
         const hDots = samplesRef.current.filter((sm) => sm.features[7] !== 0 || sm.features[8] !== 0).length;
         modelRegimeRef.current = hDots >= samplesRef.current.length / 2 ? "h" : "a";
-        const fitted = fitAimModel(samplesRef.current);
+        // Stronger ridge regularization (2e-3 vs the 1e-4 default): with only
+        // 9 dots the fit is easily over-conditioned, which amplifies tiny
+        // feature noise into big screen jumps — the post-calibration bounce.
+        // A firmer prior trades a hair of accuracy for a much steadier aim.
+        const fitted = fitAimModel(samplesRef.current, 2e-3);
         if (fitted) {
           modelRef.current = fitted;
           setModel(fitted);
@@ -1243,13 +1551,13 @@ export function DryFireTrainer() {
           setStatusLine(
             `Calibrated — fit residual ${fitted.rmsErrorPx.toFixed(0)}px over ${fitted.sampleCount} dots. Drill starting…`,
           );
-          speak("Calibration complete.");
+          say("feedback", "Calibration complete.");
           // Straight into a called drill — no extra tap. Small delay so the
           // completion callout isn't cancelled by the first drill call.
           window.setTimeout(() => {
             if (phaseRef.current !== "train") return;
             if (trainModeRef.current === "target") {
-              speak("Target is hot. Fire when ready.");
+              say("feedback", "Target is hot. Fire when ready.");
               return;
             }
             if (!drillRef.current || drillRef.current.status !== "running") {
@@ -1258,7 +1566,7 @@ export function DryFireTrainer() {
           }, 1800);
         } else {
           setStatusLine("Calibration failed to fit — restart calibration.");
-          speak("Calibration failed.");
+          say("feedback", "Calibration failed.");
         }
       }
     };
@@ -1299,6 +1607,9 @@ export function DryFireTrainer() {
               refColorsRef.current,
               refBrightTolRef.current,
               fg,
+              colorWindowRef.current,
+              colorsCommittedRef.current ? illumRef.current.gain : null,
+              shadePoolsRef.current,
             )
           : patternModeRef.current === "shape"
             ? analyzeShapeFlag(data, w, h, procW, ox, oy, redSensitivityRef.current, shapeReqRef.current)
@@ -1307,8 +1618,8 @@ export function DryFireTrainer() {
       const seedTrack = (fromObs: FlagObservation) => {
         if (patternModeRef.current === "checker" || !fromObs.quadColors) return;
         trackRef.current = {
-          // Committed colors (a ≥15 s proven lock) override whatever this
-          // seed sampled — the card's identity is settled for the instance.
+          // Committed colors (human-identified) override whatever this
+          // seed sampled — identity is settled; lighting rides the gains.
           colors: colorsCommittedRef.current ?? fromObs.quadColors,
           center: { ...fromObs.center },
           velocity: { x: 0, y: 0 },
@@ -1324,6 +1635,7 @@ export function DryFireTrainer() {
           seedAtMs: now,
           hits: 0,
           seedCellPx: fromObs.cellPx,
+          softHits: 0,
         };
       };
 
@@ -1338,7 +1650,8 @@ export function DryFireTrainer() {
         phaseRef.current !== "setup" ||
         photoStageRef.current === "position" ||
         photoStageRef.current === "countdown" ||
-        helpPickRef.current !== null;
+        helpPickRef.current !== null ||
+        doctorRef.current !== null; // the lock doctor needs live detection
       if (!detectionArmed && trackRef.current) trackRef.current = null;
 
       // ---- TRACK MODE (color card): the locked card is the prime candidate.
@@ -1356,18 +1669,74 @@ export function DryFireTrainer() {
         // adaptation speeds up. Fresh locks stay strict so a wrong seed
         // can't dig in.
         const regional = track.hits >= REGIONAL_AFTER_HITS && now - track.seedAtMs >= REGIONAL_AFTER_MS;
-        // NO area boundary while re-seeking: a single missed frame widens
-        // the search to the ENTIRE frame — the card is tracked wherever it
-        // went, not just near where it was. (While hitting, the tight ROI is
-        // pure CPU savings, not a constraint — the card is in it.)
-        const side = Math.round(
-          track.misses > 0 ? Math.max(procW, procH) : Math.min(Math.max(track.cellPx * 14, 220), Math.max(procW, procH)),
-        );
-        const rx = Math.max(0, Math.min(procW - Math.min(side, procW), Math.round(predX - side / 2)));
-        const ry = Math.max(0, Math.min(procH - Math.min(side, procH), Math.round(predY - side / 2)));
-        const rw = Math.min(side, procW - rx);
-        const rh = Math.min(side, procH - ry);
+        // FOLLOW TIGHT while hitting: the search region is the card's true
+        // extent plus 25 px of padding. The card is 2 cells across but can
+        // sit at ANY rotation — its diagonal reaches 2√2 ≈ 2.83 cells, so
+        // size for 3 cells.
+        // On a miss: a moderate 6-cell region EVERY frame, and the ENTIRE
+        // frame at ~5 Hz. Full-frame every miss frame was 50-80 ms of
+        // blocking work — it froze the camera whenever the card was down
+        // (e.g. during the color taps). 5 Hz wide sweeps + beacon steering
+        // still recapture in a fraction of a second, without the freeze.
+        let wideSearch = false;
+        if (track.misses > 0 && now - lastWideTrackMs > 180) {
+          wideSearch = true;
+          lastWideTrackMs = now;
+        }
+        let rx: number;
+        let ry: number;
+        let rw: number;
+        let rh: number;
+        // Wide recovery search: instead of scanning the whole frame, the ink
+        // quadtree isolates the box(es) with colored ink; search the one
+        // nearest the prediction. On a mostly-empty frame this is a fraction
+        // of the pixels the full-frame sweep touched.
+        const wideRegions =
+          wideSearch && patternModeRef.current === "color"
+            ? inkQuadtree(procCtx.getImageData(0, 0, procW, procH).data, procW, procH)
+            : [];
+        if (wideSearch && wideRegions.length > 0) {
+          let best = wideRegions[0];
+          let bestD = Infinity;
+          for (const reg of wideRegions) {
+            const d = Math.hypot(reg.x + reg.w / 2 - predX, reg.y + reg.h / 2 - predY);
+            if (d < bestD) {
+              bestD = d;
+              best = reg;
+            }
+          }
+          const pad = 40;
+          rx = Math.max(0, best.x - pad);
+          ry = Math.max(0, best.y - pad);
+          rw = Math.min(procW - rx, best.w + pad * 2);
+          rh = Math.min(procH - ry, best.h + pad * 2);
+        } else {
+          const side = Math.round(
+            wideSearch
+              ? Math.max(procW, procH)
+              : track.misses > 0
+                ? Math.min(track.cellPx * 6 + 100, Math.max(procW, procH))
+                : Math.min(Math.max(track.cellPx * 3 + 50, 120), Math.max(procW, procH)),
+          );
+          rx = Math.max(0, Math.min(procW - Math.min(side, procW), Math.round(predX - side / 2)));
+          ry = Math.max(0, Math.min(procH - Math.min(side, procH), Math.round(predY - side / 2)));
+          rw = Math.min(side, procW - rx);
+          rh = Math.min(side, procH - ry);
+        }
         const trackFn = patternModeRef.current === "shape" ? trackShapeFlag : trackColorFlag;
+        // DAMPED white-patch illuminant gain: symmetric appearance correction
+        // across track AND reacquire. The always-on learner already follows
+        // the light, so the gain here is damped to ~35% — a feed-forward
+        // nudge for fast appearance shifts (posture/exposure) the learner is
+        // still catching up to, without the steady-state double-correction a
+        // full gain would cause. Only when colors are committed.
+        const trackGain: [number, number, number] | undefined = colorsCommittedRef.current
+          ? [
+              1 + (illumRef.current.gain[0] - 1) * 0.35,
+              1 + (illumRef.current.gain[1] - 1) * 0.35,
+              1 + (illumRef.current.gain[2] - 1) * 0.35,
+            ]
+          : undefined;
         // Full-resolution ROI: the camera usually has more detail than the
         // downscaled processing frame — spend it where the card actually is.
         const kNative = vw / procW;
@@ -1390,6 +1759,9 @@ export function DryFireTrainer() {
             relax: regional ? 1 : 0,
             misses: track.misses,
             palette: colorPaletteRef.current,
+            chromaWindow: colorWindowRef.current,
+            illumGain: trackGain,
+            shades: shadePoolsRef.current,
           });
           if (result.observation) result.observation = scaleObs(result.observation, 1 / s2);
           scaleDebug(result.debug, 1 / s2);
@@ -1403,11 +1775,20 @@ export function DryFireTrainer() {
             relax: regional ? 1 : 0,
             misses: track.misses,
             palette: colorPaletteRef.current,
+            chromaWindow: colorWindowRef.current,
+            illumGain: trackGain,
+            shades: shadePoolsRef.current,
           });
         }
         frameDebug = result.debug;
         frameRoi = { x: rx, y: ry, w: rw, h: rh };
+        // Rigid-coherence cap: 2-patch coasting is a bridge, not a home —
+        // after ~12 consecutive soft frames, demand a full 3-color frame.
+        if (result.observation && (result.observation.softPatches ?? 0) > 0 && track.softHits >= 12) {
+          result = { observation: null, debug: result.debug };
+        }
         if (result.observation) {
+          track.softHits = (result.observation.softPatches ?? 0) > 0 ? track.softHits + 1 : 0;
           obs = result.observation;
           const instVx = (obs.center.x - track.center.x) / dtMs;
           const instVy = (obs.center.y - track.center.y) / dtMs;
@@ -1431,24 +1812,61 @@ export function DryFireTrainer() {
           track.hits += 1;
           // Follow lighting drift — faster once the region is trusted, so
           // the learned colors ride through exposure swings.
-          if (obs.quadColors && !colorsCommittedRef.current) {
-            track.colors = blendColors(track.colors, obs.quadColors, regional ? 0.25 : 0.15);
+          // ALWAYS learn while tracking: as the aim moves through different
+          // light, the track's working colors follow what the camera sees —
+          // even for committed colors. The COMMITTED identity is untouched
+          // (it re-anchors every reseed and drives reacquisition); this is
+          // the fast local learner riding on top of it.
+          if (obs.quadColors) {
+            // Slightly gentler than before: the damped illuminant gain now
+            // shares the appearance-tracking load, so the learner needn't
+            // chase as hard (which also curbs drift/ratchet instability).
+            track.colors = blendColors(track.colors, obs.quadColors, regional ? 0.2 : 0.12);
+            // SHADE ACCUMULATION: a valid lock's sampled patch colors are
+            // proven-viable shades — add any that are meaningfully new
+            // (>0.018 chroma from everything already pooled), capped at 24
+            // per ink (oldest dropped).
+            const pools = shadePoolsRef.current;
+            const slots = [obs.quadColors.red, obs.quadColors.green, obs.quadColors.blue] as const;
+            for (let k = 0; k < 3; k += 1) {
+              const c = slots[k];
+              const sum = Math.max(1, c[0] + c[1] + c[2]);
+              const cr = c[0] / sum;
+              const cg = c[1] / sum;
+              let novel = true;
+              for (const [pr, pg] of pools[k]) {
+                if (Math.hypot(cr - pr, cg - pg) < 0.018) {
+                  novel = false;
+                  break;
+                }
+              }
+              if (novel) {
+                pools[k].push([cr, cg]);
+                if (pools[k].length > 24) pools[k].shift();
+              }
+            }
           }
-          // COLOR COMMIT: 15 s of sustained lock settles the card's colors
-          // for the remainder of this training instance — adaptation stops,
-          // the acquisition reference adopts them, reseeds reuse them.
-          if (
-            !colorsCommittedRef.current &&
-            patternModeRef.current === "color" &&
-            now - track.seedAtMs >= 15000
-          ) {
-            const committed: TrackedColors = {
-              red: [...track.colors.red] as [number, number, number],
-              green: [...track.colors.green] as [number, number, number],
-              blue: [...track.colors.blue] as [number, number, number],
-            };
-            colorsCommittedRef.current = committed;
-            setRefDraft({ red: committed.red, green: committed.green, blue: committed.blue });
+          // ILLUMINANT TRACKING: update the white-quadrant gain estimate.
+          // (The 30 s auto-commit was removed by request — commits come only
+          // from the human; lighting is tracked here instead of re-learned.)
+          if (obs.whiteRGB) {
+            const il = illumRef.current;
+            const m = (obs.whiteRGB[0] + obs.whiteRGB[1] + obs.whiteRGB[2]) / 3;
+            if (m > 1) {
+              const wch: [number, number, number] = [
+                obs.whiteRGB[0] / m,
+                obs.whiteRGB[1] / m,
+                obs.whiteRGB[2] / m,
+              ];
+              if (!il.base) {
+                il.base = wch;
+              } else {
+                for (let i = 0; i < 3; i += 1) {
+                  const t = Math.min(2, Math.max(0.5, wch[i] / Math.max(0.05, il.base[i])));
+                  il.gain[i] += 0.2 * (t - il.gain[i]);
+                }
+              }
+            }
           }
         } else {
           // Dead-reckon forward, damp the velocity, widen next frame's search.
@@ -1499,7 +1917,7 @@ export function DryFireTrainer() {
           // A matured lock gets more patience before surrendering the region
           // back to full-frame acquisition — with the seek-widened gates and
           // the self-rescue it rarely comes to this.
-          if (!obs && track.misses > (regional ? 40 : 16)) {
+          if (!obs && track.misses > (regional ? 60 : 16)) {
             trackRef.current = null;
             lastFullScanMs = 0; // reacquire NOW, not after the scan throttle
           }
@@ -1565,26 +1983,44 @@ export function DryFireTrainer() {
               frameRoi = pre.roi;
             }
             if (!obs) {
-              // MOST-FORGIVING fallback: rank-based "the three most distinct
-              // colors in frame" acquisition — no absolute gates, full frame.
-              // With the motion veto the ranking sees only MOVING ink, so it
-              // runs first; the un-vetoed pass remains the last resort.
-              let loose = fgGrid ? analyzeColorFlagLoose(img.data, procW, procH, procW, 0, 0, fgGrid) : null;
-              if (!loose?.observation) loose = analyzeColorFlagLoose(img.data, procW, procH, procW, 0, 0);
-              if (loose.observation) {
-                obs = loose.observation;
-                frameDebug = loose.debug;
-                frameRoi = null;
+              // QUADTREE-MINIMIZED search: instead of scanning the whole
+              // frame, the ink quadtree returns just the box(es) that contain
+              // colored ink (empty screen pruned in O(1)). The expensive
+              // strict + loose analyzers run ONLY inside those boxes,
+              // strongest first — that's the area minimization.
+              const regions = inkQuadtree(img.data, procW, procH);
+              if (regions.length > 0) {
+                const pad = Math.max(14, Math.round(Math.min(procW, procH) * 0.02));
+                for (const reg of regions.slice(0, 3)) {
+                  const rx = Math.max(0, reg.x - pad);
+                  const ry = Math.max(0, reg.y - pad);
+                  const rw = Math.min(procW - rx, reg.w + pad * 2);
+                  const rh = Math.min(procH - ry, reg.h + pad * 2);
+                  if (rw < 12 || rh < 12) continue;
+                  const sub = procCtx.getImageData(rx, ry, rw, rh);
+                  // Strict (reference-gated) first, then rank-based loose.
+                  let result = runDetect(sub.data, rw, rh, rx, ry);
+                  if (!result.observation) result = analyzeColorFlagLoose(sub.data, rw, rh, procW, rx, ry);
+                  if (result.observation) {
+                    obs = result.observation;
+                    frameDebug = result.debug;
+                    frameRoi = { x: rx, y: ry, w: rw, h: rh };
+                    break;
+                  }
+                }
+              } else if (!pre) {
+                // The quadtree found NO ink anywhere and the prescan didn't
+                // focus a region — a truly cardless frame, or a card too faint
+                // for the activity floor. One whole-frame loose try (rare).
+                const loose = fgGrid
+                  ? analyzeColorFlagLoose(img.data, procW, procH, procW, 0, 0, fgGrid)
+                  : analyzeColorFlagLoose(img.data, procW, procH, procW, 0, 0);
+                if (loose.observation) {
+                  obs = loose.observation;
+                  frameDebug = loose.debug;
+                  frameRoi = null;
+                }
               }
-            }
-            if (!obs && pre) {
-              // Last resort: the pre-scan's focus region is a fixed size and
-              // can CROP a close-up card, so the focused strict pass fails on
-              // a perfectly good frame. Whole-frame strict before giving up.
-              const result = runDetect(img.data, procW, procH, 0, 0);
-              obs = result.observation;
-              frameDebug = result.debug;
-              frameRoi = null;
             }
           }
           if (!obs && !pre) {
@@ -1600,6 +2036,27 @@ export function DryFireTrainer() {
         if (obs) seedTrack(obs);
       }
       if (frameDebug) diagRef.current = { debug: frameDebug, roi: frameRoi };
+
+      // Lock doctor: tally every frame while a diagnosis run is active.
+      const doc = doctorRef.current;
+      if (doc && now < doc.until) {
+        doc.frames += 1;
+        doc.procW = procW;
+        doc.procH = procH;
+        doc.fps = fps;
+        if (obs) {
+          doc.det += 1;
+          doc.cells.push(obs.cellPx);
+        } else if (frameDebug) {
+          doc.stages[frameDebug.failStage] = (doc.stages[frameDebug.failStage] ?? 0) + 1;
+        }
+        const cc = frameDebug?.colorCounts;
+        if (cc) {
+          if (cc.red === 0) doc.zeroRed += 1;
+          if (cc.green === 0) doc.zeroGreen += 1;
+          if (cc.blue === 0) doc.zeroBlue += 1;
+        }
+      }
 
       if (obs) {
         obsRef.current = { obs, atMs: now };
@@ -1643,6 +2100,7 @@ export function DryFireTrainer() {
       } else if (last && now - last.atMs > 900) {
         smoothFeaturesRef.current = null;
         featureFilterRef.current.reset();
+        dispAimRef.current = null; // re-lock should snap, not slide across screen
       }
 
       // --- Calibration dwell logic ---
@@ -1689,9 +2147,35 @@ export function DryFireTrainer() {
 
       // --- Aim trace (training) ---
       if (phaseRef.current === "train" && modelRef.current && smoothFeaturesRef.current && obs) {
-        const aim = predictAim(modelRef.current, smoothFeaturesRef.current);
+        const rawAim = predictAim(modelRef.current, smoothFeaturesRef.current);
+        const zAim = { x: rawAim.x - zeroOffsetRef.current.x, y: rawAim.y - zeroOffsetRef.current.y };
+        // Light display EMA — kills high-frequency jitter, keeps real hold
+        // movement. A big jump (re-lock elsewhere) snaps rather than lerping
+        // slowly across the screen.
+        const prevDisp = dispAimRef.current;
+        const jump = prevDisp ? Math.hypot(zAim.x - prevDisp.x, zAim.y - prevDisp.y) : Infinity;
+        const aim =
+          prevDisp && jump < 140
+            ? { x: prevDisp.x + 0.35 * (zAim.x - prevDisp.x), y: prevDisp.y + 0.35 * (zAim.y - prevDisp.y) }
+            : zAim;
+        dispAimRef.current = aim;
         traceRef.current.push({ x: aim.x, y: aim.y, atMs: now });
         while (traceRef.current.length > 0 && now - traceRef.current[0].atMs > TRACE_WINDOW_MS) traceRef.current.shift();
+        // AIM-OVER-BUTTON: which on-board control is the sights on? (viewport
+        // aim vs each registered button rect). Only the transition is pushed
+        // to React, so per-frame cost is a few rect reads.
+        let overBtn: string | null = null;
+        for (const [id, el] of aimBtnRegistry.current) {
+          const r = el.getBoundingClientRect();
+          if (aim.x >= r.left && aim.x <= r.right && aim.y >= r.top && aim.y <= r.bottom) {
+            overBtn = id;
+            break;
+          }
+        }
+        if (overBtn !== aimHoverBtnRef.current) {
+          aimHoverBtnRef.current = overBtn;
+          setAimHoverBtn(overBtn);
+        }
         // Hold test: collect for the window, then report RMS jitter + drift.
         const ht = holdTestRef.current;
         if (ht && now >= ht.startMs) {
@@ -1713,7 +2197,7 @@ export function DryFireTrainer() {
               const slopeY = pts.reduce((s, p, i) => s + (ts[i] - tm) * (p.y - my), 0) / tt;
               const driftPxPerS = Math.hypot(slopeX, slopeY);
               setHoldResult({ rmsPx, driftPxPerS, n: pts.length });
-              speak(`Hold test complete. R M S ${Math.round(rmsPx)} pixels, drift ${Math.round(driftPxPerS)} per second.`);
+              say("feedback", `Hold test complete. R M S ${Math.round(rmsPx)} pixels, drift ${Math.round(driftPxPerS)} per second.`);
             }
             setHoldActive(false);
           }
@@ -1874,7 +2358,8 @@ export function DryFireTrainer() {
               const dgN = cg - 1 / 3;
               const distNeutral = drN * drN + dgN * dgN;
               let best: 0 | 1 | 2 | 3 = 0;
-              let bestD = 0.13 * 0.13; // matches the detector's REF_THR
+              const win = colorWindowRef.current;
+              let bestD = win * win; // matches the detector's color window
               for (let k = 0; k < 3; k += 1) {
                 if (sum < refData[k].s * (1 - refTol) || sum > refData[k].s * (1 + refTol)) continue;
                 const d = locusDist2(cr, cg, refLoci[k]);
@@ -1885,6 +2370,7 @@ export function DryFireTrainer() {
               }
               return best;
             };
+            if (showTintRef.current)
             for (let i = 0; i < pw * ph; i += 1) {
               const o = i * 4;
               if (colorMode) {
@@ -1921,9 +2407,10 @@ export function DryFireTrainer() {
                 }
               }
             }
-            pctx.putImageData(img, 0, 0);
+            if (showTintRef.current) pctx.putImageData(img, 0, 0);
             // All dark blobs (gray), tile candidates (green), diagonal (cyan),
             // dot candidates (amber), search ROI (blue).
+            if (showTilesRef.current) {
             pctx.fillStyle = "rgba(229,231,235,0.85)";
             for (const blob of debug.blobs) pctx.fillRect(blob.x * s - 1, blob.y * s - 1, 2, 2);
             pctx.strokeStyle = "#22c55e";
@@ -1976,9 +2463,10 @@ export function DryFireTrainer() {
               pctx.strokeRect(roi.x * s, roi.y * s, roi.w * s, roi.h * s);
               pctx.setLineDash([]);
             }
+            }
           }
           const current = obsRef.current;
-          if (current && now - current.atMs < 400) {
+          if (showTilesRef.current && current && now - current.atMs < 400) {
             pctx.fillStyle = "#22c55e";
             for (const tile of current.obs.tiles) pctx.fillRect(tile.x * s - 1.5, tile.y * s - 1.5, 3, 3);
             pctx.fillStyle = "#f59e0b";
@@ -2065,7 +2553,7 @@ export function DryFireTrainer() {
           // (no jitter from text growing/shrinking).
           if (!frozen) {
             // Marching-ants box around the DETECTED CARD.
-            if (current && now - current.atMs < 700) {
+            if (showAntsRef.current && current && now - current.atMs < 700) {
               const pts = [...current.obs.tiles, current.obs.dot];
               let bx0 = Infinity;
               let by0 = Infinity;
@@ -2123,13 +2611,15 @@ export function DryFireTrainer() {
               }`;
               stageColor = "#38bdf8";
             }
-            const strip = 15;
-            pctx.fillStyle = "rgba(0,0,0,0.68)";
-            pctx.fillRect(0, ph - strip, pw, strip);
-            pctx.font = "600 9px ui-monospace, SFMono-Regular, monospace";
-            pctx.textAlign = "left";
-            pctx.fillStyle = stageColor;
-            pctx.fillText(stageText, 4, ph - 4.5);
+            if (showStripRef.current) {
+              const strip = 15;
+              pctx.fillStyle = "rgba(0,0,0,0.68)";
+              pctx.fillRect(0, ph - strip, pw, strip);
+              pctx.font = "600 9px ui-monospace, SFMono-Regular, monospace";
+              pctx.textAlign = "left";
+              pctx.fillStyle = stageColor;
+              pctx.fillText(stageText, 4, ph - 4.5);
+            }
           }
         }
       }
@@ -2212,6 +2702,15 @@ export function DryFireTrainer() {
             startPhotoCountdownRef.current();
           }
         }
+        // SMART DISTANCE: pinhole trig from the card's known size. quad
+        // (mm) × focal (px) / apparent quad (px) = distance. Smoothed.
+        if (locked && current && current.obs.cellPx > 2) {
+          const fpx = procW / 2 / Math.tan(((CARD_FOV_DEG / 2) * Math.PI) / 180);
+          const quadM = cardWidthMmRef.current / 2 / 1000;
+          const d = (quadM * fpx) / current.obs.cellPx;
+          smartDistRef.current = smartDistRef.current > 0 ? smartDistRef.current + 0.15 * (d - smartDistRef.current) : d;
+          setSmartDistM(Math.round(smartDistRef.current * 10) / 10);
+        }
         setTracker({
           locked,
           residual: locked && current ? current.obs.residual : 0,
@@ -2265,8 +2764,13 @@ export function DryFireTrainer() {
     // Sample aim from the raw observations JUST BEFORE the click: the
     // striker fall disturbs the muzzle and the filter lags, so the frames
     // in [-180, -20] ms are where the sights were honest.
+    // Window shifted for the 50 ms audio poll + 85 ms analysis window: the
+    // reported click time lags the PHYSICAL striker fall by ~50–135 ms, so
+    // [-280, -120] relative to the report re-centers sampling on the honest
+    // pre-break hold instead of straddling the trigger disturbance (which
+    // read as a constant aim offset).
     const rawWindow = aimHistoryRef.current.filter(
-      (hArr) => hArr.atMs >= clickAtMs - 180 && hArr.atMs <= clickAtMs - 20,
+      (hArr) => hArr.atMs >= clickAtMs - 280 && hArr.atMs <= clickAtMs - 120,
     );
     // Sample only frames in the SAME feature regime the model was fitted on
     // (homography vs affine) — mixing regimes biases the prediction.
@@ -2280,7 +2784,17 @@ export function DryFireTrainer() {
       );
     }
     if (!feats) return;
-    const aim = predictAim(modelRef.current, feats);
+    // SHOOT-A-BUTTON: if the sights are on an on-board control, the trigger
+    // "clicks" it instead of scoring a shot on the target.
+    if (aimHoverBtnRef.current) {
+      const id = aimHoverBtnRef.current;
+      setFiredBtn(id);
+      runAimBtnRef.current(id);
+      return;
+    }
+    const rawAim = predictAim(modelRef.current, feats);
+    // Zero adjustment: the constant bias dialed out via "zero to group".
+    const aim = { x: rawAim.x - zeroOffsetRef.current.x, y: rawAim.y - zeroOffsetRef.current.y };
     const rect = wrap.getBoundingClientRect();
     const nx = (aim.x - rect.left) / Math.max(1, rect.width);
     const ny = (aim.y - rect.top) / Math.max(1, rect.height);
@@ -2390,7 +2904,7 @@ export function DryFireTrainer() {
         setCurrentCall(null);
         setSession((s) => ({ ...s, drills: s.drills + 1 }));
         const score = scoreDrill(next);
-        speak(`Done. ${score.correct} of ${score.total}.`);
+        say("drill", `Done. ${score.correct} of ${score.total}.`);
       } else if (drillModeRef.current === "reactive") {
         // One-at-a-time: the hit earns the next call. Timed and sequence
         // modes don't announce here — timers or memory drive them.
@@ -2399,7 +2913,7 @@ export function DryFireTrainer() {
         if (step) {
           lastCallAtRef.current = performance.now();
           setCurrentCall({ label: step.label, kind: step.kind });
-          speak(step.spoken, { onEnd: () => (lastCallAtRef.current = performance.now()) });
+          say("drill", step.spoken, { onEnd: () => (lastCallAtRef.current = performance.now()) });
         }
       }
     }
@@ -2415,7 +2929,7 @@ export function DryFireTrainer() {
   // impacts), and the "wait" gaps between windows are deaf. Three windows,
   // then the averaged slide fingerprint screens the dry-fires and all
   // future detection.
-  const onMicClick = (atMs: number, peak: number, fingerprint: number[] | null = null) => {
+  const onMicClick = (atMs: number, peak: number, fingerprint: number[] | null = null, durationMs = 0) => {
     const cal = trigCalRef.current;
     if (cal) {
       // NEVER count our own voice prompts: the mic hears the speakers, and
@@ -2426,6 +2940,7 @@ export function DryFireTrainer() {
         // Deaf outside the open window — by design.
         if (cal.windowCloseAt === null || nowMs > cal.windowCloseAt) return;
         if (fingerprint) cal.rackFps.push(fingerprint);
+        if (durationMs > 0) cal.rackDurs.push(durationMs); // pull-back / slam durations
         cal.rackOk = true;
         trigWaveEventsRef.current.push({ t: nowMs, kind: "reject" }); // amber = slide
         return;
@@ -2442,11 +2957,12 @@ export function DryFireTrainer() {
       trigWaveEventsRef.current.push({ t: nowMs, kind: "click" });
       cal.peaks.push(peak);
       if (fingerprint) cal.clickFps.push(fingerprint);
+      if (durationMs > 0) cal.clickDurs.push(durationMs);
       setTrigCalCount(cal.peaks.length);
       if (cal.peaks.length < TRIG_CAL_CLICKS) {
         cal.armAt = nowMs + 8000; // fallback — onEnd arms sooner
         cal.remindAt = nowMs + 15000;
-        speak(`${cal.peaks.length}.`, {
+        say("guidance", `${cal.peaks.length}.`, {
           onEnd: () => {
             const c = trigCalRef.current;
             if (c) {
@@ -2459,23 +2975,50 @@ export function DryFireTrainer() {
           const sorted = [...cal.peaks].sort((a, b) => a - b);
           const median = sorted[Math.floor(sorted.length / 2)];
           // Fire comfortably below the measured click, safely above silence.
-          const floor = Math.min(0.4, Math.max(0.005, median * 0.4));
+          const floor = Math.min(0.4, Math.max(0.003, median * 0.3));
           triggerRef.current?.setCustomFloor(floor);
           // Average the three clicks and the three racks into the accept /
           // reject templates, and arm spectral matching from here on.
           const clickFp = meanFingerprint(cal.clickFps);
           const rackFp = meanFingerprint(cal.rackFps);
           triggerRef.current?.setFingerprints(clickFp, rackFp);
+          // Median click DURATION → the primary trigger gate.
+          const durSorted = [...cal.clickDurs].sort((a, b) => a - b);
+          const clickDurMs = durSorted.length ? durSorted[Math.floor(durSorted.length / 2)] : 0;
+          triggerRef.current?.setClickDuration(clickDurMs);
           triggerRef.current?.setCaptureMode(false); // back to live discrimination
           const rackOk = cal.rackOk ?? null;
           trigCalRef.current = null;
           setTrigCalCount(null);
-          setTrigCalResult({ clickPeak: median, floor, rackOk, clickFp, rackFp });
-          speak("Trigger calibrated.");
-          // Calibration chain: flow straight into the 9-dot aim calibration.
+          const calResult = {
+            clickPeak: median,
+            floor,
+            rackOk,
+            clickFp,
+            rackFp,
+            clickFps: cal.clickFps,
+            rackFps: cal.rackFps,
+            clickDurMs,
+            rackDurs: cal.rackDurs,
+          };
+          setTrigCalResult(calResult);
+          // Remember it for next session's "use previous calibration" offer
+          // (keeps the user's name for the slot).
+          const savedEntry = { savedAt: Date.now(), name: savedTrigCal?.name, result: calResult };
+          try {
+            localStorage.setItem(TRIGCAL_KEY, JSON.stringify(savedEntry));
+          } catch {
+            /* best effort */
+          }
+          setSavedTrigCal(savedEntry);
+          say("feedback", "Trigger calibrated.");
+          // Calibration chain: next is the GUIDED COLOR step (position →
+          // photo → tap C/Y/M), which seeds the hold path and then flows
+          // into the 9-dot aim calibration.
           if (pendingAimCalRef.current) {
             pendingAimCalRef.current = false;
-            window.setTimeout(() => beginCalibrationRef.current(), 1600);
+            pendingDotsAfterTapsRef.current = true;
+            window.setTimeout(() => beginGuidedColorTapsRef.current(), 1600);
           }
         }
       return;
@@ -2488,7 +3031,10 @@ export function DryFireTrainer() {
   });
 
   const startMic = async () => {
-    const trigger = createClickTrigger((atMs, peak, fp) => onMicClickRef.current(atMs, peak, fp), trigSensitivity);
+    const trigger = createClickTrigger(
+      (atMs, peak, fp, dur) => onMicClickRef.current(atMs, peak, fp, dur),
+      trigSensitivity,
+    );
     const ok = await trigger.start();
     if (!ok) {
       setStatusLine("Microphone unavailable — allow mic access, or use the manual shot button.");
@@ -2496,23 +3042,49 @@ export function DryFireTrainer() {
     }
     triggerRef.current?.stop();
     triggerRef.current = trigger;
-    // Re-apply a previously calibrated click floor + fingerprints.
+    // Re-apply a previously calibrated click floor + fingerprints + duration.
     if (trigCalResult) {
       trigger.setCustomFloor(trigCalResult.floor);
       trigger.setFingerprints(trigCalResult.clickFp ?? null, trigCalResult.rackFp ?? null);
+      trigger.setClickDuration(trigCalResult.clickDurMs ?? 0);
     }
     setMicActive(true);
   };
+  // GUIDED COLOR ACQUISITION (the chain's acquire stage): shooting position
+  // → photo → the human taps C, Y, M on the still. The taps give colors AND
+  // pose, which seed the hold path directly — the detector never has to
+  // find the card on its own.
+  const beginGuidedColorTaps = () => {
+    say("guidance", "Get into your shooting position and hold your aim at the screen. Photo in three. Two. One.", {
+      onEnd: () => {
+        if (captureFrameRef.current?.()) {
+          helpTapsRef.current = [];
+          setHelpPick({ stage: 0 });
+          say("feedback", 
+            `Got it. Set the weapon down safely, then tap the ${helpOrder[0].name.toLowerCase()} patch on the picture in the camera window.`,
+          );
+        } else {
+          say("feedback", "Camera not ready.");
+        }
+      },
+    });
+  };
+  const beginGuidedColorTapsRef = useRef(beginGuidedColorTaps);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability -- latest-value ref, mutable by design
+    beginGuidedColorTapsRef.current = beginGuidedColorTaps;
+  });
+
   // Manual fallback: freeze the (still-aimed) frame and have the human tap
   // the patches in order. Sets the reference colors directly.
   const beginHelpTap = () => {
     if (captureFrameRef.current?.()) {
       setHelpPick({ stage: 0 });
-      speak(
+      say("feedback", 
         `Frame captured. Set the weapon down safely, then tap the ${helpOrder[0].name.toLowerCase()} patch on the picture.`,
       );
     } else {
-      speak("Camera not ready.");
+      say("feedback", "Camera not ready.");
     }
   };
   // "Help computer." — BACKGROUND SUBTRACTION first: photograph the scene
@@ -2526,15 +3098,15 @@ export function DryFireTrainer() {
       setHelpPick(null);
       return;
     }
-    speak("Help mode. Lower the pistol out of the camera's view. Background photo in three. Two. One.", {
+    say("guidance", "Help mode. Lower the pistol out of the camera's view. Background photo in three. Two. One.", {
       onEnd: () => {
         const bg = captureProcImageRef.current?.();
         if (!bg) {
-          speak("Camera not ready.");
+          say("feedback", "Camera not ready.");
           return;
         }
         bgFrameRef.current = bg;
-        speak("Got it. Now raise your pistol and hold your normal aim. Three. Two. One.", {
+        say("guidance", "Got it. Now raise your pistol and hold your normal aim. Three. Two. One.", {
           onEnd: () => {
             const fg = captureProcImageRef.current?.();
             const bg2 = bgFrameRef.current;
@@ -2566,7 +3138,7 @@ export function DryFireTrainer() {
               }
             }
             if (maxX < 0 || maxX - minX < 8 || maxY - minY < 8) {
-              speak("I couldn't see a difference between the two photos. Let's do it by touch.");
+              say("feedback", "I couldn't see a difference between the two photos. Let's do it by touch.");
               beginHelpTap();
               return;
             }
@@ -2598,10 +3170,10 @@ export function DryFireTrainer() {
             if (res.observation?.quadColors) {
               const qc = res.observation.quadColors;
               setRefDraft({ red: [...qc.red], green: [...qc.green], blue: [...qc.blue] });
-              speak("Found the card. Colors captured — carry on.");
+              say("feedback", "Found the card. Colors captured — carry on.");
               return;
             }
-            speak("I couldn't isolate the card automatically. Let's do it by touch.");
+            say("feedback", "I couldn't isolate the card automatically. Let's do it by touch.");
             beginHelpTap();
           },
         });
@@ -2638,6 +3210,8 @@ export function DryFireTrainer() {
       peaks: [],
       clickFps: [],
       rackFps: [],
+      clickDurs: [],
+      rackDurs: [],
       armAt: performance.now() + 8000,
       remindAt: performance.now() + 12000,
     };
@@ -2647,8 +3221,9 @@ export function DryFireTrainer() {
     setTrigCalResult(null);
     triggerRef.current?.setCustomFloor(null); // measure on preset gates
     triggerRef.current?.setFingerprints(null, null); // and without matching
+    triggerRef.current?.setClickDuration(0); // generic duration cap
     triggerRef.current?.setCaptureMode(true); // raw spikes, no discrimination
-    speak("Calibrating the slide. Rack the slide now.", { onEnd: openSlideWindow });
+    say("guidance", "Calibrating the slide. Rack the slide now.", { onEnd: openSlideWindow });
   };
   const cancelTrigCalibration = () => {
     trigCalRef.current = null;
@@ -2685,15 +3260,15 @@ export function DryFireTrainer() {
     photoBusyRef.current = true;
     setPhotoStage("countdown");
     setPhotoCount(3);
-    speak("Hold still for the photo. Three.");
+    say("guidance", "Hold still for the photo. Three.");
     photoTimersRef.current = [
       window.setTimeout(() => {
         setPhotoCount(2);
-        speak("Two.");
+        say("guidance", "Two.");
       }, 1200),
       window.setTimeout(() => {
         setPhotoCount(1);
-        speak("One.");
+        say("guidance", "One.");
       }, 2400),
       window.setTimeout(() => {
         setPhotoCount(null);
@@ -2715,9 +3290,11 @@ export function DryFireTrainer() {
             blue: [...t.colors.blue] as [number, number, number],
           };
           colorsCommittedRef.current = cap;
+          persistCommittedColors(cap);
+          illumRef.current = { base: null, gain: [1, 1, 1] };
           setRefDraft({ red: cap.red, green: cap.green, blue: cap.blue });
           setPhotoStage("done");
-          speak("Colors captured.");
+          say("feedback", "Colors captured.");
         } else if (zoneFresh && z.colors) {
           const cap: TrackedColors = {
             red: [...z.colors.red] as [number, number, number],
@@ -2725,12 +3302,14 @@ export function DryFireTrainer() {
             blue: [...z.colors.blue] as [number, number, number],
           };
           colorsCommittedRef.current = cap;
+          persistCommittedColors(cap);
+          illumRef.current = { base: null, gain: [1, 1, 1] };
           setRefDraft({ red: cap.red, green: cap.green, blue: cap.blue });
           setPhotoStage("done");
-          speak("Colors captured.");
+          say("feedback", "Colors captured.");
         } else {
           setPhotoStage("idle"); // manual-only now — no automatic retry
-          speak("Lock slipped. Tap the photo button to retry.");
+          say("feedback", "Lock slipped. Tap the photo button to retry.");
         }
       }, 3600),
     ];
@@ -2739,15 +3318,93 @@ export function DryFireTrainer() {
     startPhotoCountdownRef.current = startPhotoCountdown;
   });
 
+  // Lock doctor: 6 s of live measurement → concrete physical prescription.
+  const runLockDoctor = () => {
+    if (doctorRef.current) return;
+    say("guidance", "Lock doctor. Hold your aim at the screen for six seconds.");
+    doctorRef.current = {
+      until: performance.now() + 6500,
+      frames: 0,
+      det: 0,
+      cells: [],
+      stages: {},
+      zeroRed: 0,
+      zeroGreen: 0,
+      zeroBlue: 0,
+      procW: 0,
+      procH: 0,
+      fps: 0,
+    };
+    setDoctorState("running");
+    window.setTimeout(() => {
+      const d = doctorRef.current;
+      doctorRef.current = null;
+      if (!d || d.frames === 0) {
+        setDoctorReport(["No frames analyzed — is the camera running?"]);
+        setDoctorState("done");
+        return;
+      }
+      const lines = lockDoctorVerdict(d);
+      setDoctorReport(lines);
+      setDoctorState("done");
+      say("feedback", lines.length > 1 ? `${lines[0]} ${lines[1]}` : lines[0]);
+    }, 6600);
+  };
+
+  // COLORS-ONLY RECALIBRATION: clears the color identity and runs just the
+  // photo-and-tap flow — no slide, no trigger, no dots. A five-count with a
+  // keep-still warning precedes the photo.
+  const recalibrateColorsOnly = () => {
+    if (photoBusyRef.current || helpPick) return;
+    colorsCommittedRef.current = null;
+    illumRef.current = { base: null, gain: [1, 1, 1] };
+    shadePoolsRef.current = [[], [], []];
+    setRefDraft({ red: null, green: null, blue: null });
+    pendingDotsAfterTapsRef.current = false; // colors only — no chain after
+    photoBusyRef.current = true;
+    const WORDS = ["", "One", "Two", "Three", "Four", "Five"];
+    say("guidance", "Color recalibration. Get into your shooting position, hold your aim, and keep still.", {
+      onEnd: () => {
+        let n = 5;
+        setPhotoCount(5);
+        say("guidance", "Five.");
+        const tick = window.setInterval(() => {
+          n -= 1;
+          if (n > 0) {
+            setPhotoCount(n);
+            say("guidance", `${WORDS[n]}.`);
+            return;
+          }
+          window.clearInterval(tick);
+          setPhotoCount(null);
+          photoBusyRef.current = false;
+          if (captureFrameRef.current?.()) {
+            helpTapsRef.current = [];
+            setHelpPick({ stage: 0 });
+            say(
+              "guidance",
+              `Got it. Set the weapon down safely, then tap the ${helpOrder[0].name.toLowerCase()} patch on the picture.`,
+            );
+          } else {
+            say("feedback", "Camera not ready.");
+          }
+        }, 1000);
+        photoTimersRef.current.push(tick);
+      },
+    });
+  };
+
   // Restart the flag lock from scratch: drop the track, clear the color
   // reference, and re-acquire — the step's do-over button.
   const restartFlagLock = () => {
     cancelPhotoCountdown();
     trackRef.current = null;
     colorsCommittedRef.current = null; // explicit do-over — colors unsettled
+    illumRef.current = { base: null, gain: [1, 1, 1] };
+    shadePoolsRef.current = [[], [], []];
     setRefDraft({ red: null, green: null, blue: null });
     setPhotoStage("idle");
-    speak("Restarting. Raise and hold your aim.");
+    say("feedback", "Restarting. Raise and hold your aim.");
   };
 
   // ---- Default-session automation (user mode) -------------------------------
@@ -2762,9 +3419,15 @@ export function DryFireTrainer() {
   const beginCalibrationRef = useRef<() => void>(() => {});
   const startFullCalibration = () => {
     if (trigCalResult) {
-      // Slide & trigger already calibrated (profile / earlier run) — go
-      // straight to the aim dots.
-      beginCalibrationRef.current();
+      // Slide & trigger already calibrated (profile / earlier run). Colors
+      // already identified this session → straight to the dots; otherwise
+      // the guided color taps come first.
+      if (colorsCommittedRef.current) {
+        beginCalibrationRef.current();
+      } else {
+        pendingDotsAfterTapsRef.current = true;
+        beginGuidedColorTapsRef.current();
+      }
       return;
     }
     // eslint-disable-next-line react-hooks/immutability -- latest-value ref, mutable by design
@@ -2810,7 +3473,7 @@ export function DryFireTrainer() {
               cal.remindAt = nowP + 15000;
               setTrigCalRacking(false);
               setTrigCalCount(0);
-              speak("Slide captured. Now dry fire three times, pausing between clicks.", {
+              say("guidance", "Slide captured. Now dry fire three times, pausing between clicks.", {
                 onEnd: () => {
                   const c = trigCalRef.current;
                   if (c) {
@@ -2820,18 +3483,18 @@ export function DryFireTrainer() {
                 },
               });
             } else {
-              speak(got ? "Good. And again — rack the slide." : "I didn't hear it. Rack the slide.", {
+              say("guidance", got ? "Good. And again — rack the slide." : "I didn't hear it. Rack the slide.", {
                 onEnd: () => openSlideWindowRef.current(),
               });
             }
           } else if (cal.windowCloseAt === null && nowP > cal.remindAt && !isSpeaking()) {
             // The prompt's onEnd never opened a window (TTS hiccup) — recover.
             cal.remindAt = nowP + 12000;
-            speak("Rack the slide.", { onEnd: () => openSlideWindowRef.current() });
+            say("guidance", "Rack the slide.", { onEnd: () => openSlideWindowRef.current() });
           }
         } else if (cal && nowP > cal.remindAt && !isSpeaking()) {
           cal.remindAt = nowP + 15000;
-          speak("Dry fire once.");
+          say("guidance", "Dry fire once.");
         }
         const thr = Math.max(1e-4, level.threshold);
         setMicStats({
@@ -2948,10 +3611,13 @@ export function DryFireTrainer() {
     calCooldownUntilRef.current = 0;
     modelRef.current = null;
     provisionalModelRef.current = null;
+    dispAimRef.current = null;
     holdTestRef.current = null;
     setHoldActive(false);
     setHoldResult(null);
     featureFilterRef.current.reset();
+    zeroOffsetRef.current = { x: 0, y: 0 }; // fresh model → fresh zero
+    setZeroed(false);
     setModel(null);
     setCalIndex(0);
     setCalHold(0);
@@ -2977,7 +3643,7 @@ export function DryFireTrainer() {
     if (!micActive) void startMic();
     // Safety announcement first — the weapons-handling rules, every time.
     setBriefActive(true);
-    speak(
+    say("safety", 
       "Please ensure your weapon is unloaded and that there is no ammunition in the room. " +
         "Treat every weapon as if it were loaded. " +
         "Never point a weapon at anything you do not intend to shoot. " +
@@ -3008,9 +3674,24 @@ export function DryFireTrainer() {
     const t = window.setTimeout(() => setPhotoStage("idle"), 0);
     return () => window.clearTimeout(t);
   }, [wizardStep]);
-  // NO auto-advance on the prep step: the chain (alternating slide/trigger
-  // calibration → 9-dot aim calibration) starts only when the user taps
-  // Start — they control when the gun comes up.
+  // ON-BOARD WIZARD auto-advance: once BOTH sound and color are calibrated
+  // (freshly or via "Use Saved"), the 9-dot aim calibration starts by
+  // itself and the popover yields to the dots.
+  const boardDotsStartedRef = useRef(false);
+  useEffect(() => {
+    if (!(uiMode === "user" && phase === "setup" && wizardStep === "board")) {
+      boardDotsStartedRef.current = false;
+      return;
+    }
+    if (boardDotsStartedRef.current) return;
+    if (!trigCalResult || !refComplete) return;
+    if (trigCalRacking || trigCalCount !== null || helpPick !== null || photoCount !== null) return;
+    const t = window.setTimeout(() => {
+      boardDotsStartedRef.current = true;
+      beginCalibrationRef.current();
+    }, 900);
+    return () => window.clearTimeout(t);
+  }, [uiMode, phase, wizardStep, trigCalResult, refComplete, trigCalRacking, trigCalCount, helpPick, photoCount]);
 
   // ---- Scenario profiles ----------------------------------------------------
   const [profiles, setProfiles] = useState<ScenarioProfile[]>([]);
@@ -3035,6 +3716,7 @@ export function DryFireTrainer() {
     triggerRef.current?.setSensitivity(p.trigSensitivity);
     triggerRef.current?.setCustomFloor(p.trigCal?.floor ?? null);
     triggerRef.current?.setFingerprints(p.trigCal?.clickFp ?? null, p.trigCal?.rackFp ?? null);
+    triggerRef.current?.setClickDuration(p.trigCal?.clickDurMs ?? 0);
   };
 
   const saveProfile = () => {
@@ -3088,13 +3770,72 @@ export function DryFireTrainer() {
 
   // Load the saved profile LIST for the picker — but NEVER auto-apply one.
   // Every session starts on the defaults; a profile's settings only take
-  // effect when the user explicitly selects it.
+  // effect when the user explicitly selects it. Same for the previous
+  // slide/trigger calibration: loaded as an OFFER, applied only on tap.
   useEffect(() => {
     const t = window.setTimeout(() => {
       setProfiles(loadProfilesFromStorage());
+      try {
+        const raw = localStorage.getItem(TRIGCAL_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as { savedAt: number; result: TrigCalData };
+          if (parsed?.result && typeof parsed.result.floor === "number") setSavedTrigCal(parsed);
+        }
+      } catch {
+        /* best effort */
+      }
+      try {
+        const raw = localStorage.getItem(COLORS_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as { savedAt: number; colors: TrackedColors };
+          if (parsed?.colors?.red && parsed.colors.green && parsed.colors.blue) setSavedColors(parsed);
+        }
+      } catch {
+        /* best effort */
+      }
     }, 0);
     return () => window.clearTimeout(t);
   }, []);
+
+  // Audition a random one of the calibration's captured events — the 16-band
+  // fingerprint resynthesized as a shaped noise burst (click) or double
+  // burst (slide). Lets the user judge whether a saved calibration still
+  // sounds like their gun before reusing it.
+  const playCalSample = (kind: "slide" | "click") => {
+    const src = trigCalResult ?? savedTrigCal?.result;
+    if (!src) return;
+    const pool =
+      kind === "click"
+        ? (src.clickFps?.length ? src.clickFps : src.clickFp ? [src.clickFp] : [])
+        : (src.rackFps?.length ? src.rackFps : src.rackFp ? [src.rackFp] : []);
+    if (pool.length === 0) {
+      say("feedback", "No recording stored for that.");
+      return;
+    }
+    const fp = pool[Math.floor(Math.random() * pool.length)];
+    playFingerprintSample(fp, kind === "click" ? { durMs: 90, peak: src.clickPeak, bursts: 1 } : { durMs: 140, peak: Math.max(src.clickPeak, 0.12), bursts: 2 });
+  };
+
+  // Opt-in reuse of a previous session's committed colors — the chain then
+  // skips the photo/tap step and goes straight to the aim dots.
+  const usePreviousColors = () => {
+    if (!savedColors) return;
+    colorsCommittedRef.current = savedColors.colors;
+    illumRef.current = { base: null, gain: [1, 1, 1] };
+    setRefDraft({ red: savedColors.colors.red, green: savedColors.colors.green, blue: savedColors.colors.blue });
+    say("feedback", "Using the previous color calibration.");
+  };
+
+  // Opt-in reuse of the previous session's slide & trigger calibration —
+  // the chain then skips straight past those steps.
+  const usePreviousTrigCal = () => {
+    if (!savedTrigCal) return;
+    setTrigCalResult(savedTrigCal.result);
+    triggerRef.current?.setCustomFloor(savedTrigCal.result.floor);
+    triggerRef.current?.setFingerprints(savedTrigCal.result.clickFp ?? null, savedTrigCal.result.rackFp ?? null);
+    triggerRef.current?.setClickDuration(savedTrigCal.result.clickDurMs ?? 0);
+    say("feedback", "Using the previous slide and trigger calibration.");
+  };
 
   // Nudge the reference colors for a room that got brighter (☀) or darker
   // (🌙) since they were captured.
@@ -3109,7 +3850,7 @@ export function DryFireTrainer() {
     cancelSpeech();
     setBriefActive(false);
     setStatusLine("Aim at the amber dot and hold steady — it captures automatically.");
-    speak("Aim at the first dot and hold.");
+    say("guidance", "Aim at the first dot and hold.");
   };
 
   // "Wait — I messed up.": undo the PREVIOUS calibration dot (jerked while
@@ -3124,8 +3865,34 @@ export function DryFireTrainer() {
     setCalHold(0);
     calCooldownUntilRef.current = performance.now() + 800;
     provisionalModelRef.current = fitAimModel(samplesRef.current, 1e-3, 3);
-    speak(`Redoing dot ${prev + 1}. Aim and hold.`);
+    say("guidance", `Redoing dot ${prev + 1}. Aim and hold.`);
   };
+
+  // ZERO TO GROUP: like adjusting sights — measure the group's mean point
+  // of impact and dial that constant offset out of every future prediction.
+  const zeroAimToGroup = () => {
+    const wrap = boardWrapRef.current;
+    if (!targetStats || targetStats.count < 3 || !wrap) {
+      say("guidance", "Shoot at least three at the center first, then zero.");
+      return;
+    }
+    const rect = wrap.getBoundingClientRect();
+    const rPx = 0.45 * Math.min(rect.width, rect.height) * targetScale;
+    zeroOffsetRef.current = {
+      x: zeroOffsetRef.current.x + targetStats.mpiX * rPx,
+      y: zeroOffsetRef.current.y + targetStats.mpiY * rPx,
+    };
+    setZeroed(true);
+    setTargetShots([]);
+    shotMarkersRef.current = [];
+    say("feedback", "Zeroed to your group. Confirm with a few more shots.");
+  };
+  const resetZero = () => {
+    zeroOffsetRef.current = { x: 0, y: 0 };
+    setZeroed(false);
+    say("feedback", "Zero reset.");
+  };
+
 
   // "Wait — I messed up." during target practice: strike the last shot (a
   // false trigger from noise, or a shot you called before the gun settled).
@@ -3134,10 +3901,40 @@ export function DryFireTrainer() {
     setTargetShots((prev) => prev.slice(0, -1));
     shotMarkersRef.current.pop();
     setSession((s) => ({ ...s, shots: Math.max(0, s.shots - 1) }));
-    speak("Last shot removed.");
+    say("feedback", "Last shot removed.");
+  };
+
+  // Register/unregister a button element in the aim registry (callback ref).
+  const aimBtnRef = (id: string) => (el: HTMLButtonElement | null) => {
+    if (el) aimBtnRegistry.current.set(id, el);
+    else aimBtnRegistry.current.delete(id);
+  };
+  // Dispatch an aim-targetable button by id (mouse click AND the
+  // shoot-a-button trigger path). By id → action looked up fresh, no stale
+  // closures. Declared after all its actions so nothing is used-before-init.
+  const runAimBtn = (id: string) => {
+    switch (id) {
+      case "rangeMinus":
+        stepRange(-1);
+        break;
+      case "rangePlus":
+        stepRange(1);
+        break;
+      case "undoShot":
+        undoLastShot();
+        break;
+      case "zero":
+        zeroAimToGroup();
+        break;
+      case "resetZero":
+        resetZero();
+        break;
+    }
   };
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/immutability -- latest-value ref, mutable by design
+    runAimBtnRef.current = runAimBtn;
+  });
+  useEffect(() => {
     beginCalibrationRef.current = beginCalibration;
   });
 
@@ -3162,7 +3959,7 @@ export function DryFireTrainer() {
         if (step) {
           lastCallAtRef.current = performance.now();
           setCurrentCall({ label: step.label, kind: step.kind });
-          speak(step.spoken, { onEnd: () => (lastCallAtRef.current = performance.now()) });
+          say("drill", step.spoken, { onEnd: () => (lastCallAtRef.current = performance.now()) });
         }
       } else {
         // Sequence: the course of fire was announced before the commands —
@@ -3174,12 +3971,12 @@ export function DryFireTrainer() {
       if (protocol === "none") {
         playStartBeep(go);
       } else {
-        speakSequence(RANGE_COMMANDS[protocol], { onEnd: () => window.setTimeout(() => playStartBeep(go), 600) });
+        saySeq("drill", RANGE_COMMANDS[protocol], { onEnd: () => window.setTimeout(() => playStartBeep(go), 600) });
       }
     };
     if (drillMode === "sequence") {
       // Announce the full course of fire first, then run the range commands.
-      speakSequence(
+      saySeq("drill", 
         steps.map((s) => s.spoken),
         { onEnd: commands },
       );
@@ -3216,7 +4013,7 @@ export function DryFireTrainer() {
       setCurrentCall(null);
       setSession((s) => ({ ...s, drills: s.drills + 1 }));
       const score = scoreDrill(state);
-      speak(`Done. ${score.correct} of ${score.total}.`);
+      say("drill", `Done. ${score.correct} of ${score.total}.`);
     };
     const timers: number[] = timedRun.calloutAtMs.map((atMs, index) =>
       window.setTimeout(() => {
@@ -3231,7 +4028,7 @@ export function DryFireTrainer() {
         if (step) {
           lastCallAtRef.current = performance.now();
           setCurrentCall({ label: step.label, kind: step.kind });
-          speak(step.spoken, { onEnd: () => (lastCallAtRef.current = performance.now()) });
+          say("drill", step.spoken, { onEnd: () => (lastCallAtRef.current = performance.now()) });
         }
       }, atMs),
     );
@@ -3263,6 +4060,7 @@ export function DryFireTrainer() {
     stopDrill();
     setBriefActive(false);
     colorsCommittedRef.current = null; // the training instance is over
+    illumRef.current = { base: null, gain: [1, 1, 1] };
     setPhase("setup");
     setWizardStep("choose"); // back to the landing chooser
     setStatusLine("Ready — calibrate to train again.");
@@ -3271,13 +4069,19 @@ export function DryFireTrainer() {
   const activeCalPoint = phase === "calibrate" && calIndex < CAL_POINTS.length ? CAL_POINTS[calIndex] : null;
   const drillStep = drill ? currentStep(drill) : null;
   const drillScore = drill && drill.status === "done" ? scoreDrill(drill) : null;
+  // The board takes the full screen during training AND during the on-board
+  // calibration wizard (the popover flow).
+  const boardFull = phase !== "setup" || (uiMode === "user" && wizardStep === "board");
 
+  const wizardShowing = uiMode === "user" && phase === "setup" && wizardStep !== "board";
   return (
     <main className="min-h-screen bg-black px-4 py-6 text-white">
       {/* ---- USER MODE: guided walkthrough (the shippable experience). The
-           full pro UI stays mounted underneath so every ref keeps living. */}
-      {uiMode === "user" && phase === "setup" ? (
-        <div className="fixed inset-0 z-[70] overflow-y-auto bg-neutral-950/[0.97] px-4 py-8">
+           full pro UI stays mounted (zero-height) underneath so every ref
+           keeps living. Rendered IN FLOW — not as a fixed overlay — so the
+           site header stays visible and the page height is just the wizard. */}
+      {wizardShowing ? (
+        <div className="px-0 py-2">
           <div className="mx-auto max-w-lg space-y-5">
             <div className="flex items-center justify-between">
               <p className="text-[11px] font-semibold uppercase tracking-widest text-sky-400">Trackr · dry-fire trainer</p>
@@ -3403,8 +4207,13 @@ export function DryFireTrainer() {
                 <button
                   type="button"
                   onClick={() => {
-                    setWizardStep("prep");
+                    // Straight to the TARGET SCREEN: the calibration wizard
+                    // runs as a small popover on top of the live board.
+                    setWizardStep("board");
                     if (!cameraActive) void startCamera();
+                    if (typeof document !== "undefined" && !document.fullscreenElement) {
+                      void document.documentElement.requestFullscreen?.().catch(() => undefined);
+                    }
                   }}
                   className="w-full rounded-md border border-rose-400/50 bg-rose-500/15 px-4 py-3 text-sm font-medium text-rose-100 transition hover:bg-rose-500/25"
                 >
@@ -3434,9 +4243,12 @@ export function DryFireTrainer() {
                       Rack the slide when told — three short listen windows — then dry fire three times.
                     </li>
                   )}
-                  <li>Seat the flag in the muzzle (colors to camera), raise, and hold your normal aim.</li>
                   <li>
-                    Hold your sights on each of the 9 flashing dots until its ring fills.{" "}
+                    Get into your shooting position for a photo, then set the gun down and tap the cyan, magenta, and
+                    yellow patches on the frozen picture — that teaches it your card.
+                  </li>
+                  <li>
+                    Pick the pistol back up and hold your sights on each of the 9 flashing dots until its ring fills.{" "}
                     {trainMode === "target" ? "Then the target is hot." : "Then the drill starts — wait for the beep."}
                   </li>
                 </ol>
@@ -3471,7 +4283,7 @@ export function DryFireTrainer() {
                     {patternMode === "color" ? (
                       <div className="mt-2 flex gap-2">
                         {(colorPalette === "cmy"
-                          ? (["green", "red", "blue"] as const)
+                          ? (["green", "blue", "red"] as const)
                           : (["red", "green", "blue"] as const)
                         ).map((slot) => {
                           const c = refDraft[slot];
@@ -3487,6 +4299,46 @@ export function DryFireTrainer() {
                     ) : null}
                   </div>
                 )}
+                {/* COLOR WINDOW: how tightly detection hugs the locked C/Y/M
+                    colors. Slider adjusts; the padlock freezes it. */}
+                {cameraActive && patternMode === "color" ? (
+                  <div className="rounded-lg border border-gray-800 px-3 py-2">
+                    <div className="flex items-center gap-2">
+                      <span className="whitespace-nowrap text-xs text-gray-400">Color window</span>
+                      <input
+                        type="range"
+                        min={0.05}
+                        max={0.2}
+                        step={0.005}
+                        value={colorWindow}
+                        disabled={colorWindowLocked}
+                        onChange={(e) => setColorWindow(Number(e.target.value))}
+                        className="flex-1 accent-sky-400 disabled:opacity-40"
+                      />
+                      <span className="w-14 text-right font-mono text-xs text-gray-300">
+                        ±{colorWindow.toFixed(3)}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setColorWindowLocked((v) => !v)}
+                        title={
+                          colorWindowLocked
+                            ? "Window locked — tap to allow adjustment"
+                            : "Lock the window at this value"
+                        }
+                        className={`rounded px-1.5 py-0.5 text-sm transition ${
+                          colorWindowLocked ? "bg-sky-500/20" : "hover:bg-neutral-900"
+                        }`}
+                      >
+                        {colorWindowLocked ? "🔒" : "🔓"}
+                      </button>
+                    </div>
+                    <p className="mt-1 text-[10px] leading-snug text-gray-500">
+                      Tighter (left) = look-alikes rejected harder · wider (right) = more forgiving of lighting.
+                      Lighting shifts are already modeled, so tight usually works.
+                    </p>
+                  </div>
+                ) : null}
                 {/* Live audio waveform + detection info during the slide &
                     trigger calibration steps. */}
                 {micActive && (trigCalRacking || trigCalCount !== null) ? (
@@ -3514,6 +4366,28 @@ export function DryFireTrainer() {
                   </div>
                 ) : null}
                 {cameraError ? <p className="text-xs text-rose-300">{cameraError}</p> : null}
+                {cameraActive && !(trigCalRacking || trigCalCount !== null) && !refComplete && savedColors ? (
+                  <button
+                    type="button"
+                    onClick={usePreviousColors}
+                    title="Reuse the color identity committed in a past session — the chain skips the photo/tap step"
+                    className="w-full rounded-lg border border-fuchsia-400/40 bg-fuchsia-500/10 px-4 py-4 text-base font-semibold text-fuchsia-100 shadow-lg shadow-fuchsia-500/10 transition hover:bg-fuchsia-500/20"
+                  >
+                    🎨 Use previous color calibration (
+                    {new Date(savedColors.savedAt).toLocaleDateString()})
+                  </button>
+                ) : null}
+                {cameraActive && !(trigCalRacking || trigCalCount !== null) && !trigCalResult && savedTrigCal ? (
+                  <button
+                    type="button"
+                    onClick={usePreviousTrigCal}
+                    title="Reuse the slide & trigger calibration from your last session — the chain skips those steps"
+                    className="w-full rounded-lg border border-sky-400/50 bg-sky-500/15 px-4 py-4 text-base font-semibold text-sky-100 shadow-lg shadow-sky-500/10 transition hover:bg-sky-500/25"
+                  >
+                    🎚 Use previous slide &amp; trigger calibration (
+                    {new Date(savedTrigCal.savedAt).toLocaleDateString()})
+                  </button>
+                ) : null}
                 {cameraActive && !(trigCalRacking || trigCalCount !== null) ? (
                   <button
                     type="button"
@@ -3524,6 +4398,26 @@ export function DryFireTrainer() {
                       ? "🎯 Start calibration (straight to the aim dots)"
                       : "🎯 Start calibration — slide & trigger, then the dots"}
                   </button>
+                ) : null}
+                {cameraActive && !(trigCalRacking || trigCalCount !== null) && (trigCalResult ?? savedTrigCal) ? (
+                  <div className="flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => playCalSample("slide")}
+                      title="Play a random captured slide sound (resynthesized from its fingerprint)"
+                      className="flex-1 rounded-md border border-gray-700 px-3 py-1.5 text-xs text-gray-300 transition hover:bg-neutral-900"
+                    >
+                      🔊 Sample slide
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => playCalSample("click")}
+                      title="Play a random captured trigger click (resynthesized from its fingerprint)"
+                      className="flex-1 rounded-md border border-gray-700 px-3 py-1.5 text-xs text-gray-300 transition hover:bg-neutral-900"
+                    >
+                      🔊 Sample click
+                    </button>
+                  </div>
                 ) : null}
                 {/* Per-step controls: every stage can be cancelled, restarted,
                     or redone without leaving the flow. */}
@@ -3560,6 +4454,15 @@ export function DryFireTrainer() {
                             ? "📸 Retake the color photo (3·2·1)"
                             : "📸 Optional: photo the card's colors (3·2·1)"}
                         </button>
+                        <button
+                          type="button"
+                          onClick={recalibrateColorsOnly}
+                          disabled={photoCount !== null || helpPick !== null}
+                          title="Redo ONLY the colors: 5-second keep-still countdown, photo, then tap C/M/Y — slide, trigger, and aim calibration untouched"
+                          className="rounded-md border border-fuchsia-400/40 bg-fuchsia-500/10 px-3 py-1.5 text-xs text-fuchsia-200 transition hover:bg-fuchsia-500/20 disabled:opacity-40"
+                        >
+                          🎨 Recalibrate colors only (5 s)
+                        </button>
                       </>
                     ) : null}
                     {cameraActive ? (
@@ -3572,6 +4475,17 @@ export function DryFireTrainer() {
                         ↺ Restart flag lock
                       </button>
                     ) : null}
+                    {cameraActive && patternMode === "color" ? (
+                      <button
+                        type="button"
+                        onClick={runLockDoctor}
+                        disabled={doctorState === "running"}
+                        title="Hold your aim for 6 seconds — measures card size, ink visibility, and fps, then prescribes the fix"
+                        className="rounded-md border border-amber-400/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-200 transition hover:bg-amber-500/20 disabled:opacity-50"
+                      >
+                        {doctorState === "running" ? "🩺 Analyzing — hold your aim…" : "🩺 Lock doctor (6 s)"}
+                      </button>
+                    ) : null}
                     {trigCalResult ? (
                       <button
                         type="button"
@@ -3579,6 +4493,7 @@ export function DryFireTrainer() {
                           setTrigCalResult(null);
                           triggerRef.current?.setCustomFloor(null);
                           triggerRef.current?.setFingerprints(null, null);
+                          triggerRef.current?.setClickDuration(0);
                         }}
                         className="rounded-md border border-gray-700 px-3 py-1.5 text-xs text-gray-400 transition hover:bg-neutral-900"
                         title="A saved slide & trigger calibration will be reused — tap to redo it as part of the chain"
@@ -3599,18 +4514,176 @@ export function DryFireTrainer() {
                     </button>
                   </div>
                 )}
+                {/* Voice prompt sections: what gets spoken, each toggleable.
+                    Muting never changes behavior — only the audio. */}
+                <details className="rounded-lg border border-gray-800 px-3 py-2 text-[12px]">
+                  <summary className="cursor-pointer text-gray-400 transition hover:text-gray-300">
+                    🔈 Voice prompts (
+                    {VOICE_SECTION_INFO.filter((s) => voicePrefs[s.key]).length}/{VOICE_SECTION_INFO.length} on)
+                  </summary>
+                  <div className="mt-2 space-y-2">
+                    {VOICE_SECTION_INFO.map((section) => (
+                      <label key={section.key} className="flex items-start gap-2">
+                        <input
+                          type="checkbox"
+                          checked={voicePrefs[section.key]}
+                          onChange={(e) =>
+                            setVoicePrefs((prev) => ({ ...prev, [section.key]: e.target.checked }))
+                          }
+                          className="mt-0.5 accent-sky-400"
+                        />
+                        <span className="min-w-0">
+                          <span className={voicePrefs[section.key] ? "font-semibold text-gray-200" : "text-gray-400"}>
+                            {section.label}
+                          </span>
+                          <span className="block text-[11px] leading-snug text-gray-500">{section.examples}</span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </details>
                 {trigCalResult && !(trigCalRacking || trigCalCount !== null) ? (
                   <p className="text-[12px] text-gray-500">
                     Slide &amp; trigger are already calibrated from your saved scene — the chain will jump straight to
                     the aim dots. Use the recalibrate button above if the mic or the gun changed.
                   </p>
                 ) : null}
+                {doctorState === "done" ? (
+                  <div className="space-y-1 rounded-lg border border-amber-400/30 bg-amber-500/5 p-3 text-[12px] leading-relaxed text-amber-100">
+                    {doctorReport.map((line, i) => (
+                      <p key={i} className={i === 0 ? "font-semibold" : "text-amber-200/90"}>
+                        {line}
+                      </p>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>
         </div>
       ) : null}
-      <div className="mx-auto grid max-w-6xl gap-6 lg:grid-cols-[1fr_300px]">
+      {/* ON-BOARD CALIBRATION POPOVER: the target is already live behind it.
+          Sound → color → (auto) the 9 dots. Minimal by design. */}
+      {uiMode === "user" && phase === "setup" && wizardStep === "board" ? (
+        <div className="fixed left-1/2 top-1/2 z-[90] w-[min(92vw,400px)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-gray-700 bg-neutral-950/95 p-5 text-white shadow-2xl">
+          <div className="mb-3 flex items-center justify-between">
+            <p className="text-[11px] font-semibold uppercase tracking-widest text-sky-400">
+              {!trigCalResult ? "1 · Sound" : !refComplete ? "2 · Colors" : "3 · Aim"}
+            </p>
+            <button
+              type="button"
+              onClick={exitFullBoard}
+              className="text-sm text-gray-500 transition hover:text-gray-300"
+              title="Back to the start"
+            >
+              ✕
+            </button>
+          </div>
+          {!trigCalResult ? (
+            trigCalRacking || trigCalCount !== null ? (
+              <div className="space-y-3">
+                <p className="font-mono text-sm">
+                  {trigCalRacking
+                    ? slideWindowOpen
+                      ? `🎚 RACK NOW (${Math.min(TRIG_CAL_CLICKS, (trigCalCount ?? 0) + 1)}/${TRIG_CAL_CLICKS})`
+                      : `⏳ Wait… (slide ${Math.min(TRIG_CAL_CLICKS, (trigCalCount ?? 0) + 1)}/${TRIG_CAL_CLICKS})`
+                    : `🎚 Dry fire (click ${Math.min(TRIG_CAL_CLICKS, (trigCalCount ?? 0) + 1)}/${TRIG_CAL_CLICKS})`}
+                </p>
+                <button
+                  type="button"
+                  onClick={cancelTrigCalibration}
+                  className="w-full rounded-md border border-amber-400/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-200 transition hover:bg-amber-500/20"
+                >
+                  ✕ Cancel
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <p className="text-sm text-gray-300">Teach it your slide and trigger sounds.</p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void beginTrigCalibration()}
+                    className="flex-1 rounded-md bg-emerald-500 px-3 py-2.5 text-sm font-semibold text-black transition hover:bg-emerald-400"
+                  >
+                    🎚 Calibrate
+                  </button>
+                  {savedTrigCal ? (
+                    <button
+                      type="button"
+                      onClick={usePreviousTrigCal}
+                      title={`Saved ${new Date(savedTrigCal.savedAt).toLocaleDateString()}`}
+                      className="flex-1 rounded-md border border-sky-400/50 bg-sky-500/15 px-3 py-2.5 text-sm font-semibold text-sky-100 transition hover:bg-sky-500/25"
+                    >
+                      Use Saved{savedTrigCal.name ? ` · ${savedTrigCal.name}` : ""}
+                    </button>
+                  ) : null}
+                </div>
+                {savedTrigCal ? (
+                  <input
+                    value={savedTrigCal.name ?? ""}
+                    onChange={(e) => renameSavedTrigCal(e.target.value)}
+                    placeholder="name this saved calibration"
+                    className="w-full rounded border border-gray-800 bg-neutral-900 px-2 py-1 text-xs text-gray-300 placeholder:text-gray-600"
+                  />
+                ) : null}
+              </div>
+            )
+          ) : !refComplete ? (
+            helpPick ? (
+              <p className="text-sm text-gray-300">
+                👉 Tap the <span className="font-semibold text-white">{helpOrder[helpPick.stage].name}</span> patch on
+                the camera window (top-right) — {helpPick.stage + 1}/{helpOrder.length}.
+              </p>
+            ) : photoCount !== null ? (
+              <p className="font-mono text-sm">📸 FREEZE — photo in {photoCount}…</p>
+            ) : (
+              <div className="space-y-2">
+                <p className="text-sm text-gray-300">Photograph the card, then tap its three colors.</p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      pendingDotsAfterTapsRef.current = false; // auto-advance handles the dots
+                      beginGuidedColorTaps();
+                    }}
+                    className="flex-1 rounded-md bg-emerald-500 px-3 py-2.5 text-sm font-semibold text-black transition hover:bg-emerald-400"
+                  >
+                    🎨 Calibrate
+                  </button>
+                  {savedColors ? (
+                    <button
+                      type="button"
+                      onClick={usePreviousColors}
+                      title={`Saved ${new Date(savedColors.savedAt).toLocaleDateString()}`}
+                      className="flex-1 rounded-md border border-fuchsia-400/50 bg-fuchsia-500/15 px-3 py-2.5 text-sm font-semibold text-fuchsia-100 transition hover:bg-fuchsia-500/25"
+                    >
+                      Use Saved{savedColors.name ? ` · ${savedColors.name}` : ""}
+                    </button>
+                  ) : null}
+                </div>
+                {savedColors ? (
+                  <input
+                    value={savedColors.name ?? ""}
+                    onChange={(e) => renameSavedColors(e.target.value)}
+                    placeholder="name this saved calibration"
+                    className="w-full rounded border border-gray-800 bg-neutral-900 px-2 py-1 text-xs text-gray-300 placeholder:text-gray-600"
+                  />
+                ) : null}
+              </div>
+            )
+          ) : (
+            <p className="text-sm text-gray-300">✅ Sound and colors ready — the 9 aim dots start now. Hold on each until its ring fills.</p>
+          )}
+        </div>
+      ) : null}
+      {/* While the wizard is up, the pro UI collapses to zero height (still
+          mounted — camera/canvas/refs keep living) so the page doesn't grow
+          a long dead scroll region beneath the wizard. */}
+      <div
+        aria-hidden={wizardShowing}
+        className={`mx-auto grid max-w-6xl gap-6 lg:grid-cols-[1fr_300px] ${wizardShowing ? "h-0 overflow-hidden" : ""}`}
+      >
         <section className="space-y-3">
           <div className="flex items-center justify-between">
             <Link href="/" className="text-sm text-sky-300 hover:underline">
@@ -3647,11 +4720,11 @@ export function DryFireTrainer() {
           {/* The board is the target. Trace + markers draw on the overlay.
               Out of setup it takes over the ENTIRE viewport (100vw × 100vh,
               landscape-locked fullscreen) — the targets are all that shows. */}
-          <div ref={boardWrapRef} className={phase !== "setup" ? "fixed inset-0 z-50 bg-white" : "relative"}>
+          <div ref={boardWrapRef} className={boardFull ? "fixed inset-0 z-50 bg-white" : "relative"}>
             {trainMode === "target" ? (
               <TargetFace
-                aspectRatio={phase !== "setup" ? winAspect : SCENARIO_SHEET_ASPECT}
-                className={phase !== "setup" ? "!h-full !rounded-none !border-0" : ""}
+                aspectRatio={boardFull ? winAspect : SCENARIO_SHEET_ASPECT}
+                className={boardFull ? "!h-full !rounded-none !border-0" : ""}
                 scale={targetScale}
               />
             ) : (
@@ -3660,34 +4733,77 @@ export function DryFireTrainer() {
                 feedback={feedback}
                 interactive={false}
                 paper
-                aspectRatio={phase !== "setup" ? winAspect : SCENARIO_SHEET_ASPECT}
-                className={phase !== "setup" ? "!h-full !rounded-none !border-0" : ""}
+                aspectRatio={boardFull ? winAspect : SCENARIO_SHEET_ASPECT}
+                className={boardFull ? "!h-full !rounded-none !border-0" : ""}
               />
             )}
             <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" />
-            {activeCalPoint ? (
+            {calBurst ? (
               <div
-                className="pointer-events-none absolute z-[95]"
-                style={{ left: `${activeCalPoint[0] * 100}%`, top: `${activeCalPoint[1] * 100}%` }}
+                key={calBurst.id}
+                className="pointer-events-none absolute z-[94]"
+                style={{ left: `${calBurst.x * 100}%`, top: `${calBurst.y * 100}%` }}
               >
-                {/* Flashing black/white calibration marker — unmissable on
-                    any background, and topmost while calibrating. */}
-                <style>{`@keyframes calFlash { 0%, 49% { background:#000; border-color:#fff; } 50%, 100% { background:#fff; border-color:#000; } }`}</style>
+                <style>{`
+                  @keyframes calBurstRing { from { transform: scale(0.4); opacity: 0.9; } to { transform: scale(2.6); opacity: 0; } }
+                  @keyframes calBurstCore { from { transform: scale(1); opacity: 1; } to { transform: scale(0); opacity: 0; } }
+                `}</style>
                 <div className="relative -translate-x-1/2 -translate-y-1/2">
                   <div
-                    className="h-11 w-11 rounded-full border-4 shadow-lg"
-                    style={{ animation: "calFlash 0.45s steps(1) infinite" }}
+                    className="absolute inset-0 h-11 w-11 rounded-full border-2 border-red-500"
+                    style={{ animation: "calBurstRing 0.5s cubic-bezier(0.2, 0.7, 0.3, 1) forwards" }}
                   />
-                  {calHold > 0 ? (
-                    <div
-                      className="absolute inset-0 rounded-full border-4 border-emerald-400"
-                      style={{ clipPath: `inset(${(1 - calHold) * 100}% 0 0 0)` }}
-                    />
-                  ) : null}
+                  <div
+                    className="h-11 w-11 rounded-full border border-red-400/70"
+                    style={{ animation: "calBurstRing 0.38s cubic-bezier(0.2, 0.7, 0.3, 1) forwards" }}
+                  />
+                  <div
+                    className="absolute left-1/2 top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-red-500"
+                    style={{ animation: "calBurstCore 0.3s ease-in forwards" }}
+                  />
                 </div>
               </div>
             ) : null}
-            {phase !== "setup" ? (
+            {activeCalPoint ? (
+              <div
+                className="pointer-events-none absolute z-[95] transition-[left,top] duration-500 ease-out"
+                style={{ left: `${activeCalPoint[0] * 100}%`, top: `${activeCalPoint[1] * 100}%` }}
+              >
+                {/* Big marching-ants target: an animated dashed ring draws the
+                    eye and reads on any background; a flashing black/white core
+                    is the precise aim point; a green arc fills as the hold
+                    matures. The whole marker GLIDES to the next dot (transition
+                    above). A fixed 96px box CENTERED on the point (translate
+                    on the box, not per-child) keeps ring, arc, and core exactly
+                    concentric on the calibration coordinate. */}
+                <style>{`
+                  @keyframes calFlash { 0%, 49% { background:#000; border-color:#fff; } 50%, 100% { background:#fff; border-color:#000; } }
+                  @keyframes calAnts { to { stroke-dashoffset: -36; } }
+                  @keyframes calBreathe { 0%,100% { transform: scale(1); } 50% { transform: scale(1.06); } }
+                `}</style>
+                <div className="relative h-24 w-24 -translate-x-1/2 -translate-y-1/2">
+                  {/* Marching-ants ring + hold arc — fills the box, breathes
+                      around the box center = the point. */}
+                  <svg
+                    viewBox="0 0 96 96"
+                    className="absolute inset-0 h-full w-full"
+                    style={{ animation: "calBreathe 2s ease-in-out infinite" }}
+                  >
+                    <circle cx="48" cy="48" r="44" fill="none" stroke="#fff" strokeWidth="3.5" strokeDasharray="9 9" style={{ animation: "calAnts 0.8s linear infinite" }} />
+                    <circle cx="48" cy="48" r="44" fill="none" stroke="#000" strokeWidth="3.5" strokeDasharray="9 9" strokeDashoffset="9" style={{ animation: "calAnts 0.8s linear infinite" }} />
+                    {calHold > 0 ? (
+                      <circle cx="48" cy="48" r="44" fill="none" stroke="#34d399" strokeWidth="5" strokeLinecap="round" transform="rotate(-90 48 48)" strokeDasharray={`${calHold * 276.5} 276.5`} />
+                    ) : null}
+                  </svg>
+                  {/* Flashing precise core, centered in the box. */}
+                  <div
+                    className="absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full border-4 shadow-lg"
+                    style={{ animation: "calFlash 0.45s steps(1) infinite" }}
+                  />
+                </div>
+              </div>
+            ) : null}
+            {boardFull ? (
               <>
                 {/* Big readable banner: the current CALL during drills, the
                     dot progress during calibration. */}
@@ -3728,36 +4844,69 @@ export function DryFireTrainer() {
                   {phase === "calibrate" ? "↺ Restart calibration" : "↻ Recalibrate aim"}
                 </button>
                 {phase === "train" && trainMode === "target" ? (
-                  <div className="absolute bottom-3 left-1/2 z-[80] flex -translate-x-1/2 items-center gap-2">
-                    <div className="flex items-center gap-1 rounded-full bg-black/30 px-2 py-1 text-xs text-white/90">
-                      <button
-                        type="button"
-                        onClick={() => stepRange(-1)}
-                        title="Bring the target closer"
-                        className="rounded-full px-2 py-0.5 transition hover:bg-black/40"
-                      >
-                        −
-                      </button>
-                      <span className="min-w-14 text-center font-mono">🎯 {simRangeM} m</span>
-                      <button
-                        type="button"
-                        onClick={() => stepRange(1)}
-                        title="Push the target farther out"
-                        className="rounded-full px-2 py-0.5 transition hover:bg-black/40"
-                      >
-                        +
-                      </button>
-                    </div>
-                    {targetShots.length > 0 ? (
-                      <button
-                        type="button"
-                        onClick={undoLastShot}
-                        title="Strike the last recorded shot from the target and the stats"
-                        className="rounded-full bg-black/30 px-3 py-1 text-xs text-white/90 transition hover:bg-black/50"
-                      >
-                        🙋 Wait — I messed up. Undo shot
-                      </button>
-                    ) : null}
+                  <div className="absolute bottom-4 left-1/2 z-[80] flex -translate-x-1/2 items-center gap-2.5">
+                    <style>{`
+                      @keyframes aimHoverPulse { 0%,100% { transform: scale(1.08); } 50% { transform: scale(1.14); } }
+                      @keyframes aimFireBoom { 0% { transform: scale(1.2); } 45% { transform: scale(0.9); } 100% { transform: scale(1.08); } }
+                    `}</style>
+                    {/* Aim-targetable: over → pulses + sky ring; shot → red flash. */}
+                    {(
+                      [
+                        { id: "rangeMinus", label: "−", title: "Bring the target closer (shootable)", show: true },
+                        { id: "rangePlus", label: "+", title: "Push the target farther out (shootable)", show: true },
+                        {
+                          id: "undoShot",
+                          label: "🙋 Undo shot",
+                          title: "Strike the last recorded shot (shootable)",
+                          show: targetShots.length > 0,
+                        },
+                        {
+                          id: "zero",
+                          label: "🎯 Zero to group",
+                          title: "Zero the aim to this group's center (shootable)",
+                          show: targetShots.length >= 3,
+                        },
+                        {
+                          id: "resetZero",
+                          label: "↩ Reset zero",
+                          title: "Remove the zero adjustment (shootable)",
+                          show: zeroed,
+                        },
+                      ] as const
+                    )
+                      .filter((b) => b.show)
+                      .map((b) => {
+                        const hovered = aimHoverBtn === b.id;
+                        const fired = firedBtn === b.id;
+                        return (
+                          <button
+                            key={b.id}
+                            ref={aimBtnRef(b.id)}
+                            type="button"
+                            onClick={() => runAimBtn(b.id)}
+                            title={b.title}
+                            style={{
+                              animation: fired
+                                ? "aimFireBoom 0.4s ease-out"
+                                : hovered
+                                  ? "aimHoverPulse 0.9s ease-in-out infinite"
+                                  : undefined,
+                            }}
+                            className={`rounded-full border px-4 py-2.5 text-sm font-semibold transition ${
+                              fired
+                                ? "border-red-400 bg-red-500 text-white shadow-lg shadow-red-500/40"
+                                : hovered
+                                  ? "border-sky-300 bg-sky-500/30 text-white ring-2 ring-sky-300 shadow-lg shadow-sky-400/30"
+                                  : "border-white/20 bg-black/40 text-white/90 hover:bg-black/60"
+                            }`}
+                          >
+                            {b.label}
+                          </button>
+                        );
+                      })}
+                    <span className="rounded-full bg-black/40 px-3 py-2.5 text-center font-mono text-sm text-white/90">
+                      🎯 {simRangeM} m{smartDistance && smartDistM > 0 ? ` · you ${smartDistM.toFixed(1)} m` : ""}
+                    </span>
                   </div>
                 ) : null}
                 {phase === "calibrate" && !briefActive && calIndex > 0 && calIndex < CAL_POINTS.length ? (
@@ -3928,7 +5077,7 @@ export function DryFireTrainer() {
             </div>
             {patternMode === "color" ? (
               <span className="text-[10px] text-gray-600">
-                Facing the card: CYAN top-left, YELLOW top-right, MAGENTA bottom-left, WHITE with a BLACK dot
+                Facing the card: CYAN top-left, MAGENTA top-right, YELLOW bottom-left, WHITE with a BLACK dot
                 bottom-right. CMY patches are ~2× brighter in dim rooms.
               </span>
             ) : null}
@@ -4001,7 +5150,7 @@ export function DryFireTrainer() {
                 </span>
                 <div className="flex flex-wrap items-center gap-1.5 border-t border-gray-800 pt-1.5">
                   <span className="text-[11px] text-gray-500">Reference:</span>
-                  {(colorPalette === "cmy" ? (["green", "red", "blue"] as const) : (["red", "green", "blue"] as const)).map((slot) => {
+                  {(colorPalette === "cmy" ? (["green", "blue", "red"] as const) : (["red", "green", "blue"] as const)).map((slot) => {
                     const c = refDraft[slot];
                     const names =
                       colorPalette === "cmy"
@@ -4143,9 +5292,9 @@ export function DryFireTrainer() {
                     "fixed right-3 top-[22%] z-[60] w-40"
                   : phase === "train"
                     ? "fixed bottom-3 right-3 z-[60] w-64"
-                    : uiMode === "user" && wizardStep === "prep"
+                    : uiMode === "user" && (wizardStep === "prep" || wizardStep === "board")
                       ? // Top-right during the wizard so it can NEVER cover the
-                        // centered action buttons.
+                        // centered action buttons (or the on-board popover).
                         "fixed right-3 top-3 z-[80] w-56 sm:w-80"
                       : "relative"
               }
@@ -4176,12 +5325,56 @@ export function DryFireTrainer() {
                     const rgb: [number, number, number] = [r / 25, g / 25, b / 25];
                     const step = helpOrder[helpPick.stage];
                     setRefDraft((prev) => ({ ...prev, [step.slot]: rgb }));
+                    helpTapsRef.current[helpPick.stage] = { x, y, rgb };
                     if (helpPick.stage + 1 < helpOrder.length) {
                       setHelpPick({ stage: helpPick.stage + 1 });
-                      speak(`Now tap the ${helpOrder[helpPick.stage + 1].name.toLowerCase()} patch.`);
+                      say("guidance", `Now tap the ${helpOrder[helpPick.stage + 1].name.toLowerCase()} patch.`);
                     } else {
                       setHelpPick(null);
-                      speak("Reference colors set. Resume your shooting position.");
+                      // Three human-identified patches = colors AND pose:
+                      // commit the colors (the human outranks any automatic
+                      // capture) and seed the HOLD path directly.
+                      const taps = helpTapsRef.current;
+                      // Map taps to slots via helpOrder — tap-order-proof.
+                      const bySlot: Partial<Record<"red" | "green" | "blue", { x: number; y: number; rgb: [number, number, number] }>> = {};
+                      helpOrder.forEach((step, i) => {
+                        if (taps[i]) bySlot[step.slot] = taps[i];
+                      });
+                      if (colorPalette === "cmy" && bySlot.red && bySlot.green && bySlot.blue) {
+                        const committed: TrackedColors = {
+                          red: bySlot.red.rgb,
+                          green: bySlot.green.rgb,
+                          blue: bySlot.blue.rgb,
+                        };
+                        colorsCommittedRef.current = committed;
+                        persistCommittedColors(committed);
+                        // New identity → new illuminant baseline (the taps
+                        // were made under the CURRENT light).
+                        illumRef.current = { base: null, gain: [1, 1, 1] };
+                        const pose = seedFromThreePoints(bySlot.red, bySlot.green, bySlot.blue);
+                        const nowMs = performance.now();
+                        trackRef.current = {
+                          colors: committed,
+                          center: pose.center,
+                          velocity: { x: 0, y: 0 },
+                          cellPx: pose.cellPx,
+                          affine: pose.affine,
+                          atMs: nowMs,
+                          misses: 0,
+                          seedAtMs: nowMs,
+                          hits: 0,
+                          seedCellPx: pose.cellPx,
+                          softHits: 0,
+                        };
+                      }
+                      if (pendingDotsAfterTapsRef.current) {
+                        pendingDotsAfterTapsRef.current = false;
+                        say("guidance", "Colors locked. Pick up your pistol and resume your position.", {
+                          onEnd: () => window.setTimeout(() => beginCalibrationRef.current(), 800),
+                        });
+                      } else {
+                        say("guidance", "Colors locked. Resume your shooting position.");
+                      }
                     }
                     return;
                   }
@@ -4196,16 +5389,31 @@ export function DryFireTrainer() {
                   pickSlot || helpPick ? "cursor-crosshair border-sky-400" : "border-gray-800"
                 }`}
               />
-              <button
-                type="button"
-                onClick={() => setShowGuide((v) => !v)}
-                title={showGuide ? "Hide the ideal-position guide" : "Show the ideal-position guide"}
-                className={`absolute left-1.5 top-1.5 rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
-                  showGuide ? "bg-sky-500/80 text-black" : "bg-neutral-800/80 text-gray-400 hover:text-gray-200"
-                }`}
-              >
-                👤
-              </button>
+              {/* Per-element overlay toggles: each camera-overlay layer can
+                  be switched on/off independently. */}
+              <div className="absolute left-1.5 top-1.5 flex gap-1">
+                {(
+                  [
+                    { on: showGuide, set: setShowGuide, icon: "👤", title: "Ideal-position guide" },
+                    { on: showTint, set: setShowTint, icon: "🎨", title: "Color classification tint" },
+                    { on: showTiles, set: setShowTiles, icon: "🔳", title: "C/M/Y tiles & dot markers" },
+                    { on: showAnts, set: setShowAnts, icon: "🐜", title: "Marching box around the card" },
+                    { on: showStrip, set: setShowStrip, icon: "📊", title: "Detection stage strip" },
+                  ] as const
+                ).map((t) => (
+                  <button
+                    key={t.icon}
+                    type="button"
+                    onClick={() => t.set((v) => !v)}
+                    title={`${t.on ? "Hide" : "Show"}: ${t.title}`}
+                    className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
+                      t.on ? "bg-sky-500/80 text-black" : "bg-neutral-800/80 text-gray-400 hover:text-gray-200"
+                    }`}
+                  >
+                    {t.icon}
+                  </button>
+                ))}
+              </div>
               <span
                 className={`absolute right-1.5 top-1.5 rounded px-1.5 py-0.5 text-[10px] font-semibold ${
                   tracker.tracking && tracker.misses === 0
@@ -4220,7 +5428,7 @@ export function DryFireTrainer() {
                 {tracker.tracking && tracker.misses === 0
                   ? `${tracker.regional ? "REGIONAL LOCK" : "TRACK LOCK"} · ${tracker.fps}fps`
                   : tracker.tracking
-                    ? `re-seeking ${tracker.misses}/${tracker.regional ? 40 : 16}…`
+                    ? `re-seeking ${tracker.misses}/${tracker.regional ? 60 : 16}…`
                     : tracker.locked
                       ? `FLAG LOCK · ${tracker.fps}fps`
                       : cameraActive
@@ -4291,7 +5499,7 @@ export function DryFireTrainer() {
                         {patternMode === "shape"
                           ? `disk ${diag.colorCounts.red} · ring ${diag.colorCounts.green} · 2-hole ${diag.colorCounts.blue}`
                           : colorPalette === "cmy" && patternMode === "color"
-                            ? `cyan ${diag.colorCounts.green} · yellow ${diag.colorCounts.red} · magenta ${diag.colorCounts.blue}`
+                            ? `cyan ${diag.colorCounts.green} · magenta ${diag.colorCounts.blue} · yellow ${diag.colorCounts.red}`
                             : `red ${diag.colorCounts.red} · green ${diag.colorCounts.green} · blue ${diag.colorCounts.blue}`}
                         {diag.cellPx !== null ? ` · quadrant ${diag.cellPx.toFixed(1)}px` : ""}
                         {diag.colorGates
@@ -4363,7 +5571,7 @@ export function DryFireTrainer() {
               type="button"
               onClick={() => {
                 if (!modelRef.current || holdActive) return;
-                speak("Hold test. Aim at one point and hold for ten seconds.");
+                say("guidance", "Hold test. Aim at one point and hold for ten seconds.");
                 holdTestRef.current = { startMs: performance.now() + 2500, until: performance.now() + 12500, pts: [] };
                 setHoldActive(true);
                 setHoldResult(null);
@@ -4479,6 +5687,7 @@ export function DryFireTrainer() {
                       setTrigCalResult(null);
                       triggerRef.current?.setCustomFloor(null);
                       triggerRef.current?.setFingerprints(null, null);
+                      triggerRef.current?.setClickDuration(0);
                     }}
                     title="Clear the calibrated threshold — back to presets"
                     className="ml-1 rounded px-1 text-gray-500 hover:bg-neutral-900 hover:text-gray-300"
@@ -4524,6 +5733,46 @@ export function DryFireTrainer() {
               >
                 Clear target ({targetShots.length} shots)
               </button>
+            ) : null}
+            {trainMode === "target" ? (
+              <div className="flex items-center justify-between gap-2 rounded-md border border-gray-800 px-3 py-2">
+                <label className="flex items-center gap-1.5 text-xs text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={smartDistance}
+                    onChange={(e) => setSmartDistance(e.target.checked)}
+                    className="accent-sky-400"
+                  />
+                  Smart distance
+                  {smartDistance ? (
+                    <span className="font-mono text-sky-300">{smartDistM > 0 ? `~${smartDistM.toFixed(1)} m` : "…"}</span>
+                  ) : null}
+                </label>
+                <label className="flex items-center gap-1 text-xs text-gray-500">
+                  card
+                  <input
+                    type="number"
+                    min={20}
+                    max={200}
+                    value={cardWidthMm}
+                    onChange={(e) => setCardWidthMm(Math.max(20, Math.min(200, Number(e.target.value) || 60)))}
+                    className="w-14 rounded border border-gray-700 bg-neutral-900 px-1 py-0.5 text-right font-mono text-xs text-gray-200"
+                  />
+                  mm
+                </label>
+                <label className="flex items-center gap-1 text-xs text-gray-500">
+                  target Ø
+                  <input
+                    type="number"
+                    min={4}
+                    max={48}
+                    value={targetDiamIn}
+                    onChange={(e) => setTargetDiamIn(Math.max(4, Math.min(48, Number(e.target.value) || 12)))}
+                    className="w-12 rounded border border-gray-700 bg-neutral-900 px-1 py-0.5 text-right font-mono text-xs text-gray-200"
+                  />
+                  in
+                </label>
+              </div>
             ) : null}
             {trainMode === "target" ? (
               <div className="flex items-center justify-between rounded-md border border-gray-800 px-3 py-2">

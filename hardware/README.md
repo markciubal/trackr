@@ -274,12 +274,13 @@ rather not burn AMS purge waste on a 2-gram color change:
 3. Print `glock17-aim-flag-card-click-tile-white.stl` (the tile with the
    dot hole) in matte white, and `glock17-aim-flag-card-click-dot.stl` in
    matte blue. All five inserts print flat in minutes.
-4. Assemble: drop the blue dot into the white tile **from behind** — its
-   flange seats in the counterbore on the tile's back. Then press each tile
-   into a pocket, chamfered face down, until it snaps flat under the ridges.
-   The pocket floor traps the dot's flange, so the dot can never fall out.
-   Facing the finished card: GREEN top-left, RED top-right, BLUE
-   bottom-right, white tile with the blue dot bottom-left.
+4. Assemble: press each tile into a pocket, chamfered face down, until it
+   snaps flat under the ridges. Then press the blue dot into the white tile
+   **from the front**, flange out — it seats snugly in the front-face
+   counterbore, flush with the tile, and the pocket floor behind it stops
+   it from ever pushing through. Facing the finished card: GREEN top-left,
+   RED top-right, BLUE bottom-right, white tile with the blue dot
+   bottom-left.
 
 To swap a tile, push a straightened paperclip through the poke-hole in the
 pocket's back and it pops out. Tiles too tight to click in → raise

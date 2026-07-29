@@ -798,10 +798,11 @@ module card_inlay_blue() {
 // card body and CLICK under four small snap ridges — no AMS needed: print the
 // body (matte white recommended, so the rims between tiles read as
 // background), one tile each in matte red/green/blue, the dot-hole tile in
-// matte white, and the dot in matte blue. Drop the dot into the white tile
-// from BEHIND (its flange seats in the counterbore), then click every tile
-// in; the pocket floor traps the flange so the dot can never fall out. Each
-// pocket floor has a poke-hole so a paperclip from the back pops a tile out.
+// matte white, and the dot in matte blue. Click every tile in, then press
+// the dot into the white tile from the FRONT — its flange seats snugly in
+// the front-face counterbore, and the pocket floor behind stops it from
+// ever pushing through. Each pocket floor has a poke-hole so a paperclip
+// from the back pops a tile (or the dot) out.
 insert_t       = 1.0;   // tile thickness (5 layers @ 0.2)
 insert_fit     = 0.15;  // per-side tile ↔ pocket clearance
 insert_chamfer = 0.4;   // lead-in chamfer around the tile's bottom edge
@@ -877,19 +878,23 @@ module insert_tile() {
   }
 }
 
-// The white tile: dot hole through the middle plus a counterbore in the back
-// face that swallows the dot's flange, so the flange is sandwiched between
-// tile and pocket floor once the tile clicks in.
+// The white tile: dot hole through the middle plus a counterbore in the
+// FRONT face for the dot's flange — the dot presses in from the front with
+// the tile already clicked into the card (no assembly-order trap), snug in
+// the recess, backed by the pocket floor so it can never push through.
 module insert_tile_white() {
   difference() {
     insert_tile();
     translate([0, 0, -0.5]) cylinder(d = dot_d + 0.3, h = insert_t + 1);
-    translate([0, 0, -0.5]) cylinder(d = dot_d + 2 * dot_flange + 0.3, h = 0.5 + dot_counter);
+    translate([0, 0, insert_t - dot_counter])
+      cylinder(d = dot_d + 2 * dot_flange + 0.15, h = dot_counter + 0.5);
   }
 }
 
-// The blue confirmation dot: a flanged disc, printed flange-down. Total
-// height = insert_t, so it sits flush with the white tile's face.
+// The blue confirmation dot: a flanged disc, printed flange-down. Pressed in
+// FLANGE-OUT from the tile's front; the body reaches through the hole to the
+// pocket floor and the total height = insert_t keeps the flange flush with
+// the white tile's face.
 module insert_dot() {
   cylinder(d = dot_d + 2 * dot_flange, h = 0.4);
   cylinder(d = dot_d, h = insert_t);

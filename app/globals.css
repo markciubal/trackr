@@ -98,8 +98,41 @@ html {
   }
 }
 
-/* Printable target sheet: print only the sheet, at true physical size. */
+/* Printable target sheet: print only the sheet, at true physical size.
+   Everything that is not the sheet must be REMOVED from layout, not just
+   made invisible — hidden elements still occupy space, which kept the
+   document several screens tall and minted a blank second page. */
 @media print {
+  html,
+  body {
+    margin: 0 !important;
+    padding: 0 !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: #fff !important;
+  }
+  /* Drop every branch of the DOM that does not contain the sheet. */
+  body *:not(.ts-print-area):not(.ts-print-area *):not(:has(.ts-print-area)) {
+    display: none !important;
+  }
+  /* The sheet's ancestor chain stays in flow but becomes weightless:
+     no spacing, no borders, no positioning offsets, no clipping. */
+  body :has(.ts-print-area) {
+    display: block !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    background: #fff !important;
+    width: auto !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-width: none !important;
+    overflow: visible !important;
+    position: static !important;
+    transform: none !important;
+    box-shadow: none !important;
+  }
+  /* Legacy fallback for browsers without :has() support. */
   body * {
     visibility: hidden;
   }
@@ -108,22 +141,52 @@ html {
     visibility: visible;
   }
   .ts-print-area {
+    display: block !important;
     position: absolute;
     left: 0;
     top: 0;
+    margin: 0 !important;
+    padding: 0 !important;
     overflow: visible !important;
+    /* No stray line boxes: a single whitespace text node after the sheet
+       adds a ~16px line — enough to mint a blank page after an exactly
+       page-sized sheet. The sheet's own text sets explicit sizes. */
+    line-height: 0;
   }
   .ts-print-area > div {
+    display: block !important;
     width: auto !important;
     height: auto !important;
     border: 0 !important;
+    border-radius: 0 !important;
   }
   .ts-sheet {
     transform: none !important;
     box-shadow: none !important;
+    break-after: avoid-page;
+    line-height: normal; /* undo the area's line-height:0 for sheet text */
+  }
+  .ts-print-area ~ * {
+    display: none !important;
   }
   .ts-controls {
     display: none !important;
+  }
+  /* Full header on EACH printed page: position:fixed repeats per page. */
+  .ts-print-header {
+    display: block !important;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    padding: 0.06in 0.15in;
+    background: rgba(255, 255, 255, 0.92);
+    border-bottom: 0.5pt solid #999;
+    color: #000;
+    font-family: var(--font-jetbrains-mono), monospace;
+    font-size: 8pt;
+    line-height: 1.2;
+    visibility: visible;
   }
   @page {
     margin: 0;
