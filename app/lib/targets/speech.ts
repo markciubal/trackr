@@ -10,10 +10,15 @@ export type VoiceSettings = {
   voiceURI: string | null; // null = the browser/system default voice
   rate: number; // 0.5–2, 1 = normal
   pitch: number; // 0–2, 1 = normal
-  volume: number; // 0–1
+  volume: number; // 0–VOICE_VOLUME_CAP
 };
 
-export const DEFAULT_VOICE_SETTINGS: VoiceSettings = { voiceURI: null, rate: 1, pitch: 1, volume: 1 };
+// HARD ceiling on speech volume: the mic hears the speakers, and loud
+// prompts are exactly what self-triggers the click detector. Every path —
+// defaults, persisted settings, live utterances — clamps to this.
+export const VOICE_VOLUME_CAP = 0.5;
+
+export const DEFAULT_VOICE_SETTINGS: VoiceSettings = { voiceURI: null, rate: 1, pitch: 1, volume: VOICE_VOLUME_CAP };
 
 const VOICE_STORAGE_KEY = "trackr.drillVoice";
 
@@ -35,7 +40,7 @@ export function loadVoiceSettings(): VoiceSettings {
       voiceURI: typeof parsed.voiceURI === "string" && parsed.voiceURI ? parsed.voiceURI : null,
       rate: clampNumber(parsed.rate, 0.5, 2, 1),
       pitch: clampNumber(parsed.pitch, 0, 2, 1),
-      volume: clampNumber(parsed.volume, 0, 1, 1),
+      volume: clampNumber(parsed.volume, 0, VOICE_VOLUME_CAP, VOICE_VOLUME_CAP),
     };
   } catch {
     return { ...DEFAULT_VOICE_SETTINGS };
@@ -44,7 +49,7 @@ export function loadVoiceSettings(): VoiceSettings {
 
 // Set (and persist) the voice used for all subsequent speech.
 export function setVoiceSettings(settings: VoiceSettings): void {
-  activeSettings = { ...settings };
+  activeSettings = { ...settings, volume: Math.min(VOICE_VOLUME_CAP, Math.max(0, settings.volume)) };
   if (typeof window === "undefined") return;
   try {
     window.localStorage.setItem(VOICE_STORAGE_KEY, JSON.stringify(activeSettings));
@@ -75,16 +80,33 @@ export function canSpeak(): boolean {
 // synthesizer, resurrecting callouts after a Stop.
 let speechGeneration = 0;
 
+// WATCHDOG: browsers (Chrome especially) sometimes wedge speechSynthesis —
+// `speaking` sticks true and `onend` never fires. Detection code gates the
+// microphone on isSpeaking(), so a wedged engine would leave the app DEAF
+// forever. Track when the current queue should plausibly have finished and
+// stop believing the engine past that point.
+let expectedSpeechEndMs = 0;
+
+function estimateSpeechMs(text: string, rate: number): number {
+  // ~70 ms/char at rate 1 plus startup latency, capped — generous on
+  // purpose; the cap only matters when the engine is already lying.
+  return Math.min(20000, 1200 + (text.length * 70) / Math.max(0.5, rate));
+}
+
 export function cancelSpeech(): void {
   speechGeneration += 1;
+  expectedSpeechEndMs = 0;
   if (canSpeak()) window.speechSynthesis.cancel();
 }
 
 // True while an utterance is speaking or queued. Detection code uses this to
 // ignore the microphone picking up our OWN voice prompts — the speakers'
-// audio is a spike like any other to the mic.
+// audio is a spike like any other to the mic. The watchdog above bounds it:
+// a stuck engine reads as silent once the queue should have drained.
 export function isSpeaking(): boolean {
-  return canSpeak() && (window.speechSynthesis.speaking || window.speechSynthesis.pending);
+  if (!canSpeak()) return false;
+  const engineBusy = window.speechSynthesis.speaking || window.speechSynthesis.pending;
+  return engineBusy && Date.now() < expectedSpeechEndMs;
 }
 
 export function speak(text: string, opts: { rate?: number; onEnd?: () => void } = {}): void {
@@ -93,10 +115,14 @@ export function speak(text: string, opts: { rate?: number; onEnd?: () => void } 
     return;
   }
   const settings = getActiveVoiceSettings();
+  expectedSpeechEndMs = Math.max(
+    expectedSpeechEndMs,
+    Date.now() + estimateSpeechMs(text, opts.rate ?? settings.rate),
+  );
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.rate = opts.rate ?? settings.rate;
   utterance.pitch = settings.pitch;
-  utterance.volume = settings.volume;
+  utterance.volume = Math.min(VOICE_VOLUME_CAP, settings.volume);
   if (settings.voiceURI) {
     const voice = window.speechSynthesis.getVoices().find((v) => v.voiceURI === settings.voiceURI);
     if (voice) {

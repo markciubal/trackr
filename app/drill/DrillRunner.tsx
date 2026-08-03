@@ -30,6 +30,7 @@ import {
 import {
   DEFAULT_VOICE_SETTINGS,
   type VoiceSettings,
+  VOICE_VOLUME_CAP,
   canSpeak,
   cancelSpeech,
   listVoices,
@@ -695,13 +696,15 @@ export function DrillRunner() {
                     />
                   </label>
                   <label className="block">
-                    <span className="text-xs text-gray-400">Volume: {Math.round(voiceSettings.volume * 100)}%</span>
+                    <span className="text-xs text-gray-400">
+                      Volume: {Math.round(voiceSettings.volume * 100)}% (max {Math.round(VOICE_VOLUME_CAP * 100)}%)
+                    </span>
                     <input
                       type="range"
                       min={0}
-                      max={1}
+                      max={VOICE_VOLUME_CAP}
                       step={0.05}
-                      value={voiceSettings.volume}
+                      value={Math.min(VOICE_VOLUME_CAP, voiceSettings.volume)}
                       onChange={(event) => updateVoiceSettings({ volume: Number(event.target.value) })}
                       className="mt-1 w-full"
                     />

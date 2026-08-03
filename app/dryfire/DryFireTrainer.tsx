@@ -90,10 +90,18 @@ import {
   trackColorFlag,
   trackShapeFlag,
 } from "@/app/lib/dryfire/flagTracker";
+import {
+  type StanceSig,
+  WIREFRAME_EDGES,
+  WIREFRAME_JOINTS,
+  detectPose,
+  initPoseStance,
+  stanceDeviation,
+  stanceSignature,
+} from "@/app/lib/dryfire/poseStance";
 import { fitAimModel, meanFeatures, predictAim, type AimModel, type AimSample } from "@/app/lib/dryfire/aimModel";
 import {
   createClickTrigger,
-  fingerprintSimilarity,
   meanFingerprint,
   playFingerprintSample,
   type ClickTrigger,
@@ -262,10 +270,13 @@ type ScenarioProfile = {
     // audition a random one instead of only the average.
     clickFps?: number[][];
     rackFps?: number[][];
-    // Calibrated durations (ms): the striker click, and the two rack impacts
-    // (pull-back, slam). Duration is the primary trigger discriminator.
+    // Calibrated timings (ms): striker click duration, the two rack impact
+    // durations (pull-back, slam), and the pull-back → slam gap. Duration
+    // is the primary trigger discriminator; the gap sizes the two-peak
+    // confirmation wait (rack = two peaks, trigger = one).
     clickDurMs?: number;
     rackDurs?: number[];
+    rackGapMs?: number;
   } | null;
   drillMode: CalloutMode;
   drillLen: number;
@@ -827,6 +838,15 @@ export function DryFireTrainer() {
   useEffect(() => {
     phaseRef.current = phase;
   }, [phase]);
+  // Out of setup the board takes the whole viewport (fixed, z-50) — lock the
+  // body scroll so the tall page underneath can't scroll behind it (the
+  // stray scrollbar/rubber-banding while the targets are up).
+  useEffect(() => {
+    document.body.style.overflow = phase !== "setup" ? "hidden" : "";
+    return () => {
+      document.body.style.overflow = "";
+    };
+  }, [phase]);
 
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -856,14 +876,19 @@ export function DryFireTrainer() {
   // Rolling audio waveform for the trigger-calibration steps: peak samples,
   // gate/ambient traces, and click/reject event markers on a small canvas.
   const waveCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const micWaveRef = useRef<{ t: number; peak: number; thr: number; ambient: number; suppressed: boolean }[]>([]);
-  const trigWaveEventsRef = useRef<{ t: number; kind: "click" | "reject" }[]>([]);
+  const micWaveRef = useRef<
+    { t: number; peak: number; thr: number; ambient: number; suppressed: boolean; win: boolean; speak: boolean }[]
+  >([]);
+  const trigWaveEventsRef = useRef<{ t: number; kind: "click" | "slide" | "reject" }[]>([]);
   const lastRejectSeenRef = useRef(0);
   // Shot-trigger sensitivity: "high" arms on the faintest clean click.
   const [trigSensitivity, setTrigSensitivity] = useState<TriggerSensitivity>("high");
   // Trigger-click calibration: collect the peaks of 3 real dry-fire clicks
   // and derive a custom threshold floor from YOUR striker on YOUR mic.
   const TRIG_CAL_CLICKS = 3;
+  // Slide listen window: long enough that a normal human reaction to "rack
+  // the slide now" plus the full rack action fits comfortably inside.
+  const TRIG_SLIDE_WINDOW_MS = 2600;
   const trigCalRef = useRef<{
     // SLIDES first: three prompted 2-second listen windows — whatever lands
     // inside a window IS the slide (both rack impacts); the gaps are deaf.
@@ -877,6 +902,10 @@ export function DryFireTrainer() {
     rackFps: number[][]; // slide fingerprints — the reject template
     clickDurs: number[]; // dry-fire durations (ms) — primary trigger gate
     rackDurs: number[]; // slide impact durations (ms) — pull-back & slam
+    rackGaps: number[]; // pull-back → slam start-to-start gaps (ms)
+    lastRackAtMs?: number; // previous impact's start time in THIS window
+    lastEvtMs?: number; // clicks: previous event time (compound-rack screen)
+    forceOpenAt?: number; // slides: open the window by force if TTS onEnd never fires
     armAt: number; // clicks: ignore spikes before this (TTS guard)
     remindAt: number; // gentle re-prompt when a step sits idle
     rackOk?: boolean | null;
@@ -1042,7 +1071,7 @@ export function DryFireTrainer() {
     const next = RANGE_PRESETS[Math.min(RANGE_PRESETS.length - 1, Math.max(0, (i < 0 ? 1 : i) + dir))];
     if (next !== simRangeM) {
       setSimRangeM(next);
-      say("feedback", `Range ${next} meters.`);
+      say("feedback", `${next} meters.`);
     }
   };
   const [showStatHelp, setShowStatHelp] = useState(false);
@@ -1266,6 +1295,24 @@ export function DryFireTrainer() {
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // ---- Stance guard (body wireframe) ----
+  // The aim model is only valid for the posture it was calibrated from. A
+  // throttled body-pose pass draws a wireframe on the preview and, once the
+  // 9 dots complete, anchors a STANCE REFERENCE — drift past the threshold
+  // during training raises a "you've moved, redo the dots" warning.
+  const poseInitRef = useRef<"idle" | "loading" | "ready" | "failed">("idle");
+  const poseLmRef = useRef<{ lm: ReturnType<typeof detectPose>; atMs: number } | null>(null);
+  const latestStanceSigRef = useRef<StanceSig | null>(null);
+  const stanceRefSigRef = useRef<StanceSig | null>(null);
+  const stanceDriftRef = useRef(0); // EMA of deviation
+  const stanceBadSinceRef = useRef(0);
+  const stanceWarnRef = useRef(false);
+  const stanceSpokeAtRef = useRef(0);
+  const [stanceWarn, setStanceWarn] = useState(false);
+  // LOCK-TROUBLE BANNER: when the lock keeps dropping during calibration,
+  // the dominant cause (diagnosed from the detector's fail stages) is shown
+  // top-of-screen in large type so the shooter can fix the actual problem.
+  const [lockIssue, setLockIssue] = useState<string | null>(null);
   const boardWrapRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -1477,6 +1524,13 @@ export function DryFireTrainer() {
     let raf = 0;
     let lastFullScanMs = 0;
     let lastWideTrackMs = 0; // throttle for full-frame miss searches
+    let lastPoseMs = 0; // stance guard cadence gate (adaptive, see below)
+    let poseCostEma = 0; // EMA of detectForVideo blocking time (ms)
+    // Lock-churn ledger: hit→miss transitions in the last few seconds, each
+    // tagged with WHY that frame failed. Powers the big calibrate banner.
+    let prevHadObs = false;
+    let lastIssueSpokeMs = 0;
+    const lockDrops: { t: number; cause: string }[] = [];
     // Background subtraction: per-camera-session model, stepped on the same
     // throttled cadence as full scans (that's when a full frame is in hand).
     const bgModel = createBackgroundModel();
@@ -1547,23 +1601,32 @@ export function DryFireTrainer() {
           modelRef.current = fitted;
           setModel(fitted);
           setResizedSinceCal(false);
+          // STANCE ANCHOR: the model is only valid for THIS posture — pin
+          // the most recent body signature as the reference the guard
+          // measures drift against during training.
+          stanceRefSigRef.current = latestStanceSigRef.current;
+          stanceDriftRef.current = 0;
+          stanceBadSinceRef.current = 0;
+          stanceWarnRef.current = false;
+          setStanceWarn(false);
           setPhase("train");
           setStatusLine(
             `Calibrated — fit residual ${fitted.rmsErrorPx.toFixed(0)}px over ${fitted.sampleCount} dots. Drill starting…`,
           );
-          say("feedback", "Calibration complete.");
-          // Straight into a called drill — no extra tap. Small delay so the
-          // completion callout isn't cancelled by the first drill call.
+          // ONE completion callout, not two: target mode folds "complete"
+          // into the hot call; drill mode's range commands announce
+          // themselves, so a bare "complete" suffices there.
           window.setTimeout(() => {
             if (phaseRef.current !== "train") return;
             if (trainModeRef.current === "target") {
-              say("feedback", "Target is hot. Fire when ready.");
+              say("feedback", "Calibration complete. Target is hot — fire when ready.");
               return;
             }
+            say("feedback", "Calibration complete.");
             if (!drillRef.current || drillRef.current.status !== "running") {
               beginDrillRef.current();
             }
-          }, 1800);
+          }, 900);
         } else {
           setStatusLine("Calibration failed to fit — restart calibration.");
           say("feedback", "Calibration failed.");
@@ -1724,19 +1787,20 @@ export function DryFireTrainer() {
           rh = Math.min(side, procH - ry);
         }
         const trackFn = patternModeRef.current === "shape" ? trackShapeFlag : trackColorFlag;
-        // DAMPED white-patch illuminant gain: symmetric appearance correction
-        // across track AND reacquire. The always-on learner already follows
-        // the light, so the gain here is damped to ~35% — a feed-forward
-        // nudge for fast appearance shifts (posture/exposure) the learner is
-        // still catching up to, without the steady-state double-correction a
-        // full gain would cause. Only when colors are committed.
-        const trackGain: [number, number, number] | undefined = colorsCommittedRef.current
-          ? [
-              1 + (illumRef.current.gain[0] - 1) * 0.35,
-              1 + (illumRef.current.gain[1] - 1) * 0.35,
-              1 + (illumRef.current.gain[2] - 1) * 0.35,
-            ]
-          : undefined;
+        // DAMPED white-patch illuminant gain — but ONLY on miss frames. While
+        // the track is hitting, the always-on learner owns appearance and a
+        // live gain would close a feedback loop (gain shifts classification →
+        // white sample shifts → gain shifts) that wobbles the lock. On a
+        // miss the learner is blind, so the damped gain steers the re-find
+        // through fast appearance shifts (posture/exposure).
+        const trackGain: [number, number, number] | undefined =
+          colorsCommittedRef.current && track.misses > 0
+            ? [
+                1 + (illumRef.current.gain[0] - 1) * 0.35,
+                1 + (illumRef.current.gain[1] - 1) * 0.35,
+                1 + (illumRef.current.gain[2] - 1) * 0.35,
+              ]
+            : undefined;
         // Full-resolution ROI: the camera usually has more detail than the
         // downscaled processing frame — spend it where the card actually is.
         const kNative = vw / procW;
@@ -2080,7 +2144,10 @@ export function DryFireTrainer() {
         smoothFeaturesRef.current = featureFilterRef.current.update(obs.features, now, quality);
         // Raw history for click-time aim sampling.
         aimHistoryRef.current.push({ atMs: now, features: obs.features });
-        while (aimHistoryRef.current.length > 0 && now - aimHistoryRef.current[0].atMs > 1000) {
+        // Retention must cover the WORST-CASE click-report delay (the
+        // two-peak confirm wait, up to ~700 ms) PLUS the -280 ms sampling
+        // window behind the break — 1000 ms left only ~20 ms of slack.
+        while (aimHistoryRef.current.length > 0 && now - aimHistoryRef.current[0].atMs > 1800) {
           aimHistoryRef.current.shift();
         }
         // Background HOMOGRAPHY LOG for Zhang self-calibration: perspective
@@ -2197,7 +2264,7 @@ export function DryFireTrainer() {
               const slopeY = pts.reduce((s, p, i) => s + (ts[i] - tm) * (p.y - my), 0) / tt;
               const driftPxPerS = Math.hypot(slopeX, slopeY);
               setHoldResult({ rmsPx, driftPxPerS, n: pts.length });
-              say("feedback", `Hold test complete. R M S ${Math.round(rmsPx)} pixels, drift ${Math.round(driftPxPerS)} per second.`);
+              say("feedback", `Hold test done. Wobble ${Math.round(rmsPx)} pixels, drift ${Math.round(driftPxPerS)}.`);
             }
             setHoldActive(false);
           }
@@ -2303,6 +2370,72 @@ export function DryFireTrainer() {
             ctx.moveTo(mx, my - 4);
             ctx.lineTo(mx, my + 4);
             ctx.stroke();
+          }
+        }
+      }
+
+      // ---- Stance guard: throttled body pose ----------------------------
+      // Loads lazily the first time it's needed; every failure path just
+      // leaves the guard off. detectForVideo BLOCKS the main thread — the
+      // same thread the card tracker and aim sampling live on — so the
+      // cadence adapts to measured cost, runs sparsest during calibration
+      // (dwell capture needs dense frames far more than the wireframe
+      // does), and the guard turns itself OFF outright on machines where
+      // inference is slow enough to hurt the aim (CPU fallback).
+      const phaseNowSG = phaseRef.current;
+      if (phaseNowSG === "calibrate" || phaseNowSG === "train") {
+        // Base cadence: 1 Hz while calibrating (only the anchor snapshot
+        // needs freshness), ~3 Hz training; stretched 3× if inference is
+        // costing real frame budget.
+        const poseBase = phaseNowSG === "calibrate" ? 1000 : 350;
+        const poseInterval = poseCostEma > 18 ? poseBase * 3 : poseBase;
+        if (poseInitRef.current === "idle") {
+          poseInitRef.current = "loading";
+          initPoseStance().then((ok) => {
+            poseInitRef.current = ok ? "ready" : "failed";
+          });
+        } else if (poseInitRef.current === "ready" && now - lastPoseMs > poseInterval) {
+          lastPoseMs = now;
+          const t0 = performance.now();
+          const lm = detectPose(video, now);
+          const poseDt = performance.now() - t0;
+          poseCostEma += 0.3 * (poseDt - poseCostEma);
+          if (poseCostEma > 45) {
+            // Too expensive on this machine (likely CPU fallback) — the
+            // stance guard is a nice-to-have; the aim model is not.
+            poseInitRef.current = "failed";
+            poseLmRef.current = null;
+          } else if (lm) {
+            poseLmRef.current = { lm, atMs: now };
+            const sig = stanceSignature(lm);
+            if (sig) {
+              latestStanceSigRef.current = sig;
+              const refSig = stanceRefSigRef.current;
+              if (refSig && phaseNowSG === "train") {
+                const dev = stanceDeviation(refSig, sig);
+                stanceDriftRef.current += 0.25 * (dev - stanceDriftRef.current);
+                const drift = stanceDriftRef.current;
+                if (drift > 0.5) {
+                  // Sustained, not a flinch: 2 s over threshold before warning.
+                  if (stanceBadSinceRef.current === 0) stanceBadSinceRef.current = now;
+                  else if (now - stanceBadSinceRef.current > 2000 && !stanceWarnRef.current) {
+                    stanceWarnRef.current = true;
+                    setStanceWarn(true);
+                    if (now - stanceSpokeAtRef.current > 45000) {
+                      stanceSpokeAtRef.current = now;
+                      say("guidance", "Stance shifted — aim may be off. Redo the dots or step back into place.");
+                    }
+                  }
+                } else if (drift < 0.3) {
+                  // Back in place: clear with hysteresis.
+                  stanceBadSinceRef.current = 0;
+                  if (stanceWarnRef.current) {
+                    stanceWarnRef.current = false;
+                    setStanceWarn(false);
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -2547,6 +2680,32 @@ export function DryFireTrainer() {
             pctx.fillText(lockIn ? "position ✓" : "flag here", cx, zoneY + zoneR + 12);
             pctx.textAlign = "start";
           }
+          // BODY WIREFRAME (stance guard): live skeleton over the preview.
+          // Emerald = stance matches the calibration anchor (or no anchor
+          // yet); amber = drifted past the warn threshold.
+          const poseNow = poseLmRef.current;
+          if (poseNow?.lm && now - poseNow.atMs < 500 && !frozen) {
+            const wfColor = stanceWarnRef.current ? "rgba(245,158,11,0.95)" : "rgba(52,211,153,0.8)";
+            pctx.strokeStyle = wfColor;
+            pctx.lineWidth = 2;
+            pctx.beginPath();
+            for (const [a, b] of WIREFRAME_EDGES) {
+              const pa = poseNow.lm[a];
+              const pb = poseNow.lm[b];
+              if (!pa || !pb || pa.v < 0.5 || pb.v < 0.5) continue;
+              pctx.moveTo(pa.x * pw, pa.y * ph);
+              pctx.lineTo(pb.x * pw, pb.y * ph);
+            }
+            pctx.stroke();
+            pctx.fillStyle = wfColor;
+            for (const ji of WIREFRAME_JOINTS) {
+              const p = poseNow.lm[ji];
+              if (!p || p.v < 0.5) continue;
+              pctx.beginPath();
+              pctx.arc(p.x * pw, p.y * ph, 2.5, 0, Math.PI * 2);
+              pctx.fill();
+            }
+          }
           // ---- Detection-status layer -----------------------------------
           // Everything here is drawn ON the canvas — an overlapping layer —
           // so per-frame changes repaint pixels and never reflow the DOM
@@ -2624,6 +2783,39 @@ export function DryFireTrainer() {
         }
       }
 
+      // ---- Lock-churn diagnosis --------------------------------------
+      // Every hit→miss transition is logged with the detector's stated
+      // reason; the throttled block below promotes the dominant one to the
+      // big banner when churn is high.
+      const causeNow = (): string => {
+        const dbg = frameDebug ?? diagRef.current?.debug ?? null;
+        const ig = illumRef.current.gain;
+        if (Math.max(Math.abs(ig[0] - 1), Math.abs(ig[1] - 1), Math.abs(ig[2] - 1)) > 0.4)
+          return "Lighting shifted — recapture colors";
+        const cnt = dbg?.colorCounts;
+        if (dbg?.failStage === "missing-color" && cnt) {
+          const cmy = colorPaletteRef.current === "cmy";
+          const inks: [string, number][] = [
+            [cmy ? "Yellow" : "Red", cnt.red],
+            [cmy ? "Cyan" : "Green", cnt.green],
+            [cmy ? "Magenta" : "Blue", cnt.blue],
+          ];
+          inks.sort((a, b) => a[1] - b[1]);
+          return `${inks[0][0]} patch keeps vanishing — glare or angle?`;
+        }
+        if (dbg?.failStage === "bad-color-layout") return "Colors seen, square failing — face the card to the camera";
+        if (dbg?.failStage === "too-few-blobs" || dbg?.failStage === "too-few-tiles")
+          return "Card too faint — add light or step closer";
+        const cell = trackRef.current?.cellPx ?? 99;
+        if (cell < 7) return "Card too small on camera — step closer";
+        return "Card slipping out of frame — move slower";
+      };
+      if (phaseRef.current === "calibrate" || phaseRef.current === "train") {
+        if (prevHadObs && !obs) lockDrops.push({ t: now, cause: causeNow() });
+      }
+      prevHadObs = obs !== null;
+      while (lockDrops.length > 0 && now - lockDrops[0].t > 4000) lockDrops.shift();
+
       // Throttled status.
       frameCount += 1;
       if (now - fpsWindowStart >= 1000) {
@@ -2633,6 +2825,25 @@ export function DryFireTrainer() {
       }
       if (now - lastStatusPushMs > 300) {
         lastStatusPushMs = now;
+        // Big banner: 3+ drops inside 4 s = the lock is CHURNING — name the
+        // dominant cause in large type (calibration is where it hurts most).
+        let issue: string | null = null;
+        if (phaseRef.current === "calibrate" && lockDrops.length >= 3) {
+          const tally = new Map<string, number>();
+          for (const d of lockDrops) tally.set(d.cause, (tally.get(d.cause) ?? 0) + 1);
+          let bestN = 0;
+          for (const [cause, n] of tally)
+            if (n > bestN) {
+              bestN = n;
+              issue = cause;
+            }
+          // Speak the diagnosis too, sparingly — the banner is the primary.
+          if (issue && now - lastIssueSpokeMs > 12000) {
+            lastIssueSpokeMs = now;
+            say("guidance", issue.replace("—", ","));
+          }
+        }
+        setLockIssue(issue);
         const current = obsRef.current;
         // 700 ms of hysteresis: a few marginal frames (self-rescue window)
         // shouldn't flip the LOCK badge and everything keyed off it.
@@ -2932,28 +3143,65 @@ export function DryFireTrainer() {
   const onMicClick = (atMs: number, peak: number, fingerprint: number[] | null = null, durationMs = 0) => {
     const cal = trigCalRef.current;
     if (cal) {
-      // NEVER count our own voice prompts: the mic hears the speakers, and
-      // a TTS syllable is a spike like any other.
-      if (isSpeaking()) return;
+      // NOTE: no isSpeaking() drop here. Capture-mode runs can't FORM while
+      // our prompts play (the trigger gates formation on speech), so any
+      // delivered event is a real user sound — and run-END delivery means a
+      // legit rack often ARRIVES just as the window-tally prompt starts;
+      // dropping it for that made the "I didn't hear it" loop.
       const nowMs = performance.now();
       if (cal.stage === "slides") {
-        // Deaf outside the open window — by design.
-        if (cal.windowCloseAt === null || nowMs > cal.windowCloseAt) return;
+        // Window membership is judged by when the sound STARTED (atMs), not
+        // when the run-end report arrived — delivery lag can't disqualify a
+        // rack that happened inside the window.
+        if (cal.windowCloseAt === null) return;
+        const winOpenMs = cal.windowCloseAt - TRIG_SLIDE_WINDOW_MS;
+        if (atMs < winOpenMs || atMs > cal.windowCloseAt) return;
+        if (durationMs > 900) {
+          // Far too long for a rack impact — sustained handling/scrape noise.
+          trigWaveEventsRef.current.push({ t: nowMs, kind: "reject" });
+          return;
+        }
         if (fingerprint) cal.rackFps.push(fingerprint);
         if (durationMs > 0) cal.rackDurs.push(durationMs); // pull-back / slam durations
+        // Inter-impact gap: this impact's start minus the previous one's,
+        // within the same window — the pull-back → slam spacing that sizes
+        // the live two-peak confirmation wait.
+        if (cal.lastRackAtMs !== undefined) {
+          const gap = atMs - cal.lastRackAtMs;
+          if (gap > 60 && gap < 1200) cal.rackGaps.push(gap);
+        }
+        cal.lastRackAtMs = atMs;
         cal.rackOk = true;
-        trigWaveEventsRef.current.push({ t: nowMs, kind: "reject" }); // amber = slide
+        trigWaveEventsRef.current.push({ t: nowMs, kind: "slide" }); // captured slide impact
         return;
       }
       // ---- Dry-fire stage ----
       if (nowMs < cal.armAt) return; // TTS prompt guard
-      const rackTpl = meanFingerprint(cal.rackFps);
-      const rackSim = fingerprint && rackTpl ? fingerprintSimilarity(fingerprint, rackTpl) : null;
-      if (rackSim !== null && rackSim > 0.92) {
-        // Sounds like the STORED SLIDE — ignore it, it isn't a trigger pull.
+      // NO fingerprint screen here: the click and the rack are the same
+      // gun's metal — their spectra score 0.9+ against each other, so a
+      // similarity gate silently rejects REAL dry-fires and the count
+      // never advances. What actually separates them is sequence and
+      // duration: a rack is a LONG sound / TWO runs in quick succession,
+      // a dry-fire is one short isolated snap.
+      if (durationMs > 260) {
+        // Far too long for a striker fall — scrape, voice, rack.
         trigWaveEventsRef.current.push({ t: nowMs, kind: "reject" });
         return;
       }
+      if (cal.lastEvtMs !== undefined && nowMs - cal.lastEvtMs < 500) {
+        // Second impact hot on the heels of the last event = a rack; the
+        // PREVIOUS event was its first impact — uncount it.
+        cal.lastEvtMs = nowMs;
+        if (cal.peaks.length > 0) {
+          cal.peaks.pop();
+          if (cal.clickFps.length > cal.peaks.length) cal.clickFps.pop();
+          if (cal.clickDurs.length > cal.peaks.length) cal.clickDurs.pop();
+          setTrigCalCount(cal.peaks.length);
+        }
+        trigWaveEventsRef.current.push({ t: nowMs, kind: "reject" });
+        return;
+      }
+      cal.lastEvtMs = nowMs;
       trigWaveEventsRef.current.push({ t: nowMs, kind: "click" });
       cal.peaks.push(peak);
       if (fingerprint) cal.clickFps.push(fingerprint);
@@ -2986,6 +3234,10 @@ export function DryFireTrainer() {
           const durSorted = [...cal.clickDurs].sort((a, b) => a - b);
           const clickDurMs = durSorted.length ? durSorted[Math.floor(durSorted.length / 2)] : 0;
           triggerRef.current?.setClickDuration(clickDurMs);
+          // Median rack inter-impact GAP → sizes the two-peak confirm wait.
+          const gapSorted = [...cal.rackGaps].sort((a, b) => a - b);
+          const rackGapMs = gapSorted.length ? gapSorted[Math.floor(gapSorted.length / 2)] : 0;
+          triggerRef.current?.setRackGap(rackGapMs);
           triggerRef.current?.setCaptureMode(false); // back to live discrimination
           const rackOk = cal.rackOk ?? null;
           trigCalRef.current = null;
@@ -3000,6 +3252,7 @@ export function DryFireTrainer() {
             rackFps: cal.rackFps,
             clickDurMs,
             rackDurs: cal.rackDurs,
+            rackGapMs,
           };
           setTrigCalResult(calResult);
           // Remember it for next session's "use previous calibration" offer
@@ -3047,6 +3300,7 @@ export function DryFireTrainer() {
       trigger.setCustomFloor(trigCalResult.floor);
       trigger.setFingerprints(trigCalResult.clickFp ?? null, trigCalResult.rackFp ?? null);
       trigger.setClickDuration(trigCalResult.clickDurMs ?? 0);
+      trigger.setRackGap(trigCalResult.rackGapMs ?? 0);
     }
     setMicActive(true);
   };
@@ -3185,9 +3439,11 @@ export function DryFireTrainer() {
   // the window can never overlap our own narration).
   const openSlideWindow = () => {
     const c = trigCalRef.current;
-    if (!c || c.stage !== "slides") return;
+    if (!c || c.stage !== "slides" || c.windowCloseAt !== null) return;
     c.windowStartCount = c.rackFps.length;
-    c.windowCloseAt = performance.now() + 2000;
+    c.windowCloseAt = performance.now() + TRIG_SLIDE_WINDOW_MS;
+    c.lastRackAtMs = undefined; // gaps are measured within one window only
+    c.forceOpenAt = undefined;
     c.remindAt = performance.now() + 12000;
     setSlideWindowOpen(true);
   };
@@ -3212,7 +3468,9 @@ export function DryFireTrainer() {
       rackFps: [],
       clickDurs: [],
       rackDurs: [],
+      rackGaps: [],
       armAt: performance.now() + 8000,
+      forceOpenAt: performance.now() + 4500, // TTS-wedge insurance
       remindAt: performance.now() + 12000,
     };
     setTrigCalCount(0);
@@ -3222,6 +3480,7 @@ export function DryFireTrainer() {
     triggerRef.current?.setCustomFloor(null); // measure on preset gates
     triggerRef.current?.setFingerprints(null, null); // and without matching
     triggerRef.current?.setClickDuration(0); // generic duration cap
+    triggerRef.current?.setRackGap(0); // generic two-peak wait
     triggerRef.current?.setCaptureMode(true); // raw spikes, no discrimination
     say("guidance", "Calibrating the slide. Rack the slide now.", { onEnd: openSlideWindow });
   };
@@ -3457,8 +3716,10 @@ export function DryFireTrainer() {
         const cal = trigCalRef.current;
         const nowP = performance.now();
         if (cal && cal.stage === "slides") {
-          if (cal.windowCloseAt !== null && nowP > cal.windowCloseAt) {
-            // Window closed — tally it: did the slide land inside?
+          if (cal.windowCloseAt !== null && nowP > cal.windowCloseAt + 600) {
+            // Window closed, plus grace for run-end delivery lag (a rack's
+            // report arrives ~90-600 ms after the sound) — tally it: did
+            // the slide land inside?
             cal.windowCloseAt = null;
             setSlideWindowOpen(false);
             const got = cal.rackFps.length > cal.windowStartCount;
@@ -3483,13 +3744,20 @@ export function DryFireTrainer() {
                 },
               });
             } else {
+              cal.forceOpenAt = nowP + 4500; // insurance if onEnd never fires
               say("guidance", got ? "Good. And again — rack the slide." : "I didn't hear it. Rack the slide.", {
                 onEnd: () => openSlideWindowRef.current(),
               });
             }
+          } else if (cal.windowCloseAt === null && cal.forceOpenAt !== undefined && nowP > cal.forceOpenAt) {
+            // TTS wedge: the prompt's onEnd never came (or the engine is
+            // stuck "speaking"). The window opens anyway — the RACK NOW
+            // indicator carries the flow even with no audio.
+            openSlideWindowRef.current();
           } else if (cal.windowCloseAt === null && nowP > cal.remindAt && !isSpeaking()) {
             // The prompt's onEnd never opened a window (TTS hiccup) — recover.
             cal.remindAt = nowP + 12000;
+            cal.forceOpenAt = nowP + 4500;
             say("guidance", "Rack the slide.", { onEnd: () => openSlideWindowRef.current() });
           }
         } else if (cal && nowP > cal.remindAt && !isSpeaking()) {
@@ -3529,7 +3797,19 @@ export function DryFireTrainer() {
       if (!level || !canvas || !ctx) return;
       const now = performance.now();
       const buf = micWaveRef.current;
-      buf.push({ t: now, peak: level.rms, thr: level.threshold, ambient: level.ambient, suppressed: level.suppressed });
+      const calNow = trigCalRef.current;
+      buf.push({
+        t: now,
+        peak: level.rms,
+        // During calibration the trigger is in CAPTURE mode — the line that
+        // matters is the capture gate (3× room noise), not the live trigger
+        // threshold. A rack must poke above THIS line to register.
+        thr: Math.max(level.ambient * 3, 0.004),
+        ambient: level.ambient,
+        suppressed: level.suppressed,
+        win: calNow?.stage === "slides" && calNow.windowCloseAt !== null && now <= calNow.windowCloseAt,
+        speak: isSpeaking(),
+      });
       while (buf.length > 0 && now - buf[0].t > WINDOW_MS) buf.shift();
       if (level.rejectedAtMs > lastRejectSeenRef.current) {
         lastRejectSeenRef.current = level.rejectedAtMs;
@@ -3547,12 +3827,19 @@ export function DryFireTrainer() {
       let maxV = level.threshold * 2.5;
       for (const s of buf) maxV = Math.max(maxV, s.peak);
       const yOf = (v: number) => h - 2 - Math.sqrt(Math.min(1, v / maxV)) * (h - 6);
-      // Suppressed spans (rack/noise hold-off) as an amber wash.
-      ctx.fillStyle = "rgba(245,158,11,0.13)";
+      // Background washes, drawn first: SKY = the listen window is OPEN
+      // (rack now!), GRAY = our voice is speaking (the capture gate is deaf
+      // — a rack here is invisible), AMBER = noisy hold-off.
       for (let i = 0; i < buf.length; i += 1) {
-        if (!buf[i].suppressed) continue;
-        const x0 = xOf(buf[i].t);
+        const s = buf[i];
+        if (!s.win && !s.speak && !s.suppressed) continue;
+        const x0 = xOf(s.t);
         const x1 = i + 1 < buf.length ? xOf(buf[i + 1].t) : w;
+        ctx.fillStyle = s.win
+          ? "rgba(56,189,248,0.16)"
+          : s.speak
+            ? "rgba(148,163,184,0.22)"
+            : "rgba(245,158,11,0.13)";
         ctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
       }
       // Sound bars.
@@ -3588,15 +3875,20 @@ export function DryFireTrainer() {
       });
       ctx.stroke();
       ctx.setLineDash([]);
-      // Event markers.
+      // Event markers: green = trigger pull COUNTED, amber = slide impact
+      // CAPTURED, red = rejected (too long / compound / noise).
       for (const e of evs) {
         const x = xOf(e.t);
-        ctx.strokeStyle = e.kind === "click" ? "#22c55e" : "#f59e0b";
+        ctx.strokeStyle = e.kind === "click" ? "#22c55e" : e.kind === "slide" ? "#f59e0b" : "#f43f5e";
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(x, 0);
         ctx.lineTo(x, h);
         ctx.stroke();
+        // Tiny glyph at the top so color-blind users can still read it.
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.font = "700 9px ui-monospace, monospace";
+        ctx.fillText(e.kind === "click" ? "T" : e.kind === "slide" ? "S" : "✕", x + 2, 9);
       }
     }, 45);
     return () => window.clearInterval(timer);
@@ -3612,6 +3904,12 @@ export function DryFireTrainer() {
     modelRef.current = null;
     provisionalModelRef.current = null;
     dispAimRef.current = null;
+    // A new dot run will pin a fresh stance anchor.
+    stanceRefSigRef.current = null;
+    stanceDriftRef.current = 0;
+    stanceBadSinceRef.current = 0;
+    stanceWarnRef.current = false;
+    setStanceWarn(false);
     holdTestRef.current = null;
     setHoldActive(false);
     setHoldResult(null);
@@ -3717,6 +4015,7 @@ export function DryFireTrainer() {
     triggerRef.current?.setCustomFloor(p.trigCal?.floor ?? null);
     triggerRef.current?.setFingerprints(p.trigCal?.clickFp ?? null, p.trigCal?.rackFp ?? null);
     triggerRef.current?.setClickDuration(p.trigCal?.clickDurMs ?? 0);
+    triggerRef.current?.setRackGap(p.trigCal?.rackGapMs ?? 0);
   };
 
   const saveProfile = () => {
@@ -3834,6 +4133,7 @@ export function DryFireTrainer() {
     triggerRef.current?.setCustomFloor(savedTrigCal.result.floor);
     triggerRef.current?.setFingerprints(savedTrigCal.result.clickFp ?? null, savedTrigCal.result.rackFp ?? null);
     triggerRef.current?.setClickDuration(savedTrigCal.result.clickDurMs ?? 0);
+    triggerRef.current?.setRackGap(savedTrigCal.result.rackGapMs ?? 0);
     say("feedback", "Using the previous slide and trigger calibration.");
   };
 
@@ -3929,6 +4229,14 @@ export function DryFireTrainer() {
       case "resetZero":
         resetZero();
         break;
+      case "repeatCall": {
+        // Called drills: re-announce the current call (missed audio). The
+        // reaction clock is NOT reset — timing stays honest.
+        const st = drillRef.current;
+        const step = st && st.status === "running" ? currentStep(st) : null;
+        if (step) say("drill", step.spoken);
+        break;
+      }
     }
   };
   useEffect(() => {
@@ -4340,28 +4648,27 @@ export function DryFireTrainer() {
                   </div>
                 ) : null}
                 {/* Live audio waveform + detection info during the slide &
-                    trigger calibration steps. */}
-                {micActive && (trigCalRacking || trigCalCount !== null) ? (
+                    trigger calibration steps. NOT rendered while the board
+                    wizard is up — that popover mounts the same canvas ref. */}
+                {micActive && !boardFull && (trigCalRacking || trigCalCount !== null) ? (
                   <div className="rounded-lg border border-gray-800 p-2">
                     <canvas ref={waveCanvasRef} width={640} height={96} className="h-20 w-full rounded bg-neutral-950" />
                     <p className="mt-1 flex flex-wrap justify-between gap-x-3 font-mono text-[10px] text-gray-400">
                       <span>peak {(micStats.peak * 100).toFixed(1)}</span>
                       <span>room {(micStats.ambient * 100).toFixed(2)}</span>
-                      <span>gate {(micStats.threshold * 100).toFixed(1)}</span>
-                      {micStats.sim !== null ? (
-                        <span className={micStats.sim >= 0.7 ? "text-emerald-300" : "text-amber-300"}>
-                          match {Math.round(micStats.sim * 100)}%
-                        </span>
-                      ) : null}
+                      <span>gate {(Math.max(micStats.ambient * 3, 0.004) * 100).toFixed(1)}</span>
                       <span className={micStats.suppressed ? "text-amber-300" : "text-emerald-300"}>
                         {micStats.suppressed ? "HOLDING (noisy)" : "ARMED"}
                       </span>
                     </p>
                     <p className="mt-0.5 text-[10px] leading-snug text-gray-500">
-                      <span className="text-sky-400">▮</span> sound · <span className="text-rose-400">┄</span> trigger
-                      gate · <span className="text-gray-400">—</span> room noise ·{" "}
-                      <span className="text-emerald-400">│</span> trigger pull ·{" "}
-                      <span className="text-amber-400">│</span> slide / noise
+                      <span className="text-sky-400">▮</span> mic level · <span className="text-rose-400">┄</span>{" "}
+                      capture gate · <span className="text-gray-400">—</span> room noise ·{" "}
+                      <span className="text-emerald-400">│T</span> trigger counted ·{" "}
+                      <span className="text-amber-400">│S</span> slide captured ·{" "}
+                      <span className="text-rose-400">│✕</span> rejected ·{" "}
+                      <span className="rounded bg-sky-400/20 px-1">listen window</span> ·{" "}
+                      <span className="rounded bg-gray-400/25 px-1">voice (deaf)</span>
                     </p>
                   </div>
                 ) : null}
@@ -4494,6 +4801,8 @@ export function DryFireTrainer() {
                           triggerRef.current?.setCustomFloor(null);
                           triggerRef.current?.setFingerprints(null, null);
                           triggerRef.current?.setClickDuration(0);
+                      triggerRef.current?.setRackGap(0);
+                          triggerRef.current?.setRackGap(0);
                         }}
                         className="rounded-md border border-gray-700 px-3 py-1.5 text-xs text-gray-400 transition hover:bg-neutral-900"
                         title="A saved slide & trigger calibration will be reused — tap to redo it as part of the chain"
@@ -4589,6 +4898,29 @@ export function DryFireTrainer() {
                       : `⏳ Wait… (slide ${Math.min(TRIG_CAL_CLICKS, (trigCalCount ?? 0) + 1)}/${TRIG_CAL_CLICKS})`
                     : `🎚 Dry fire (click ${Math.min(TRIG_CAL_CLICKS, (trigCalCount ?? 0) + 1)}/${TRIG_CAL_CLICKS})`}
                 </p>
+                {/* Live mic sparkline: SEE the sound land (or not) — bars
+                    must poke above the dashed capture gate, inside the sky
+                    listen window, to register. */}
+                <div className="rounded-lg border border-gray-800 bg-neutral-950 p-2">
+                  <canvas ref={waveCanvasRef} width={640} height={96} className="h-24 w-full rounded" />
+                  <p className="mt-1 flex flex-wrap justify-between gap-x-3 font-mono text-[10px] text-gray-400">
+                    <span>peak {(micStats.peak * 100).toFixed(1)}</span>
+                    <span>room {(micStats.ambient * 100).toFixed(2)}</span>
+                    <span>gate {(Math.max(micStats.ambient * 3, 0.004) * 100).toFixed(1)}</span>
+                    <span className={slideWindowOpen ? "text-sky-300" : "text-gray-500"}>
+                      {trigCalRacking ? (slideWindowOpen ? "WINDOW OPEN" : "window closed") : "listening"}
+                    </span>
+                  </p>
+                  <p className="mt-0.5 text-[10px] leading-snug text-gray-500">
+                    <span className="text-sky-400">▮</span> mic level · <span className="text-rose-400">┄</span>{" "}
+                    capture gate · <span className="text-gray-400">—</span> room noise ·{" "}
+                    <span className="text-emerald-400">│T</span> trigger counted ·{" "}
+                    <span className="text-amber-400">│S</span> slide captured ·{" "}
+                    <span className="text-rose-400">│✕</span> rejected ·{" "}
+                    <span className="rounded bg-sky-400/20 px-1">listen window</span> ·{" "}
+                    <span className="rounded bg-gray-400/25 px-1">voice speaking (deaf)</span>
+                  </p>
+                </div>
                 <button
                   type="button"
                   onClick={cancelTrigCalibration}
@@ -4815,11 +5147,19 @@ export function DryFireTrainer() {
                     <p className="text-5xl font-black uppercase tracking-wide text-white">{currentCall.label}</p>
                   </div>
                 ) : phase === "calibrate" ? (
-                  <div className="pointer-events-none absolute left-1/2 top-3 z-[85] -translate-x-1/2 rounded-2xl bg-neutral-950/90 px-8 py-2.5 text-center shadow-2xl">
+                  <div className="pointer-events-none absolute left-1/2 top-3 z-[85] w-[min(92vw,52rem)] -translate-x-1/2 rounded-2xl bg-neutral-950/90 px-8 py-2.5 text-center shadow-2xl">
                     <p className="text-sm font-semibold text-white">
                       Dot {Math.min(calIndex + 1, CAL_POINTS.length)}/{CAL_POINTS.length} — hold your aim on the
                       flashing marker until its green ring fills
                     </p>
+                    {/* LOCK-TROUBLE readout: when the lock keeps dropping,
+                        the dominant diagnosed cause — big enough to read
+                        from shooting distance. */}
+                    {lockIssue ? (
+                      <p className="mt-1.5 animate-pulse text-3xl font-black leading-tight text-amber-400">
+                        {lockIssue}
+                      </p>
+                    ) : null}
                   </div>
                 ) : null}
                 {/* Minimal floating controls — everything else is audio. */}
@@ -4843,6 +5183,20 @@ export function DryFireTrainer() {
                 >
                   {phase === "calibrate" ? "↺ Restart calibration" : "↻ Recalibrate aim"}
                 </button>
+                {/* Stance guard: the body wireframe says the shooter moved
+                    from the posture the aim dots were run in — the model's
+                    aim is suspect until the dots are redone (or they step
+                    back into place, which clears this automatically). */}
+                {stanceWarn && phase === "train" ? (
+                  <button
+                    type="button"
+                    onClick={() => beginCalibration()}
+                    title="Your body has shifted from the calibrated stance — aim accuracy degrades. Tap to redo the 9 dots, or step back into your original position."
+                    className="absolute left-1/2 top-14 z-[85] -translate-x-1/2 animate-pulse rounded-full border border-amber-400/70 bg-amber-500/90 px-4 py-2 text-sm font-semibold text-black shadow-lg transition hover:bg-amber-400"
+                  >
+                    🧍 Stance shifted — tap to redo aim dots
+                  </button>
+                ) : null}
                 {phase === "train" && trainMode === "target" ? (
                   <div className="absolute bottom-4 left-1/2 z-[80] flex -translate-x-1/2 items-center gap-2.5">
                     <style>{`
@@ -4907,6 +5261,63 @@ export function DryFireTrainer() {
                     <span className="rounded-full bg-black/40 px-3 py-2.5 text-center font-mono text-sm text-white/90">
                       🎯 {simRangeM} m{smartDistance && smartDistM > 0 ? ` · you ${smartDistM.toFixed(1)} m` : ""}
                     </span>
+                  </div>
+                ) : null}
+                {/* Called drills get the same aim-shootable control bar as
+                    the fixed target — same registry, hover pulse, and
+                    fire-to-click — with drill-appropriate actions. */}
+                {phase === "train" && trainMode === "drill" ? (
+                  <div className="absolute bottom-4 left-1/2 z-[80] flex -translate-x-1/2 items-center gap-2.5">
+                    <style>{`
+                      @keyframes aimHoverPulse { 0%,100% { transform: scale(1.08); } 50% { transform: scale(1.14); } }
+                      @keyframes aimFireBoom { 0% { transform: scale(1.2); } 45% { transform: scale(0.9); } 100% { transform: scale(1.08); } }
+                    `}</style>
+                    {(
+                      [
+                        {
+                          id: "repeatCall",
+                          label: "📢 Repeat call",
+                          title: "Say the current call again (shootable — timing is not reset)",
+                          show: Boolean(drillStep),
+                        },
+                        {
+                          id: "resetZero",
+                          label: "↩ Reset zero",
+                          title: "Remove the zero adjustment carried from target practice (shootable)",
+                          show: zeroed,
+                        },
+                      ] as const
+                    )
+                      .filter((b) => b.show)
+                      .map((b) => {
+                        const hovered = aimHoverBtn === b.id;
+                        const fired = firedBtn === b.id;
+                        return (
+                          <button
+                            key={b.id}
+                            ref={aimBtnRef(b.id)}
+                            type="button"
+                            onClick={() => runAimBtn(b.id)}
+                            title={b.title}
+                            style={{
+                              animation: fired
+                                ? "aimFireBoom 0.4s ease-out"
+                                : hovered
+                                  ? "aimHoverPulse 0.9s ease-in-out infinite"
+                                  : undefined,
+                            }}
+                            className={`rounded-full border px-4 py-2.5 text-sm font-semibold transition ${
+                              fired
+                                ? "border-red-400 bg-red-500 text-white shadow-lg shadow-red-500/40"
+                                : hovered
+                                  ? "border-sky-300 bg-sky-500/30 text-white ring-2 ring-sky-300 shadow-lg shadow-sky-400/30"
+                                  : "border-white/20 bg-black/40 text-white/90 hover:bg-black/60"
+                            }`}
+                          >
+                            {b.label}
+                          </button>
+                        );
+                      })}
                   </div>
                 ) : null}
                 {phase === "calibrate" && !briefActive && calIndex > 0 && calIndex < CAL_POINTS.length ? (
@@ -5688,6 +6099,7 @@ export function DryFireTrainer() {
                       triggerRef.current?.setCustomFloor(null);
                       triggerRef.current?.setFingerprints(null, null);
                       triggerRef.current?.setClickDuration(0);
+                      triggerRef.current?.setRackGap(0);
                     }}
                     title="Clear the calibrated threshold — back to presets"
                     className="ml-1 rounded px-1 text-gray-500 hover:bg-neutral-900 hover:text-gray-300"

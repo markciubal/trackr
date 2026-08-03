@@ -59,6 +59,12 @@
 //                  against any bore from 9 mm up
 //   "stem-plug-gland" — that TPU ring, alone (print in the softest TPU
 //                  available)
+//   "stem-cork"  — CORK STEM spine (RECOMMENDED universal): rigid rod with
+//                  the click nub integral — no threads, no mechanisms
+//   "stem-cork-tpu" — the TPU taper cork that presses onto that rod and
+//                  wedges into any pistol bore, 9 mm through .45
+//   "stem-cork-tpu-rifle" — the rifle-caliber cork for the same spine,
+//                  6.5 mm through 8 mm bores (.264–.323)
 //   "connector"  — stem socket + arm + 45° head, print orientation
 //   "holder"     — card-holding object, print orientation
 //   "card"       — pattern card BODY, printed flat, pattern face up
@@ -701,6 +707,74 @@ module plug_stem() {
 }
 
 // ============================================================================
+// PART 1g — CORK STEM (universal, NO threads, NO mechanisms — recommended).
+//
+// Two parts, zero fasteners. A rigid spine carries the click nub INTEGRALLY
+// (the project's one proven snap joint does all the connecting), and a TPU
+// TAPER CORK pressed onto its rod does all the gripping: push the stem into
+// the bore and the cone wedges snug at whatever depth matches the caliber —
+// 9 mm through .45 with nothing to adjust, nothing to unscrew, nothing that
+// can bind. Elastomer friction dwarfs dry-fire loads, the cork seals the
+// muzzle, and a twist-pull removes it with zero set. Insertion depth varies
+// ~2 cm across calibers; software zeroing absorbs it like everything else.
+//
+// Assembly (once): slide the cork onto the rod from the rod's tip, FAT END
+// FIRST, so the small end faces the tip — its bore pops over the barb
+// ring, which then stops the cork sliding off during withdrawal; the
+// flange is the shoulder it wedges against (and the hard stop against the
+// crown if you shove).
+cork_len    = 25;
+cork_d_big  = 11.5; // pistol cork fat end — covers a .45 groove
+cork_d_tip  = 8.5;  // pistol cork small end — enters a 9 mm bore
+// RIFLE cork on the same spine: 6.5 mm through 8 mm bores (6.5 CM, 6.8,
+// 7 mm-08, .308/.30-06, 7.62×39, 8 mm Mauser). The Ø5 rod + a printable
+// TPU wall set the ~Ø6.3 floor — for .22/.223 print a SLIM spine + cork:
+// set cork_rod_d = 3.6, cork_barb_d = 4.6, cork_bore = 3.2, and scale the
+// cork to d_big 5.9 / d_tip 4.6, then re-export both parts.
+cork_rifle_d_big = 8.7;
+cork_rifle_d_tip = 6.3;
+cork_bore   = 4.6;  // stretch fit over the Ø5 rod
+cork_rod_d  = 5.0;
+cork_barb_d = 6.2;  // ring the TPU pops over; holds the cork on withdrawal
+
+// SPINE (PETG) — prints vertically, rod tip at the bed (brim), integral
+// prong nub self-supporting at the top: the original stem's proven print.
+module cork_stem_spine() {
+  cylinder(d1 = 3.4, d2 = cork_rod_d, h = 2);
+  translate([0, 0, 1.9]) cylinder(d = cork_rod_d, h = 31.2);
+  // Barb ring, chamfered both ways so it prints clean and the cork slides
+  // over on assembly but catches on withdrawal.
+  translate([0, 0, 3.6]) cylinder(d1 = cork_rod_d, d2 = cork_barb_d, h = 0.8);
+  translate([0, 0, 4.4]) cylinder(d = cork_barb_d, h = 0.8);
+  translate([0, 0, 5.2]) cylinder(d1 = cork_barb_d, d2 = cork_rod_d, h = 0.8);
+  // Grip flange: pull/twist handle + the max-depth stop at the crown.
+  difference() {
+    translate([0, 0, 33]) cylinder(d = 14, h = 3);
+    for (i = [0 : 11])
+      rotate([0, 0, i * 30])
+        translate([7, 0, 32.8])
+          cylinder(d = 1.2, h = 3.4);
+  }
+  translate([0, 0, 36]) rotate([90, 0, 0]) click_nub_assembly(14);
+}
+
+// CORKS (TPU, any shore — softer grips larger bores easier). Print fat end
+// down, solid (3+ walls / 100 % infill). Pistol and rifle corks share the
+// spine; together they cover Ø6.3 → Ø11.5 with no gap.
+module cork_taper(d_big, d_tip) {
+  difference() {
+    cylinder(d1 = d_big, d2 = d_tip, h = cork_len);
+    translate([0, 0, -0.5]) cylinder(d = cork_bore, h = cork_len + 1);
+  }
+}
+module cork_stem_cork() {
+  cork_taper(cork_d_big, cork_d_tip);
+}
+module cork_stem_cork_rifle() {
+  cork_taper(cork_rifle_d_big, cork_rifle_d_tip);
+}
+
+// ============================================================================
 // Fiducial pattern DARK volumes, in card-local coordinates (card slab local
 // y ∈ [−card_t, 0], camera face at y = 0): alternating checker cells plus a
 // round dot in one white cell that breaks the checkerboard's 180° rotational
@@ -1185,6 +1259,12 @@ if (render_part == "assembled") {
   plug_stem();
 } else if (render_part == "stem-plug-gland") {
   plug_gland();
+} else if (render_part == "stem-cork") {
+  cork_stem_spine();
+} else if (render_part == "stem-cork-tpu") {
+  cork_stem_cork();
+} else if (render_part == "stem-cork-tpu-rifle") {
+  cork_stem_cork_rifle();
 } else if (render_part == "holder") {
   holder_for_print();
 } else if (render_part == "connector") {

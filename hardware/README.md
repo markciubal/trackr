@@ -102,7 +102,40 @@ The dedicated fixed stems are lighter and stiffer — prefer them for a gun
 you use regularly; the universal stem is for trying the system on whatever
 is in the safe.
 
-### Plug stem (universal, squeezed TPU gland — recommended universal)
+### Cork stem (universal, no threads, no mechanisms — RECOMMENDED)
+
+Two parts, zero fasteners, nothing to bind: a rigid spine with the **click
+nub printed integral** (the snap joint this project has already proven),
+and a **TPU taper cork** that does all the gripping — exactly like a drum
+plug or rubber chamber flag.
+
+- `aim-flag-stem-cork.stl` — the spine (PETG): rod, barb ring, knurled
+  grip flange, prong nub. Prints vertically, tip down, generous brim, no
+  supports.
+- `aim-flag-stem-cork-tpu.stl` — the pistol cork (any TPU; softer = easier
+  on big bores). Ø8.5 → Ø11.5 over 25 mm, prints fat-end-down, solid.
+- `aim-flag-stem-cork-tpu-rifle.stl` — the **rifle cork** for the same
+  spine: Ø6.3 → Ø8.7, covering 6.5 mm–8 mm bores (6.5 Creedmoor, 6.8,
+  7 mm-08, .308/.30-06, 7.62×39, 8 mm Mauser). Swap corks by pulling one
+  off over the barb ring and popping the other on. The Ø5 rod sets the
+  floor — for .22/.223, print a slim spine + cork: `cork_rod_d = 3.6`,
+  `cork_barb_d = 4.6`, `cork_bore = 3.2`, cork Ø4.6 → Ø5.9, re-export
+  both parts.
+
+**Assemble once**: slide the cork onto the rod from the tip, **fat end
+first** (small end pointing at the rod tip) — its bore pops over the barb
+ring, which keeps it on the rod when you pull out; the flange is the
+shoulder it wedges against. **Use**: verified-empty firearm,
+push the stem in until the cone wedges snug — it stops at whatever depth
+matches the caliber (9 mm seats shallow, .45 seats deep; zeroing absorbs
+the difference). Twist-pull to remove. There is nothing to adjust and
+nothing that can cross-thread, strip, or snap.
+
+If the grip feels light in a clean, oily bore, wipe the bore or print the
+cork one size up (`cork_d_tip = 9.0`); if the .45 fit runs out of cone,
+raise `cork_d_big` to 12.
+
+### Plug stem (universal, squeezed TPU gland)
 
 The test-plug take, and the simplest of the three universals: a **small TPU
 ring squeezed lengthwise between two rigid faces bulges out and seals

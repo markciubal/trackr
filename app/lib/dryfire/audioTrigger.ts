@@ -40,6 +40,10 @@ export type ClickTrigger = {
   // most reliable discriminator — a candidate much longer than this is a
   // scrape/voice/rack, not a click. 0 = fall back to a generic short cap.
   setClickDuration: (ms: number) => void;
+  // Calibrated rack inter-impact gap (pull-back → slam), ms. Sizes the
+  // two-peak confirmation wait: a candidate only fires after this window
+  // passes with NO second peak. 0 = generic window.
+  setRackGap: (ms: number) => void;
   // Latest level / threshold (0..~1), for a small UI meter. peakHold decays
   // over ~1 s so a 2 ms click stays visible to a slow UI poll; ambient is
   // the rolling quiet-room level the threshold is derived from. suppressed
@@ -149,8 +153,14 @@ export function meanFingerprint(fps: number[][]): number[] | null {
 // as a noisy action and suppresses triggering until the room settles.
 const PRE_QUIET_POLLS = 2; // ~100 ms of history that must be calm before a click
 const PRE_QUIET_FACTOR = 0.7; // "calm" = below this × threshold
-const CONFIRM_MS = 120; // post-click quiet window before firing
-const RETRIGGER_FACTOR = 0.5; // follow-up transient above this × candidate peak = rack
+// TWO PEAKS vs ONE: a slide rack ALWAYS lands as two impacts (pull-back,
+// then slam forward); a trigger pull is a single snap. So a candidate is
+// confirmed only after a wait long enough to have SEEN the rack's second
+// impact — calibrated from the shooter's own measured inter-impact gap, or
+// this generic window before calibration. The wait delays the shot callout
+// slightly; aim is unaffected (sampling keys off the click's own timestamp).
+const GENERIC_CONFIRM_MS = 420;
+const RING_GAP_MS = 110; // loud polls this close together = same transient ringing
 const NOISY_QUIET_MS = 250; // silence needed to leave the suppressed state
 
 export function createClickTrigger(
@@ -179,6 +189,11 @@ export function createClickTrigger(
   // DURATION gate (primary). clickDurMs = calibrated striker duration.
   let clickDurMs = 0;
   const GENERIC_MAX_DUR = 190; // pre-calibration cap on a "click" transient
+  // Calibrated rack inter-impact gap (pull-back → slam), ms. Sets how long
+  // a candidate waits for a possible second peak before confirming.
+  let rackGapMs = 0;
+  const confirmWindowMs = (): number =>
+    rackGapMs > 0 ? Math.min(700, Math.max(250, rackGapMs * 1.5 + 100)) : GENERIC_CONFIRM_MS;
   // Discrimination state.
   const recent: number[] = []; // last few poll peaks (pre-quiet check)
   let candidate: { atMs: number; peak: number; fp: number[] | null; lastLoudMs: number } | null = null;
@@ -282,7 +297,9 @@ export function createClickTrigger(
       // A loud run starts on the first above-noise poll and ends after
       // ~90 ms of quiet; its length is the event's duration. Each rack
       // impact (pull-back, slam) is its own run → its own duration.
-      const capLoud = !speakingNow && peak > Math.max(emaMean * 4, 0.004);
+      // 3× the (now honest) noise floor: the old 4× was tuned against a
+      // floor that wedged low; against the real room level it over-gated.
+      const capLoud = !speakingNow && peak > Math.max(emaMean * 3, 0.004);
       if (capLoud) {
         if (capStart === 0) {
           capStart = now;
@@ -318,26 +335,32 @@ export function createClickTrigger(
         noisyUntilQuietMs = now + NOISY_QUIET_MS;
       }
     } else if (candidate) {
-      // Extend the candidate's loud run while it keeps ringing.
+      // Extend the candidate's loud run while its OWN ring continues —
+      // contiguous loud polls only. A loud poll after a real gap is not
+      // ring, it's a new sound (see secondPeak below).
       const stillLoud = peak > threshold * 0.6;
-      if (stillLoud) {
+      const ringContinues = stillLoud && now - candidate.lastLoudMs <= RING_GAP_MS;
+      if (ringContinues) {
         candidate.lastLoudMs = now;
         candidate.peak = Math.max(candidate.peak, peak);
       }
       const durMs = candidate.lastLoudMs - candidate.atMs + POLL_MS;
       // DURATION is the PRIMARY gate: a striker click is a short, consistent
-      // snap. A candidate that stays loud past the calibrated click length
-      // (×2 + margin) is a scrape / voice / rack, not a click — reject on
-      // duration alone. A distinct SECOND loud burst is the compound signal
-      // of a rack.
+      // snap — a candidate ringing past the calibrated click length (×2 +
+      // margin) is a scrape / voice / rack.
       const maxDur = clickDurMs > 0 ? clickDurMs * 2 + 70 : GENERIC_MAX_DUR;
-      const secondBurst =
-        peak > Math.max(threshold, candidate.peak * RETRIGGER_FACTOR) && now - candidate.lastLoudMs > POLL_MS * 1.5;
-      if (durMs > maxDur || secondBurst) {
+      // TWO-PEAK TEST: the candidate's ring has ended, and a NEW burst
+      // arrives — that's the rack's second impact (slam after pull-back).
+      // The slam is often QUIETER than the pull-back, so the bar is
+      // deliberately generous: well above calm, or a real fraction of the
+      // first peak.
+      const ringOver = now - candidate.lastLoudMs > RING_GAP_MS;
+      const secondPeak = ringOver && peak > Math.max(threshold * 0.75, candidate.peak * 0.3);
+      if (durMs > maxDur || secondPeak) {
         candidate = null;
         rejectedAtMs = now;
         noisyUntilQuietMs = now + NOISY_QUIET_MS;
-      } else if (now - candidate.atMs >= CONFIRM_MS && !stillLoud) {
+      } else if (now - candidate.atMs >= confirmWindowMs() && !stillLoud) {
         // Clean short transient, confirmed quiet. FINGERPRINT is now only a
         // SECONDARY veto: reject only when the sound is decisively rack-like
         // (both the click and rack are the same gun's metal, so their
@@ -372,10 +395,17 @@ export function createClickTrigger(
       }
     }
 
-    if (!loud && !speakingNow) {
-      // Only track ambient while quiet AND not narrating — neither a click
-      // nor our own voice may raise the bar.
-      const alpha = 0.15; // matched to the 50 ms poll (~330 ms time constant)
+    if (!speakingNow) {
+      // ASYMMETRIC noise-floor tracker. Falls fast; rises slowly — but it
+      // DOES rise even while "loud". The old !loud gate was circular: the
+      // threshold comes from the floor, so a room that is continuously
+      // louder than the current floor read as "loud" forever, the floor
+      // never caught up, and the capture gate sat BELOW the room — one
+      // endless run, nothing ever delivered. A brief transient (a click is
+      // 1-2 polls) barely moves the slow riser; sustained room noise lifts
+      // the floor to reality within a few seconds. Our own voice is still
+      // excluded — the mic hears the speakers.
+      const alpha = peak < emaMean ? 0.15 : loud ? 0.02 : 0.15;
       emaMean += alpha * (peak - emaMean);
       emaVar += alpha * ((peak - emaMean) * (peak - emaMean) - emaVar);
     }
@@ -458,6 +488,9 @@ export function createClickTrigger(
     },
     setClickDuration: (ms: number) => {
       clickDurMs = ms > 0 ? ms : 0;
+    },
+    setRackGap: (ms: number) => {
+      rackGapMs = ms > 0 ? ms : 0;
     },
     getLevel: () => level,
   };

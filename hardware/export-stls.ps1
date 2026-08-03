@@ -68,7 +68,7 @@ foreach ($part in $parts) {
 
 # Universal dial stem (9 mm through .40 — twist to expand): the replate set
 # (sleeve + spine + dial) plus the screw-on head, which only prints once.
-foreach ($uniPart in @("stem-universal", "stem-universal-head", "stem-cage", "stem-cage-flex", "stem-plug", "stem-plug-gland")) {
+foreach ($uniPart in @("stem-universal", "stem-universal-head", "stem-cage", "stem-cage-flex", "stem-plug", "stem-plug-gland", "stem-cork", "stem-cork-tpu", "stem-cork-tpu-rifle")) {
   $outUni = Join-Path $PSScriptRoot "aim-flag-$uniPart.stl"
   Write-Host "Exporting $uniPart -> $outUni"
   $define = 'render_part=\"' + $uniPart + '\"'
